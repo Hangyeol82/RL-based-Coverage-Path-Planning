@@ -50,6 +50,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed-base", type=int, default=100)
 
     p.add_argument("--python-bin", type=str, default=sys.executable)
+    p.add_argument(
+        "--init-from-bc",
+        type=str,
+        default="",
+        help="Warm-start each PPO run from this BC checkpoint (.pt).",
+    )
+    p.add_argument(
+        "--init-from-bc-strict",
+        action="store_true",
+        help="Use strict BC->PPO encoder key/shape matching.",
+    )
     p.add_argument("--run-tag", type=str, default="")
     p.add_argument("--out-dir", type=str, default="")
     p.add_argument("--overwrite", action="store_true")
@@ -136,6 +147,10 @@ def _build_run_cmd(
     ]
     if include_dtm:
         cmd.append("--include-dtm")
+    if args.init_from_bc:
+        cmd += ["--init-from-bc", args.init_from_bc]
+    if args.init_from_bc_strict:
+        cmd.append("--init-from-bc-strict")
     return cmd
 
 
@@ -373,6 +388,8 @@ def main():
             "n_steps": int(args.n_steps),
             "batch_size": int(args.batch_size),
             "n_epochs": int(args.n_epochs),
+            "init_from_bc": str(args.init_from_bc),
+            "init_from_bc_strict": bool(args.init_from_bc_strict),
         },
         "num_selected_maps": int(len(entries)),
         "num_reported_maps": int(len(per_map_rows)),

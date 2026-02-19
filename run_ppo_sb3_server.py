@@ -32,6 +32,13 @@ def _parse_args():
     p.add_argument("--n-epochs", type=int, default=4)
 
     p.add_argument("--include-dtm", action="store_true")
+    p.add_argument(
+        "--init-from-bc",
+        type=str,
+        default="",
+        help="Warm-start PPO feature encoder from BC checkpoint (.pt).",
+    )
+    p.add_argument("--init-from-bc-strict", action="store_true")
     p.add_argument("--save-model", type=str, default="learning/checkpoints/rl/ppo_sb3_server_latest")
     p.add_argument(
         "--save-breakdown-json",
@@ -90,6 +97,10 @@ def _build_cmd(args: argparse.Namespace, extra: List[str]) -> List[str]:
         cmd += ["--map-file", args.map_file]
     if args.include_dtm:
         cmd += ["--include-dtm"]
+    if args.init_from_bc:
+        cmd += ["--init-from-bc", args.init_from_bc]
+    if args.init_from_bc_strict:
+        cmd += ["--init-from-bc-strict"]
     cmd += extra
     return cmd
 

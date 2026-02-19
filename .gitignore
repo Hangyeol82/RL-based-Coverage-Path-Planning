@@ -1,0 +1,28 @@
+# OS / editor
+.DS_Store
+.vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Runtime / test cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Training outputs
+learning/checkpoints/
+
+# Map images (text maps + manifest are tracked)
+map/*.png
+
+# Logs / artifacts
+*.log
+*.tmp

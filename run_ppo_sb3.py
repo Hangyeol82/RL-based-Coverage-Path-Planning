@@ -1,7 +1,7 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -73,6 +73,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-model", type=str, default="learning/checkpoints/rl/ppo_sb3_latest")
     p.add_argument("--save-breakdown-json", type=str, default="learning/checkpoints/rl/logs/ppo_breakdown.json")
     p.add_argument("--save-breakdown-csv", type=str, default="learning/checkpoints/rl/logs/ppo_breakdown.csv")
+    p.add_argument(
+        "--load-model",
+        type=str,
+        default="",
+        help="Resume PPO from existing SB3 .zip model. If set, PPO hyper-params come from checkpoint.",
+    )
+    p.add_argument(
+        "--init-from-bc",
+        type=str,
+        default="",
+        help="Warm-start PPO feature encoder from BC checkpoint (.pt). Applied only when not resuming PPO.",
+    )
+    p.add_argument(
+        "--init-from-bc-strict",
+        action="store_true",
+        help="Require exact BC->PPO encoder key/shape match. Default loads shape-compatible subset.",
+    )
     return p.parse_args()
 
 
@@ -155,10 +172,109 @@ def _pick_start(grid: np.ndarray) -> GridPos:
     return int(r), int(c)
 
 
+def _get_checkpoint_state_dict(payload: object) -> Dict[str, torch.Tensor]:
+    if not isinstance(payload, dict):
+        raise ValueError("Checkpoint payload must be a dictionary")
+
+    raw = None
+    if "model_state_dict" in payload and isinstance(payload["model_state_dict"], dict):
+        raw = payload["model_state_dict"]
+    elif "state_dict" in payload and isinstance(payload["state_dict"], dict):
+        raw = payload["state_dict"]
+    elif all(isinstance(v, torch.Tensor) for v in payload.values()):
+        raw = payload
+
+    if raw is None:
+        keys = list(payload.keys())[:8]
+        raise ValueError(
+            "Unsupported checkpoint format. Expected keys like model_state_dict/state_dict. "
+            f"Top-level keys sample: {keys}"
+        )
+    return raw
+
+
+def _extract_encoder_state_dict(raw_state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    encoder_state: Dict[str, torch.Tensor] = {}
+    prefixes = (
+        "encoder.",
+        "features_extractor.encoder.",
+        "policy.features_extractor.encoder.",
+    )
+    direct_prefixes = ("maps_encoder.", "state_encoder.", "fusion.")
+
+    for key, value in raw_state_dict.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        mapped = None
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                mapped = key[len(prefix) :]
+                break
+        if mapped is None and key.startswith(direct_prefixes):
+            mapped = key
+        if mapped is not None:
+            encoder_state[mapped] = value
+    return encoder_state
+
+
+def _warm_start_encoder_from_bc(
+    model,
+    checkpoint_path: str,
+    *,
+    strict: bool = False,
+) -> Dict[str, int]:
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    raw_state = _get_checkpoint_state_dict(ckpt)
+    source_state = _extract_encoder_state_dict(raw_state)
+    if len(source_state) == 0:
+        raise ValueError(
+            "No encoder parameters found in BC checkpoint. "
+            "Expected keys starting with encoder. or policy.features_extractor.encoder."
+        )
+
+    target_encoder = model.policy.features_extractor.encoder
+    target_state = target_encoder.state_dict()
+
+    loadable: Dict[str, torch.Tensor] = {}
+    shape_mismatch = []
+    unexpected = []
+    for key, value in source_state.items():
+        if key not in target_state:
+            unexpected.append(key)
+            continue
+        if tuple(value.shape) != tuple(target_state[key].shape):
+            shape_mismatch.append((key, tuple(value.shape), tuple(target_state[key].shape)))
+            continue
+        loadable[key] = value
+
+    missing = [key for key in target_state.keys() if key not in loadable]
+    if strict and (len(unexpected) > 0 or len(shape_mismatch) > 0 or len(missing) > 0):
+        msg = (
+            "BC strict warm-start failed: "
+            f"loadable={len(loadable)}, missing={len(missing)}, "
+            f"unexpected={len(unexpected)}, shape_mismatch={len(shape_mismatch)}"
+        )
+        raise ValueError(msg)
+
+    merged = dict(target_state)
+    merged.update(loadable)
+    target_encoder.load_state_dict(merged, strict=False)
+
+    return {
+        "source_keys": len(source_state),
+        "loaded_keys": len(loadable),
+        "missing_keys": len(missing),
+        "unexpected_keys": len(unexpected),
+        "shape_mismatch": len(shape_mismatch),
+    }
+
+
 def main():
     args = _parse_args()
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
+    if args.load_model and args.init_from_bc:
+        raise ValueError("--load-model and --init-from-bc are mutually exclusive")
     _set_seed(args.seed)
     device = _select_device(args.device)
 
@@ -247,23 +363,35 @@ def main():
         net_arch=dict(pi=[128, 128], vf=[128, 128]),
     )
 
-    model = PPO(
-        policy="MultiInputPolicy",
-        env=vec_env,
-        learning_rate=args.lr,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_range=args.clip_range,
-        ent_coef=args.ent_coef,
-        vf_coef=args.vf_coef,
-        policy_kwargs=policy_kwargs,
-        seed=args.seed,
-        device=device,
-        verbose=1,
-    )
+    if args.load_model:
+        model = PPO.load(args.load_model, env=vec_env, device=device)
+        model.set_random_seed(args.seed)
+    else:
+        model = PPO(
+            policy="MultiInputPolicy",
+            env=vec_env,
+            learning_rate=args.lr,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            clip_range=args.clip_range,
+            ent_coef=args.ent_coef,
+            vf_coef=args.vf_coef,
+            policy_kwargs=policy_kwargs,
+            seed=args.seed,
+            device=device,
+            verbose=1,
+        )
+
+    bc_warm_start_stats = None
+    if args.init_from_bc:
+        bc_warm_start_stats = _warm_start_encoder_from_bc(
+            model,
+            args.init_from_bc,
+            strict=bool(args.init_from_bc_strict),
+        )
 
     callback = RewardBreakdownCallback(verbose=0)
 
@@ -277,6 +405,19 @@ def main():
         f" rollout_batch={args.n_steps * args.num_envs},"
         f" batch_size={args.batch_size}, n_epochs={args.n_epochs}"
     )
+    if args.load_model:
+        print(f"Init mode: resume PPO from {args.load_model}")
+    elif bc_warm_start_stats is not None:
+        print(
+            "Init mode: BC warm-start | "
+            f"loaded={bc_warm_start_stats['loaded_keys']}/{bc_warm_start_stats['source_keys']} "
+            f"(missing={bc_warm_start_stats['missing_keys']}, "
+            f"unexpected={bc_warm_start_stats['unexpected_keys']}, "
+            f"shape_mismatch={bc_warm_start_stats['shape_mismatch']})"
+        )
+        print(f"BC checkpoint: {args.init_from_bc}")
+    else:
+        print("Init mode: random init")
     model.learn(total_timesteps=args.total_timesteps, callback=callback)
 
     if args.save_model:
