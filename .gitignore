@@ -18,7 +18,14 @@ env/
 .ruff_cache/
 
 # Training outputs
-learning/checkpoints/
+# Keep checkpoints mostly ignored, but allow BC seed weights (.pt) to sync.
+learning/checkpoints/*
+!learning/checkpoints/.gitkeep
+!learning/checkpoints/bc/
+learning/checkpoints/bc/*
+!learning/checkpoints/bc/*.pt
+learning/checkpoints/bc/logs/
+learning/checkpoints/rl/
 
 # Map images (text maps + manifest are tracked)
 map/*.png
