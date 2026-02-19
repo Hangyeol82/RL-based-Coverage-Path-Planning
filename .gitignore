@@ -1,0 +1,18 @@
+# OS/editor noise
+.DS_Store
+.vscode/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
