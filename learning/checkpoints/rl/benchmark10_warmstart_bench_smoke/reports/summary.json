@@ -1,0 +1,74 @@
+{
+  "config": {
+    "manifest": "map/manifest.json",
+    "groups": [
+      "indoor"
+    ],
+    "max_maps": 1,
+    "total_timesteps": 128,
+    "num_envs": 1,
+    "vec_env": "dummy",
+    "subproc_start_method": "spawn",
+    "seed_mode": "map",
+    "seed_base": 100,
+    "map_size": 64,
+    "sensor_range": 2,
+    "n_steps": 64,
+    "batch_size": 64,
+    "n_epochs": 1,
+    "init_from_bc": "learning/checkpoints/bc/bc_smoke_latest.pt",
+    "init_from_bc_strict": false
+  },
+  "num_selected_maps": 1,
+  "num_reported_maps": 1,
+  "failures": [],
+  "aggregate": {
+    "num_maps": 1,
+    "delta_stats": {
+      "reward_total_last": {
+        "mean": -0.02553616166114825,
+        "std": 0.0,
+        "min": -0.02553616166114825,
+        "max": -0.02553616166114825
+      },
+      "coverage_ratio_last": {
+        "mean": -0.0015696564885496183,
+        "std": 0.0,
+        "min": -0.0015696564885496183,
+        "max": -0.0015696564885496183
+      },
+      "collision_last": {
+        "mean": 0.015625,
+        "std": 0.0,
+        "min": 0.015625,
+        "max": 0.015625
+      },
+      "reward_total_mean": {
+        "mean": -1.4964958757162095,
+        "std": 0.0,
+        "min": -1.4964958757162095,
+        "max": -1.4964958757162095
+      },
+      "coverage_ratio_mean": {
+        "mean": -0.0023258587786259555,
+        "std": 0.0,
+        "min": -0.0023258587786259555,
+        "max": -0.0023258587786259555
+      },
+      "collision_mean": {
+        "mean": 0.1484375,
+        "std": 0.0,
+        "min": 0.1484375,
+        "max": 0.1484375
+      }
+    },
+    "wins": {
+      "reward_total_last": 0,
+      "coverage_ratio_last": 0,
+      "collision_last": 0,
+      "reward_total_mean": 0,
+      "coverage_ratio_mean": 0,
+      "collision_mean": 0
+    }
+  }
+}

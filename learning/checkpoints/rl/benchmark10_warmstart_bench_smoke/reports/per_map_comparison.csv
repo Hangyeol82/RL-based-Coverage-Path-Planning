@@ -1,0 +1,2 @@
+map_id,group,seed,map_file,baseline_last_reward_total,dtm_last_reward_total,delta_last_reward_total,baseline_last_coverage_ratio,dtm_last_coverage_ratio,delta_last_coverage_ratio,baseline_last_collision,dtm_last_collision,delta_last_collision,delta_mean_reward_total,delta_mean_coverage_ratio,delta_mean_collision
+indoor_seed101,indoor,101,map/indoor_seed101.txt,-0.9445082664489743,-0.9700444281101226,-0.02553616166114825,0.01196087786259542,0.010391221374045802,-0.0015696564885496183,0.109375,0.125,0.015625,-1.4964958757162095,-0.0023258587786259555,0.1484375

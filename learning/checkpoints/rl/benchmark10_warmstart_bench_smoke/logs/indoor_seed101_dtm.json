@@ -1,0 +1,38 @@
+{
+  "rollouts": [
+    {
+      "rollout": 1.0,
+      "timesteps": 64.0,
+      "reward_area": 0.28125,
+      "reward_tv_i": -0.09343591853976249,
+      "reward_tv_g": 0.0,
+      "reward_coll": -2.96875,
+      "reward_const": -0.09999999999999999,
+      "reward_total": -2.8809359185397625,
+      "coverage_ratio": 0.0024666030534351143,
+      "collision": 0.296875
+    },
+    {
+      "rollout": 2.0,
+      "timesteps": 128.0,
+      "reward_area": 0.421875,
+      "reward_tv_i": -0.041919428110122677,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.25,
+      "reward_const": -0.09999999999999999,
+      "reward_total": -0.9700444281101226,
+      "coverage_ratio": 0.010391221374045802,
+      "collision": 0.125
+    }
+  ],
+  "track_keys": [
+    "reward_area",
+    "reward_tv_i",
+    "reward_tv_g",
+    "reward_coll",
+    "reward_const",
+    "reward_total",
+    "coverage_ratio",
+    "collision"
+  ]
+}

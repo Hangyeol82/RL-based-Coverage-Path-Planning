@@ -1,0 +1,158 @@
+{
+  "rollouts": [
+    {
+      "rollout": 1.0,
+      "timesteps": 256.0,
+      "reward_area": 0.25,
+      "reward_tv_i": -0.02027323823422194,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.6015625,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.4718357382342222,
+      "coverage_ratio": 0.011525524809160305,
+      "collision": 0.16015625
+    },
+    {
+      "rollout": 2.0,
+      "timesteps": 512.0,
+      "reward_area": 0.01953125,
+      "reward_tv_i": 0.014252063073217868,
+      "reward_tv_g": 0.0,
+      "reward_coll": -2.03125,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -2.097466686926783,
+      "coverage_ratio": 0.02087786259541985,
+      "collision": 0.203125
+    },
+    {
+      "rollout": 3.0,
+      "timesteps": 768.0,
+      "reward_area": 0.00390625,
+      "reward_tv_i": 0.0028961772099137307,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.171875,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.2650725727900864,
+      "coverage_ratio": 0.021515982824427484,
+      "collision": 0.1171875
+    },
+    {
+      "rollout": 4.0,
+      "timesteps": 1024.0,
+      "reward_area": 0.0,
+      "reward_tv_i": 0.0,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.3671875,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.4671875,
+      "coverage_ratio": 0.0216793893129771,
+      "collision": 0.13671875
+    },
+    {
+      "rollout": 5.0,
+      "timesteps": 1280.0,
+      "reward_area": 0.0,
+      "reward_tv_i": 0.0,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.2890625,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.3890625000000003,
+      "coverage_ratio": 0.0216793893129771,
+      "collision": 0.12890625
+    },
+    {
+      "rollout": 6.0,
+      "timesteps": 1536.0,
+      "reward_area": 0.046875,
+      "reward_tv_i": -0.016366988979279996,
+      "reward_tv_g": 0.0,
+      "reward_coll": -0.8984375,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -0.96792948897928,
+      "coverage_ratio": 0.018970658396946567,
+      "collision": 0.08984375
+    },
+    {
+      "rollout": 7.0,
+      "timesteps": 1792.0,
+      "reward_area": 0.11328125,
+      "reward_tv_i": -0.02105448693037033,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.796875,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.8046482369303707,
+      "coverage_ratio": 0.006858301526717557,
+      "collision": 0.1796875
+    },
+    {
+      "rollout": 8.0,
+      "timesteps": 2048.0,
+      "reward_area": 0.2578125,
+      "reward_tv_i": -0.05765547081828117,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.171875,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.0717179708182811,
+      "coverage_ratio": 0.023096374045801525,
+      "collision": 0.1171875
+    },
+    {
+      "rollout": 9.0,
+      "timesteps": 2304.0,
+      "reward_area": 0.22265625,
+      "reward_tv_i": -0.021796480566263203,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.5234375,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.4225777305662637,
+      "coverage_ratio": 0.04389432251908397,
+      "collision": 0.15234375
+    },
+    {
+      "rollout": 10.0,
+      "timesteps": 2560.0,
+      "reward_area": 0.05859375,
+      "reward_tv_i": 0.008002065122127533,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.640625,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.6740291848778726,
+      "coverage_ratio": 0.052315124045801534,
+      "collision": 0.1640625
+    },
+    {
+      "rollout": 11.0,
+      "timesteps": 2816.0,
+      "reward_area": 0.07421875,
+      "reward_tv_i": 0.01821383833885193,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.328125,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.3356924116611482,
+      "coverage_ratio": 0.05819060114503816,
+      "collision": 0.1328125
+    },
+    {
+      "rollout": 12.0,
+      "timesteps": 3072.0,
+      "reward_area": 0.1328125,
+      "reward_tv_i": -0.01646177489310503,
+      "reward_tv_g": 0.0,
+      "reward_coll": -1.2109375,
+      "reward_const": -0.10000000000000002,
+      "reward_total": -1.1945867748931052,
+      "coverage_ratio": 0.046077051526717566,
+      "collision": 0.12109375
+    }
+  ],
+  "track_keys": [
+    "reward_area",
+    "reward_tv_i",
+    "reward_tv_g",
+    "reward_coll",
+    "reward_const",
+    "reward_total",
+    "coverage_ratio",
+    "collision"
+  ]
+}
