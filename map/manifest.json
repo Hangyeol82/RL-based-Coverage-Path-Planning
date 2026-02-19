@@ -1,0 +1,76 @@
+{
+  "indoor": [
+    {
+      "seed": 101,
+      "txt": "map/indoor_seed101.txt",
+      "png": "map/indoor_seed101.png",
+      "obstacle_cells": 821,
+      "free_cells": 3275
+    },
+    {
+      "seed": 202,
+      "txt": "map/indoor_seed202.txt",
+      "png": "map/indoor_seed202.png",
+      "obstacle_cells": 801,
+      "free_cells": 3295
+    },
+    {
+      "seed": 303,
+      "txt": "map/indoor_seed303.txt",
+      "png": "map/indoor_seed303.png",
+      "obstacle_cells": 817,
+      "free_cells": 3279
+    },
+    {
+      "seed": 404,
+      "txt": "map/indoor_seed404.txt",
+      "png": "map/indoor_seed404.png",
+      "obstacle_cells": 815,
+      "free_cells": 3281
+    },
+    {
+      "seed": 505,
+      "txt": "map/indoor_seed505.txt",
+      "png": "map/indoor_seed505.png",
+      "obstacle_cells": 799,
+      "free_cells": 3297
+    }
+  ],
+  "random": [
+    {
+      "seed": 101,
+      "txt": "map/random_stage3_seed101.txt",
+      "png": "map/random_stage3_seed101.png",
+      "obstacle_cells": 1640,
+      "free_cells": 2456
+    },
+    {
+      "seed": 202,
+      "txt": "map/random_stage3_seed202.txt",
+      "png": "map/random_stage3_seed202.png",
+      "obstacle_cells": 1532,
+      "free_cells": 2564
+    },
+    {
+      "seed": 303,
+      "txt": "map/random_stage3_seed303.txt",
+      "png": "map/random_stage3_seed303.png",
+      "obstacle_cells": 1617,
+      "free_cells": 2479
+    },
+    {
+      "seed": 404,
+      "txt": "map/random_stage3_seed404.txt",
+      "png": "map/random_stage3_seed404.png",
+      "obstacle_cells": 1551,
+      "free_cells": 2545
+    },
+    {
+      "seed": 505,
+      "txt": "map/random_stage3_seed505.txt",
+      "png": "map/random_stage3_seed505.png",
+      "obstacle_cells": 1478,
+      "free_cells": 2618
+    }
+  ]
+}

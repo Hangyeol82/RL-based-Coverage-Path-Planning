@@ -1,7 +1,7 @@
 import numpy as np
 import random
 import sys
-import matplotlib.pyplot as plt
+from collections import deque
 
 class MapGenerator:
     def __init__(self, height, width, seed=None):
@@ -38,6 +38,8 @@ class MapGenerator:
             grid, metadata, success = self._try_generate_map(stage, num_obstacles)
             
             if success:
+                # Overlap으로 만들어진 enclosed free space(도달 불가 영역)를 장애물로 메움
+                grid = self._fill_unreachable_free_regions(grid)
                 # 유효성 검사 (Free Space 비율)
                 free_ratio = np.sum(grid == 0) / (self.height * self.width)
                 if free_ratio >= 0.5: # 최소 50% 이상 빈 공간
@@ -51,6 +53,43 @@ class MapGenerator:
         print("Warning: Failed to generate valid map within max retries. Returning last result.")
         if return_metadata:
             return grid, metadata
+        return grid
+
+    def _fill_unreachable_free_regions(self, grid):
+        """
+        바깥 경계에서 도달할 수 없는 free cell(예: 도넛 내부)은 obstacle(1)로 채운다.
+        4-connectivity 기준.
+        """
+        h, w = grid.shape
+        reachable = np.zeros_like(grid, dtype=bool)
+        q = deque()
+
+        def enqueue_if_free(r, c):
+            if grid[r, c] == 0 and not reachable[r, c]:
+                reachable[r, c] = True
+                q.append((r, c))
+
+        # boundary free cells를 seed로 flood fill
+        for c in range(w):
+            enqueue_if_free(0, c)
+            enqueue_if_free(h - 1, c)
+        for r in range(h):
+            enqueue_if_free(r, 0)
+            enqueue_if_free(r, w - 1)
+
+        while q:
+            r, c = q.popleft()
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w:
+                    if grid[nr, nc] == 0 and not reachable[nr, nc]:
+                        reachable[nr, nc] = True
+                        q.append((nr, nc))
+
+        enclosed = (grid == 0) & (~reachable)
+        if np.any(enclosed):
+            grid[enclosed] = 1
+
         return grid
 
     def _try_generate_map(self, stage, num_obstacles):
@@ -250,6 +289,8 @@ def visualize_map(grid):
     print("-" * (cols + 2))
 
 def plot_map_matplotlib(grid, title="Generated Map"):
+    import matplotlib.pyplot as plt
+
     plt.figure(figsize=(10, 6))
     plt.imshow(grid, cmap='binary', origin='upper') # 0:white(free), 1:black(obstacle)
     plt.title(title)
