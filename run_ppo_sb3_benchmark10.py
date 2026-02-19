@@ -107,9 +107,10 @@ def _build_run_cmd(
     save_json: Path,
     save_csv: Path,
 ) -> List[str]:
+    runner = Path(__file__).resolve().parent / "run_ppo_sb3.py"
     cmd = [
         args.python_bin,
-        "run_ppo_sb3.py",
+        str(runner),
         "--total-timesteps",
         str(args.total_timesteps),
         "--device",
