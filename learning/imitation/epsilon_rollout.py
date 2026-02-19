@@ -85,7 +85,7 @@ def collect_epsilon_rollout(
     epsilon_file: Optional[Path] = None,
 ) -> Tuple[List[RolloutTransition], List[GridPos]]:
     if epsilon_file is None:
-        epsilon_file = Path(__file__).resolve().parents[2] / "E*OlineCpp.py"
+        epsilon_file = Path(__file__).resolve().parents[2] / "EStarOlineCpp.py"
 
     base_cls = _load_epsilon_star_class(epsilon_file)
 
