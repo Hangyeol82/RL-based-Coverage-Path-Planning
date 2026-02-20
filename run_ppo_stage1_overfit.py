@@ -23,6 +23,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--manifest", type=str, default="map/manifest.json")
     p.add_argument("--group", type=str, default="indoor")
     p.add_argument("--map-seeds", type=str, default="101,202")
+    p.add_argument(
+        "--baseline-seeds",
+        type=str,
+        default="",
+        help="Comma-separated seeds to run baseline on. Empty means all --map-seeds.",
+    )
+    p.add_argument(
+        "--dtm-seeds",
+        type=str,
+        default="",
+        help="Comma-separated seeds to run DTM on. Empty means all --map-seeds.",
+    )
 
     p.add_argument("--total-timesteps", type=int, default=500000)
     p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"])
@@ -317,6 +329,19 @@ def main():
             raise FileNotFoundError(f"BC checkpoint not found: {bc_ckpt}")
 
     selected_seeds = _parse_seed_list(args.map_seeds)
+    selected_seed_set = set(selected_seeds)
+    baseline_seed_set = (
+        set(_parse_seed_list(args.baseline_seeds)) if args.baseline_seeds.strip() else set(selected_seeds)
+    )
+    dtm_seed_set = set(_parse_seed_list(args.dtm_seeds)) if args.dtm_seeds.strip() else set(selected_seeds)
+    if not baseline_seed_set.issubset(selected_seed_set):
+        extra = sorted(baseline_seed_set - selected_seed_set)
+        raise ValueError(f"--baseline-seeds contains values outside --map-seeds: {extra}")
+    if not dtm_seed_set.issubset(selected_seed_set):
+        extra = sorted(dtm_seed_set - selected_seed_set)
+        raise ValueError(f"--dtm-seeds contains values outside --map-seeds: {extra}")
+    if len(baseline_seed_set) == 0 and len(dtm_seed_set) == 0:
+        raise ValueError("No work selected: both --baseline-seeds and --dtm-seeds are empty")
     entries = _load_manifest_entries(manifest, args.group, selected_seeds)
 
     if args.out_dir:
@@ -332,6 +357,8 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] group={args.group}, seeds={selected_seeds}")
+    print(f"[INFO] baseline seeds={sorted(baseline_seed_set)}")
+    print(f"[INFO] dtm seeds={sorted(dtm_seed_set)}")
     print(f"[INFO] output dir: {out_dir}")
 
     per_map_rows: List[Dict] = []
@@ -358,6 +385,13 @@ def main():
         ]
 
         for mode_name, include_dtm, model_path, json_path, csv_path in tasks:
+            if mode_name == "baseline" and map_seed not in baseline_seed_set:
+                print(f"  [SKIP] baseline: seed {map_seed} not selected in --baseline-seeds")
+                continue
+            if mode_name == "dtm" and map_seed not in dtm_seed_set:
+                print(f"  [SKIP] dtm: seed {map_seed} not selected in --dtm-seeds")
+                continue
+
             model_zip = model_path.with_suffix(".zip")
             if args.skip_existing and json_path.exists() and model_zip.exists():
                 print(f"  [SKIP] {mode_name}: existing outputs")
@@ -458,6 +492,8 @@ def main():
             "manifest": str(manifest),
             "group": args.group,
             "map_seeds": selected_seeds,
+            "baseline_seeds": sorted(baseline_seed_set),
+            "dtm_seeds": sorted(dtm_seed_set),
             "total_timesteps": int(args.total_timesteps),
             "device": args.device,
             "num_envs": int(args.num_envs),
