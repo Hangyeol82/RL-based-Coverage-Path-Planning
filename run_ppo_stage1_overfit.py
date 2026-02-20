@@ -20,7 +20,7 @@ def _parse_args() -> argparse.Namespace:
             "and generate comparison + convergence diagnostics."
         )
     )
-    p.add_argument("--manifest", type=str, default="map/manifest.json")
+    p.add_argument("--manifest", type=str, default="map/manifest_32.json")
     p.add_argument("--group", type=str, default="indoor")
     p.add_argument("--map-seeds", type=str, default="101,202")
     p.add_argument(
@@ -51,7 +51,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--n-epochs", type=int, default=4)
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
-    p.add_argument("--map-size", type=int, default=64)
+    p.add_argument("--map-size", type=int, default=32)
 
     p.add_argument(
         "--seed-mode",

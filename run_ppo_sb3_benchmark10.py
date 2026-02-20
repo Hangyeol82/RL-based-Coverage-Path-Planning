@@ -19,7 +19,7 @@ def _parse_args() -> argparse.Namespace:
             "Run baseline+DTM PPO across map manifest entries and report per-map + aggregate comparison."
         )
     )
-    p.add_argument("--manifest", type=str, default="map/manifest.json")
+    p.add_argument("--manifest", type=str, default="map/manifest_32.json")
     p.add_argument("--groups", type=str, default="indoor,random")
     p.add_argument("--max-maps", type=int, default=0, help="0 means use all selected maps")
 
@@ -38,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--n-epochs", type=int, default=4)
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
-    p.add_argument("--map-size", type=int, default=64)
+    p.add_argument("--map-size", type=int, default=32)
 
     p.add_argument(
         "--seed-mode",
@@ -255,11 +255,14 @@ def _aggregate(per_map: List[Dict]) -> Dict:
 
 def main():
     args = _parse_args()
+    repo_root = Path(__file__).resolve().parent
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     if not groups:
         raise ValueError("No groups selected")
 
     manifest = Path(args.manifest)
+    if not manifest.is_absolute():
+        manifest = repo_root / manifest
     if not manifest.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest}")
     entries = _load_manifest(manifest, groups, args.max_maps)
@@ -305,14 +308,23 @@ def main():
         ]
 
         for mode_name, include_dtm, model_path, json_path, csv_path in tasks:
-            if args.skip_existing and json_path.exists() and model_path.with_suffix(".zip").exists():
+            model_zip = model_path.with_suffix(".zip")
+            if args.skip_existing and json_path.exists() and model_zip.exists():
                 print(f"  [SKIP] {mode_name}: existing outputs found")
                 continue
-            if (not args.overwrite) and (json_path.exists() or model_path.with_suffix(".zip").exists()):
+            if (not args.overwrite) and (json_path.exists() or model_zip.exists()):
                 raise FileExistsError(
                     f"Output already exists for {map_id} {mode_name}. "
                     f"Use --overwrite or --skip-existing."
                 )
+            if args.overwrite:
+                # Avoid stale artifacts being reused when a rerun crashes mid-training.
+                if json_path.exists():
+                    json_path.unlink()
+                if csv_path.exists():
+                    csv_path.unlink()
+                if model_zip.exists():
+                    model_zip.unlink()
 
             cmd = _build_run_cmd(
                 args,
@@ -325,7 +337,7 @@ def main():
             )
             print(f"  [RUN] {mode_name}: {' '.join(cmd)}")
             try:
-                subprocess.run(cmd, check=True)
+                subprocess.run(cmd, check=True, cwd=str(repo_root))
             except subprocess.CalledProcessError as e:
                 fail = {"map_id": map_id, "mode": mode_name, "returncode": int(e.returncode)}
                 failures.append(fail)

@@ -22,7 +22,7 @@ def _parse_args():
 
     p.add_argument("--map-source", type=str, default="file", choices=["random", "custom", "file"])
     p.add_argument("--map-file", type=str, default="map/indoor_seed101.txt")
-    p.add_argument("--map-size", type=int, default=64)
+    p.add_argument("--map-size", type=int, default=32)
     p.add_argument("--map-stage", type=int, default=3, choices=[1, 2, 3, 4])
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)

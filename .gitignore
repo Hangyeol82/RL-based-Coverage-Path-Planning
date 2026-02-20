@@ -16,3 +16,9 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Log analysis artifacts
+log_analysis/.mplconfig/
+log_analysis/__pycache__/
+log_analysis/logs/*
+!log_analysis/logs/.gitkeep

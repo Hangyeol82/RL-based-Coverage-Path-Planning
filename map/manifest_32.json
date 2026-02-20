@@ -1,0 +1,76 @@
+{
+  "indoor": [
+    {
+      "seed": 101,
+      "txt": "map/indoor32_seed101.txt",
+      "obstacle_cells": 330,
+      "free_cells": 694,
+      "png": "map/indoor32_seed101.png"
+    },
+    {
+      "seed": 202,
+      "txt": "map/indoor32_seed202.txt",
+      "obstacle_cells": 332,
+      "free_cells": 692,
+      "png": "map/indoor32_seed202.png"
+    },
+    {
+      "seed": 303,
+      "txt": "map/indoor32_seed303.txt",
+      "obstacle_cells": 324,
+      "free_cells": 700,
+      "png": "map/indoor32_seed303.png"
+    },
+    {
+      "seed": 404,
+      "txt": "map/indoor32_seed404.txt",
+      "obstacle_cells": 332,
+      "free_cells": 692,
+      "png": "map/indoor32_seed404.png"
+    },
+    {
+      "seed": 505,
+      "txt": "map/indoor32_seed505.txt",
+      "obstacle_cells": 327,
+      "free_cells": 697,
+      "png": "map/indoor32_seed505.png"
+    }
+  ],
+  "random": [
+    {
+      "seed": 101,
+      "txt": "map/random32_stage3_seed101.txt",
+      "obstacle_cells": 313,
+      "free_cells": 711,
+      "png": "map/random32_stage3_seed101.png"
+    },
+    {
+      "seed": 202,
+      "txt": "map/random32_stage3_seed202.txt",
+      "obstacle_cells": 229,
+      "free_cells": 795,
+      "png": "map/random32_stage3_seed202.png"
+    },
+    {
+      "seed": 303,
+      "txt": "map/random32_stage3_seed303.txt",
+      "obstacle_cells": 121,
+      "free_cells": 903,
+      "png": "map/random32_stage3_seed303.png"
+    },
+    {
+      "seed": 404,
+      "txt": "map/random32_stage3_seed404.txt",
+      "obstacle_cells": 88,
+      "free_cells": 936,
+      "png": "map/random32_stage3_seed404.png"
+    },
+    {
+      "seed": 505,
+      "txt": "map/random32_stage3_seed505.txt",
+      "obstacle_cells": 154,
+      "free_cells": 870,
+      "png": "map/random32_stage3_seed505.png"
+    }
+  ]
+}

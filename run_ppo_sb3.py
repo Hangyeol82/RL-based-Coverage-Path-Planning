@@ -69,6 +69,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-episode-steps", type=int, default=1500)
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
+    mask_group = p.add_mutually_exclusive_group()
+    mask_group.add_argument(
+        "--action-mask",
+        dest="action_mask",
+        action="store_true",
+        help=(
+            "Enable known-map action masking. Uses MaskablePPO when available; "
+            "otherwise applies env-side safety masking."
+        ),
+    )
+    mask_group.add_argument(
+        "--no-action-mask",
+        dest="action_mask",
+        action="store_false",
+        help="Disable action masking.",
+    )
 
     p.add_argument("--map-source", type=str, default="random", choices=["random", "custom", "file"])
     p.add_argument("--map-size", type=int, default=32)
@@ -96,6 +112,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Require exact BC->PPO encoder key/shape match. Default loads shape-compatible subset.",
     )
+    p.set_defaults(action_mask=True)
     return p.parse_args()
 
 
@@ -285,7 +302,7 @@ def main():
     device = _select_device(args.device)
 
     try:
-        from stable_baselines3 import PPO
+        from stable_baselines3 import PPO as SB3PPO
         from stable_baselines3.common.env_util import make_vec_env
         from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
     except Exception as e:
@@ -293,6 +310,20 @@ def main():
             "stable_baselines3 is not installed in this environment. "
             "Install it first, then rerun."
         ) from e
+
+    AlgoClass = SB3PPO
+    algo_name = "PPO"
+    if args.action_mask:
+        try:
+            from sb3_contrib import MaskablePPO  # type: ignore
+        except Exception:
+            print(
+                "[WARN] sb3_contrib not found. Falling back to PPO with env-side action masking.",
+                flush=True,
+            )
+        else:
+            AlgoClass = MaskablePPO
+            algo_name = "MaskablePPO"
 
     grid = _build_map(args)
     start = _pick_start(grid)
@@ -316,6 +347,7 @@ def main():
         collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
+        use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
     )
 
@@ -370,10 +402,23 @@ def main():
     )
 
     if args.load_model:
-        model = PPO.load(args.load_model, env=vec_env, device=device)
+        try:
+            model = AlgoClass.load(args.load_model, env=vec_env, device=device)
+        except Exception as load_err:
+            # Old checkpoints may have been saved with plain PPO; recover gracefully.
+            if algo_name == "MaskablePPO":
+                print(
+                    f"[WARN] MaskablePPO load failed ({load_err}). Retrying with PPO loader.",
+                    flush=True,
+                )
+                AlgoClass = SB3PPO
+                algo_name = "PPO"
+                model = AlgoClass.load(args.load_model, env=vec_env, device=device)
+            else:
+                raise
         model.set_random_seed(args.seed)
     else:
-        model = PPO(
+        model = AlgoClass(
             policy="MultiInputPolicy",
             env=vec_env,
             learning_rate=args.lr,
@@ -404,6 +449,10 @@ def main():
     print(f"Device: {device}")
     print(f"Map: source={args.map_source}, shape={grid.shape}, include_dtm={args.include_dtm}")
     print(f"Start: {start}")
+    print(
+        f"Action mask: {bool(args.action_mask)} | algo={algo_name} | "
+        f"env_shield={bool(env_cfg.use_action_mask)}"
+    )
     print(
         "PPO cfg:"
         f" total_timesteps={args.total_timesteps}, num_envs={args.num_envs},"
