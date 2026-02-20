@@ -82,6 +82,10 @@ class CPPDiscreteGymEnv(gym.Env):
         terminated = bool(done and not truncated)
         return self._convert_obs(raw_obs), float(reward), terminated, truncated, dict(info)
 
+    # sb3-contrib MaskablePPO looks for this method on envs.
+    def action_masks(self) -> np.ndarray:
+        return self.core_env.get_action_mask().astype(bool)
+
     def render(self):
         return None
 

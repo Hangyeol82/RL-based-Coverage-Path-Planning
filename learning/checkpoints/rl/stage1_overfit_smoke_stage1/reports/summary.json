@@ -1,0 +1,49 @@
+{
+  "config": {
+    "manifest": "map/manifest.json",
+    "group": "indoor",
+    "map_seeds": [
+      101
+    ],
+    "total_timesteps": 256,
+    "device": "cpu",
+    "num_envs": 1,
+    "vec_env": "dummy",
+    "subproc_start_method": "spawn",
+    "n_steps": 64,
+    "batch_size": 64,
+    "n_epochs": 1,
+    "sensor_range": 2,
+    "max_episode_steps": 200,
+    "map_size": 64,
+    "seed_mode": "map",
+    "seed_base": 100,
+    "init_from_bc": "learning/checkpoints/bc/bc_smoke_latest.pt",
+    "init_from_bc_strict": false,
+    "convergence_thresholds": {
+      "conv_window": 4,
+      "coverage_plateau_delta": 0.0005,
+      "coverage_slope_eps": 5e-05,
+      "reward_plateau_delta": 0.05,
+      "reward_slope_eps": 0.005,
+      "collision_plateau_delta": 0.01,
+      "collision_slope_eps": 0.001
+    }
+  },
+  "num_selected_maps": 1,
+  "num_reported_maps": 0,
+  "failures": [
+    {
+      "map_id": "indoor_seed101",
+      "mode": "baseline",
+      "returncode": -6
+    },
+    {
+      "map_id": "indoor_seed101",
+      "mode": "dtm",
+      "returncode": -6
+    }
+  ],
+  "aggregate": {},
+  "per_map_diagnostics": []
+}

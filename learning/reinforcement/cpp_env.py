@@ -42,6 +42,10 @@ class CPPDiscreteEnvConfig:
     include_dtm: bool = False
     tv_mode: str = "sym-iso"
     local_tv_patch_radius: int = 3
+    # Known-map safety mask (online-safe):
+    # - invalid: out-of-bounds or known obstacle (1)
+    # - valid: known free (0) or unknown (-1)
+    use_action_mask: bool = False
 
     observation: MultiScaleCPPObservationConfig = field(
         default_factory=MultiScaleCPPObservationConfig,
@@ -201,6 +205,48 @@ class CPPDiscreteEnv:
             "robot_state": robot_state.astype(np.float32),
         }
 
+    def get_action_mask(self) -> np.ndarray:
+        """
+        Validity mask over 4-connected actions from current state.
+        True means the action is currently allowed by known-map safety rules.
+        """
+        mask = np.zeros(self.action_dim, dtype=np.bool_)
+        cr, cc = self.current_pos
+        for action, (dr, dc) in ACTION_TO_DELTA.items():
+            nr, nc = cr + dr, cc + dc
+            if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                continue
+            if self.known_map[nr, nc] == 1:
+                continue
+            mask[action] = True
+        return mask
+
+    def _fallback_action_from_mask(self, mask: np.ndarray) -> Optional[int]:
+        valid = np.flatnonzero(mask)
+        if valid.size == 0:
+            return None
+
+        # Prefer moving to unexplored known-free, then unknown, then explored known-free.
+        cr, cc = self.current_pos
+        best_key = None
+        best_action = int(valid[0])
+        for a in valid:
+            action = int(a)
+            dr, dc = ACTION_TO_DELTA[action]
+            nr, nc = cr + dr, cc + dc
+            cell = int(self.known_map[nr, nc])
+            if cell == 0 and (not self.explored[nr, nc]):
+                tier = 0
+            elif cell == -1:
+                tier = 1
+            else:
+                tier = 2
+            key = (tier, action)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_action = action
+        return best_action
+
     def reset(self, *, start_pos: Optional[GridPos] = None) -> Dict[str, object]:
         self.current_pos = self._resolve_start(start_pos) if start_pos is not None else self._default_start
         self.prev_pos = None
@@ -228,10 +274,20 @@ class CPPDiscreteEnv:
     def step(self, action: int):
         if self.done:
             raise RuntimeError("Episode already done. Call reset() first.")
-        if int(action) not in ACTION_TO_DELTA:
+        requested_action = int(action)
+        if requested_action not in ACTION_TO_DELTA:
             raise ValueError(f"Invalid action {action}. Expected one of {sorted(ACTION_TO_DELTA)}")
 
-        dr, dc = ACTION_TO_DELTA[int(action)]
+        action_mask = self.get_action_mask()
+        executed_action = requested_action
+        action_overridden = False
+        if self.config.use_action_mask and (not bool(action_mask[requested_action])):
+            fallback = self._fallback_action_from_mask(action_mask)
+            if fallback is not None:
+                executed_action = int(fallback)
+                action_overridden = True
+
+        dr, dc = ACTION_TO_DELTA[executed_action]
         cr, cc = self.current_pos
         nr, nc = cr + dr, cc + dc
 
@@ -291,6 +347,11 @@ class CPPDiscreteEnv:
         info = {
             **self.last_reward.as_dict(),
             "collision": bool(collided),
+            "action_requested": int(requested_action),
+            "action_executed": int(executed_action),
+            "action_overridden": bool(action_overridden),
+            "action_mask_valid_count": int(np.count_nonzero(action_mask)),
+            "action_mask": [int(v) for v in action_mask.astype(np.int8)],
             "coverage_cells": int(coverage_cells),
             "free_cells": int(self.free_total),
             "coverage_ratio": float(self._coverage_ratio()),

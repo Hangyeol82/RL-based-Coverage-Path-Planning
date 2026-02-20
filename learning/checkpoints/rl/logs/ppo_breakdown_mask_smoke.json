@@ -1,0 +1,62 @@
+{
+  "rollouts": [
+    {
+      "rollout": 1.0,
+      "timesteps": 16.0,
+      "reward_area": 0.5,
+      "reward_tv_i": -0.20151650607585908,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.1,
+      "reward_total": 0.1984834939241409,
+      "coverage_ratio": 0.001736641221374046,
+      "collision": 0.0
+    },
+    {
+      "rollout": 2.0,
+      "timesteps": 32.0,
+      "reward_area": 0.5,
+      "reward_tv_i": -0.2633883595466614,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.1,
+      "reward_total": 0.13661164045333862,
+      "coverage_ratio": 0.004541984732824428,
+      "collision": 0.0
+    },
+    {
+      "rollout": 3.0,
+      "timesteps": 48.0,
+      "reward_area": 0.4375,
+      "reward_tv_i": -0.12499994039535522,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.1,
+      "reward_total": 0.21250005960464474,
+      "coverage_ratio": 0.006145038167938931,
+      "collision": 0.0
+    },
+    {
+      "rollout": 4.0,
+      "timesteps": 64.0,
+      "reward_area": 0.4375,
+      "reward_tv_i": -0.10669417381286621,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.1,
+      "reward_total": 0.2308058261871338,
+      "coverage_ratio": 0.008702290076335878,
+      "collision": 0.0
+    }
+  ],
+  "track_keys": [
+    "reward_area",
+    "reward_tv_i",
+    "reward_tv_g",
+    "reward_coll",
+    "reward_const",
+    "reward_total",
+    "coverage_ratio",
+    "collision"
+  ]
+}

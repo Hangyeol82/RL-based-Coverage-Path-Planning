@@ -75,12 +75,12 @@ class RobotStateObservationBuilder:
         return vec
 
     def _coverage_progress(self, occupancy: np.ndarray, explored: np.ndarray) -> float:
-        obstacle = occupancy == 1
-        free_mask = ~obstacle
-        free_total = int(np.count_nonzero(free_mask))
+        # Online setting: unknown (-1) must not be treated as free.
+        known_free = occupancy == 0
+        free_total = int(np.count_nonzero(known_free))
         if free_total == 0:
             return 0.0
-        covered_free = int(np.count_nonzero(free_mask & explored.astype(bool)))
+        covered_free = int(np.count_nonzero(known_free & explored.astype(bool)))
         return float(covered_free) / float(free_total)
 
     def _stagnation_index(self, recent_new_coverage: Optional[Sequence[float]]) -> float:
