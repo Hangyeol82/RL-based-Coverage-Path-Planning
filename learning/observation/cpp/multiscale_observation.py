@@ -37,6 +37,10 @@ class MultiScaleCPPObservationConfig:
     # Unknown relaxation: if a coarse cell has enough known area, treat it as
     # known for DTM state construction.
     dtm_min_known_ratio: float = 0.6
+    dtm_patch_min_known_ratio: float = 0.6
+    # Ambiguous partial-observation DTM output value.
+    # Default is unknown; only certain directions become 0/1.
+    dtm_uncertain_fill: float = -1.0
     dtm_unknown_fill: float = -1.0
 
 
@@ -65,6 +69,10 @@ class MultiScaleCPPObservationBuilder:
     ):
         self.config = config or MultiScaleCPPObservationConfig()
         self.include_dtm = bool(include_dtm)
+        if not (0.0 < float(self.config.dtm_min_known_ratio) <= 1.0):
+            raise ValueError("dtm_min_known_ratio must be in (0, 1]")
+        if not (0.0 < float(self.config.dtm_patch_min_known_ratio) <= 1.0):
+            raise ValueError("dtm_patch_min_known_ratio must be in (0, 1]")
 
     @property
     def num_levels(self) -> int:
@@ -86,6 +94,7 @@ class MultiScaleCPPObservationBuilder:
         obstacle_map: np.ndarray,
         frontier_map: np.ndarray,
         state_map: Optional[np.ndarray],
+        known_ratio_map: Optional[np.ndarray],
         *,
         center: Optional[GridPos],
         out_size: int,
@@ -106,15 +115,25 @@ class MultiScaleCPPObservationBuilder:
                 raise RuntimeError("state_map is required when include_dtm=True")
             dtm = compute_directional_traversability(
                 state_map,
+                known_ratio_map=known_ratio_map,
                 patch_size=self.config.dtm_patch_size,
                 connectivity=self.config.dtm_connectivity,
                 require_fully_known_patch=self.config.dtm_require_fully_known_patch,
+                min_center_known_ratio=self.config.dtm_min_known_ratio,
+                min_patch_known_ratio=self.config.dtm_patch_min_known_ratio,
+                uncertain_fill=self.config.dtm_uncertain_fill,
                 unknown_fill=self.config.dtm_unknown_fill,
             )
             if center is not None:
                 for k in range(4):
                     channels.append(
-                        center_crop_with_pad(dtm[k], center, out_size, out_size, pad_value=0.0)
+                        center_crop_with_pad(
+                            dtm[k],
+                            center,
+                            out_size,
+                            out_size,
+                            pad_value=self.config.dtm_unknown_fill,
+                        )
                     )
             else:
                 channels.extend([dtm[0], dtm[1], dtm[2], dtm[3]])
@@ -143,6 +162,7 @@ class MultiScaleCPPObservationBuilder:
             unknown_value=self.config.unknown_value,
             obstacle_value=self.config.obstacle_value,
         )
+        known_f = (~unknown).astype(np.float32)
         covered = explored.astype(bool) & known_free
         frontier = compute_frontier_map(known_free, unknown)
 
@@ -155,6 +175,7 @@ class MultiScaleCPPObservationBuilder:
         # Local robot-centered levels.
         for lv, block in enumerate(self.config.local_blocks):
             cov_coarse = block_reduce_mean(covered_f, block)
+            known_ratio_coarse = block_reduce_mean(known_f, block)
             obs_coarse = block_reduce_mean(obstacle_f, block)
             frn_coarse = block_reduce_max(frontier_f, block)
             state_coarse = None
@@ -173,6 +194,7 @@ class MultiScaleCPPObservationBuilder:
                 obs_coarse,
                 frn_coarse,
                 state_coarse,
+                known_ratio_coarse,
                 center=center_coarse,
                 out_size=self.config.local_window_size,
             )
@@ -180,6 +202,7 @@ class MultiScaleCPPObservationBuilder:
         # Global non-centered level.
         gsize = self.config.global_window_size
         cov_global = global_reduce_mean(covered_f, gsize, gsize)
+        known_ratio_global = global_reduce_mean(known_f, gsize, gsize)
         obs_global = global_reduce_mean(obstacle_f, gsize, gsize)
         frn_global = global_reduce_max(frontier_f, gsize, gsize)
         state_global = None
@@ -198,6 +221,7 @@ class MultiScaleCPPObservationBuilder:
             obs_global,
             frn_global,
             state_global,
+            known_ratio_global,
             center=None,
             out_size=gsize,
         )
