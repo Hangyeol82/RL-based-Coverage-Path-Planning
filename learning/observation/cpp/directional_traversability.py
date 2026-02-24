@@ -108,6 +108,8 @@ def compute_directional_traversability(
     min_patch_known_ratio: float = 0.0,
     uncertain_fill: float = -1.0,
     unknown_fill: float = -1.0,
+    out: Optional[np.ndarray] = None,
+    dirty_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Compute directional traversability maps for each cell.
@@ -135,92 +137,110 @@ def compute_directional_traversability(
     h, w = state_grid.shape
     p = _normalize_patch_size(patch_size, limit=max(h, w))
     center = p // 2
-    out = np.full((4, h, w), unknown_fill, dtype=np.float32)
+    if out is None:
+        out_arr = np.full((4, h, w), unknown_fill, dtype=np.float32)
+    else:
+        if out.shape != (4, h, w):
+            raise ValueError("out shape must be (4, H, W) matching state_grid")
+        out_arr = out.astype(np.float32, copy=False)
 
-    for r in range(h):
-        for c in range(w):
-            state_center = int(state_grid[r, c])
+    targets = None
+    if dirty_mask is not None:
+        if dirty_mask.shape != state_grid.shape:
+            raise ValueError("dirty_mask shape must match state_grid")
+        targets = np.argwhere(dirty_mask)
+        if targets.size == 0:
+            return out_arr
 
-            local = center_crop_with_pad(
-                state_grid,
+    if targets is None:
+        iterator = ((r, c) for r in range(h) for c in range(w))
+    else:
+        iterator = ((int(rc[0]), int(rc[1])) for rc in targets)
+
+    for r, c in iterator:
+        state_center = int(state_grid[r, c])
+
+        local = center_crop_with_pad(
+            state_grid,
+            center=(r, c),
+            out_h=p,
+            out_w=p,
+            pad_value=float(BLOCKED_STATE),
+        ).astype(np.int8)
+
+        local_has_unknown = bool(np.any(local == UNKNOWN_STATE))
+        if require_fully_known_patch and local_has_unknown:
+            out_arr[:, r, c] = float(unknown_fill)
+            continue
+
+        if known_ratio_map is not None:
+            center_known_ratio = float(known_ratio_map[r, c])
+            local_known_ratio = center_crop_with_pad(
+                known_ratio_map,
                 center=(r, c),
                 out_h=p,
                 out_w=p,
-                pad_value=float(BLOCKED_STATE),
-            ).astype(np.int8)
+                pad_value=0.0,
+            )
+            patch_known_ratio = float(np.mean(local_known_ratio))
+        else:
+            center_known_ratio = 1.0 if state_center != UNKNOWN_STATE else 0.0
+            patch_known_ratio = float(np.mean(local != UNKNOWN_STATE))
 
-            local_has_unknown = bool(np.any(local == UNKNOWN_STATE))
-            if require_fully_known_patch and local_has_unknown:
-                continue
+        trusted_local = (
+            center_known_ratio >= min_center_known_ratio
+            and patch_known_ratio >= min_patch_known_ratio
+        )
 
-            if known_ratio_map is not None:
-                center_known_ratio = float(known_ratio_map[r, c])
-                local_known_ratio = center_crop_with_pad(
-                    known_ratio_map,
-                    center=(r, c),
-                    out_h=p,
-                    out_w=p,
-                    pad_value=0.0,
-                )
-                patch_known_ratio = float(np.mean(local_known_ratio))
+        # High-confidence branch: strict free-only DTM.
+        if trusted_local and state_center == FREE_STATE:
+            free_mask = local == FREE_STATE
+            lr, ud, nwse, nesw = _direction_flags_from_mask(
+                free_mask,
+                start=(center, center),
+                connectivity=connectivity,
+            )
+            out_arr[0, r, c] = 1.0 if lr else 0.0
+            out_arr[1, r, c] = 1.0 if ud else 0.0
+            out_arr[2, r, c] = 1.0 if nwse else 0.0
+            out_arr[3, r, c] = 1.0 if nesw else 0.0
+            continue
+
+        # Observed blocked center should stay non-traversable.
+        if state_center == BLOCKED_STATE:
+            out_arr[:, r, c] = 0.0
+            continue
+
+        # Uncertainty-aware branch:
+        # - pessimistic: unknown treated as blocked
+        # - optimistic: unknown treated as free
+        # If both agree, that result is certain and used regardless of known ratio.
+        pess_mask = local == FREE_STATE
+        opt_mask = (local == FREE_STATE) | (local == UNKNOWN_STATE)
+
+        p_lr, p_ud, p_nwse, p_nesw = _direction_flags_from_mask(
+            pess_mask,
+            start=(center, center),
+            connectivity=connectivity,
+        )
+        o_lr, o_ud, o_nwse, o_nesw = _direction_flags_from_mask(
+            opt_mask,
+            start=(center, center),
+            connectivity=connectivity,
+        )
+
+        for ch, p_flag, o_flag in (
+            (0, p_lr, o_lr),
+            (1, p_ud, o_ud),
+            (2, p_nwse, o_nwse),
+            (3, p_nesw, o_nesw),
+        ):
+            if p_flag:
+                out_arr[ch, r, c] = 1.0
+            elif not o_flag:
+                out_arr[ch, r, c] = 0.0
             else:
-                center_known_ratio = 1.0 if state_center != UNKNOWN_STATE else 0.0
-                patch_known_ratio = float(np.mean(local != UNKNOWN_STATE))
+                # Ambiguous with partial observability: keep unknown.
+                out_arr[ch, r, c] = float(uncertain_fill)
 
-            trusted_local = (
-                center_known_ratio >= min_center_known_ratio
-                and patch_known_ratio >= min_patch_known_ratio
-            )
-
-            # High-confidence branch: same as previous strict free-only DTM.
-            if trusted_local and state_center == FREE_STATE:
-                free_mask = local == FREE_STATE
-                lr, ud, nwse, nesw = _direction_flags_from_mask(
-                    free_mask,
-                    start=(center, center),
-                    connectivity=connectivity,
-                )
-                out[0, r, c] = 1.0 if lr else 0.0
-                out[1, r, c] = 1.0 if ud else 0.0
-                out[2, r, c] = 1.0 if nwse else 0.0
-                out[3, r, c] = 1.0 if nesw else 0.0
-                continue
-
-            # Observed blocked center should stay non-traversable.
-            if state_center == BLOCKED_STATE:
-                out[:, r, c] = 0.0
-                continue
-
-            # Uncertainty-aware branch:
-            # - pessimistic: unknown treated as blocked
-            # - optimistic: unknown treated as free
-            # If both agree, that result is certain and used regardless of known ratio.
-            pess_mask = local == FREE_STATE
-            opt_mask = (local == FREE_STATE) | (local == UNKNOWN_STATE)
-
-            p_lr, p_ud, p_nwse, p_nesw = _direction_flags_from_mask(
-                pess_mask,
-                start=(center, center),
-                connectivity=connectivity,
-            )
-            o_lr, o_ud, o_nwse, o_nesw = _direction_flags_from_mask(
-                opt_mask,
-                start=(center, center),
-                connectivity=connectivity,
-            )
-
-            for ch, p_flag, o_flag in (
-                (0, p_lr, o_lr),
-                (1, p_ud, o_ud),
-                (2, p_nwse, o_nwse),
-                (3, p_nesw, o_nesw),
-            ):
-                if p_flag:
-                    out[ch, r, c] = 1.0
-                elif not o_flag:
-                    out[ch, r, c] = 0.0
-                else:
-                    # Ambiguous with partial observability: keep unknown.
-                    out[ch, r, c] = float(uncertain_fill)
-
-    return out
+    return out_arr
