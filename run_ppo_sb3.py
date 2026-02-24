@@ -64,6 +64,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--verbose",
+        type=int,
+        default=1,
+        choices=[0, 1, 2],
+        help="SB3 PPO verbosity level.",
+    )
 
     p.add_argument("--sensor-range", type=int, default=2, help="2 -> 5x5 sensing window")
     p.add_argument("--max-episode-steps", type=int, default=1500)
@@ -433,7 +440,7 @@ def main():
             policy_kwargs=policy_kwargs,
             seed=args.seed,
             device=device,
-            verbose=1,
+            verbose=int(args.verbose),
         )
 
     bc_warm_start_stats = None

@@ -18,6 +18,8 @@ import numpy as np
 DEFAULT_METRICS = (
     "reward_total",
     "coverage_ratio",
+    "episode_final_coverage_ratio",
+    "action_override_rate",
     "collision",
     "reward_area",
     "reward_tv_i",

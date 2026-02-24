@@ -32,7 +32,7 @@ class RolloutTransition:
     robot_pos: GridPos
     prev_pos: Optional[GridPos]
     action: int
-    potential_level0: np.ndarray
+    potential_level0: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -121,6 +121,123 @@ def collect_epsilon_rollout(
     return teacher.logged_transitions, path
 
 
+def _sense_square(
+    true_map: np.ndarray,
+    known_map: np.ndarray,
+    pos: GridPos,
+    sensor_range: int,
+):
+    rr, cc = pos
+    rows, cols = true_map.shape
+    r0 = max(0, rr - sensor_range)
+    r1 = min(rows - 1, rr + sensor_range)
+    c0 = max(0, cc - sensor_range)
+    c1 = min(cols - 1, cc + sensor_range)
+    known_map[r0 : r1 + 1, c0 : c1 + 1] = true_map[r0 : r1 + 1, c0 : c1 + 1]
+
+
+def build_serpentine_path(
+    rows: int,
+    cols: int,
+    *,
+    start_node: GridPos = (0, 0),
+    sweep_axis: str = "row",
+) -> List[GridPos]:
+    if rows <= 0 or cols <= 0:
+        raise ValueError("rows and cols must be positive")
+    if start_node != (0, 0):
+        raise ValueError("serpentine teacher currently supports start_node=(0, 0) only")
+    if sweep_axis not in {"row", "col"}:
+        raise ValueError("sweep_axis must be one of {'row', 'col'}")
+
+    path: List[GridPos] = []
+    if sweep_axis == "row":
+        for r in range(rows):
+            if (r % 2) == 0:
+                c_iter = range(cols)
+            else:
+                c_iter = range(cols - 1, -1, -1)
+            for c in c_iter:
+                path.append((int(r), int(c)))
+    else:
+        for c in range(cols):
+            if (c % 2) == 0:
+                r_iter = range(rows)
+            else:
+                r_iter = range(rows - 1, -1, -1)
+            for r in r_iter:
+                path.append((int(r), int(c)))
+    return path
+
+
+def collect_serpentine_rollout(
+    grid_map: np.ndarray,
+    *,
+    start_node: GridPos = (0, 0),
+    sensor_range: int = 2,
+    sweep_axis: str = "row",
+    max_steps: Optional[int] = None,
+    strict_empty: bool = True,
+) -> Tuple[List[RolloutTransition], List[GridPos]]:
+    """
+    Collect deterministic zigzag(serpentine) teacher transitions on a grid map.
+
+    The teacher path is generated without planner search and is intended for
+    simple directional prior pretraining on easy maps (typically empty maps).
+    """
+    true_map = np.asarray(grid_map, dtype=np.int32)
+    if true_map.ndim != 2:
+        raise ValueError("grid_map must be 2D")
+    if not np.isin(true_map, [0, 1]).all():
+        raise ValueError("grid_map must contain only 0(free),1(obstacle)")
+    rows, cols = true_map.shape
+
+    if strict_empty and int(np.count_nonzero(true_map == 1)) > 0:
+        raise ValueError("strict_empty=True requires an obstacle-free map")
+    sr, sc = start_node
+    if not (0 <= sr < rows and 0 <= sc < cols):
+        raise ValueError(f"start_node out of bounds: {start_node}")
+    if true_map[sr, sc] != 0:
+        raise ValueError(f"start_node is blocked: {start_node}")
+
+    path = build_serpentine_path(rows, cols, start_node=start_node, sweep_axis=sweep_axis)
+    if max_steps is not None:
+        max_steps_i = int(max_steps)
+        if max_steps_i <= 0:
+            raise ValueError("max_steps must be positive when provided")
+        max_nodes = min(len(path), max_steps_i + 1)
+        path = path[:max_nodes]
+
+    known_map = np.full_like(true_map, fill_value=-1, dtype=np.int32)
+    explored = np.zeros_like(true_map, dtype=bool)
+    transitions: List[RolloutTransition] = []
+
+    current = path[0]
+    prev_pos: Optional[GridPos] = None
+    _sense_square(true_map, known_map, current, int(sensor_range))
+    explored[current] = True
+
+    for nxt in path[1:]:
+        action = _action_from_nodes(current, nxt)
+        transitions.append(
+            RolloutTransition(
+                occupancy=known_map.copy(),
+                explored=explored.copy(),
+                robot_pos=tuple(current),
+                prev_pos=tuple(prev_pos) if prev_pos is not None else None,
+                action=int(action),
+                potential_level0=None,
+            )
+        )
+
+        prev_pos = current
+        current = nxt
+        _sense_square(true_map, known_map, current, int(sensor_range))
+        explored[current] = True
+
+    return transitions, path
+
+
 def build_bc_tensors_from_rollout(
     transitions: Sequence[RolloutTransition],
     maps_builder: Optional[object] = None,
@@ -148,12 +265,14 @@ def build_bc_tensors_from_rollout(
 
         # Legacy MAPS builder uses teacher level-0 potential as an input.
         if isinstance(maps_builder, MAPSObservationBuilder):
-            levels = maps_builder.build_levels(
+            build_kwargs = dict(
                 occupancy=tr.occupancy,
                 robot_pos=tr.robot_pos,
                 explored=tr.explored,
-                potential_level0=tr.potential_level0,
             )
+            if tr.potential_level0 is not None:
+                build_kwargs["potential_level0"] = tr.potential_level0
+            levels = maps_builder.build_levels(**build_kwargs)
         else:
             levels = maps_builder.build_levels(
                 occupancy=tr.occupancy,

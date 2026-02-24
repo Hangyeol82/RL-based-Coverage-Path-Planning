@@ -100,6 +100,7 @@ class CPPDiscreteEnv:
         self.explored = np.zeros_like(self.true_map, dtype=bool)
         self.current_pos: GridPos = self._default_start
         self.prev_pos: Optional[GridPos] = None
+        self.prev_action: Optional[int] = None
         self.path: List[GridPos] = [self.current_pos]
         self.steps = 0
         self.done = False
@@ -180,12 +181,28 @@ class CPPDiscreteEnv:
         obs = self._known_obstacle_map_float()
         cov_local = self._local_patch(cov, center, radius)
         obs_local = self._local_patch(obs, center, radius)
-        return float(total_variation(cov_local, obs_local, mode=self.config.tv_mode))
+        return float(
+            total_variation(
+                cov_local,
+                obs_local,
+                mode=self.config.tv_mode,
+                obstacle_mask=obs_local,
+                exclude_obstacle_edges=bool(self.config.reward.tv_exclude_obstacle_edges),
+            )
+        )
 
     def _compute_global_tv(self) -> float:
         cov = self._coverage_map_float()
         obs = self._known_obstacle_map_float()
-        return float(total_variation(cov, obs, mode=self.config.tv_mode))
+        return float(
+            total_variation(
+                cov,
+                obs,
+                mode=self.config.tv_mode,
+                obstacle_mask=obs,
+                exclude_obstacle_edges=bool(self.config.reward.tv_exclude_obstacle_edges),
+            )
+        )
 
     def _build_observation(self) -> Dict[str, object]:
         levels = self.maps_builder.build_levels(
@@ -250,6 +267,7 @@ class CPPDiscreteEnv:
     def reset(self, *, start_pos: Optional[GridPos] = None) -> Dict[str, object]:
         self.current_pos = self._resolve_start(start_pos) if start_pos is not None else self._default_start
         self.prev_pos = None
+        self.prev_action = None
         self.steps = 0
         self.done = False
         self.last_collision = False
@@ -287,8 +305,20 @@ class CPPDiscreteEnv:
                 executed_action = int(fallback)
                 action_overridden = True
 
-        dr, dc = ACTION_TO_DELTA[executed_action]
         cr, cc = self.current_pos
+        prev_action = self.prev_action
+        forced_turn = False
+        if prev_action is not None:
+            pdr, pdc = ACTION_TO_DELTA[int(prev_action)]
+            pr, pc = cr + pdr, cc + pdc
+            can_keep_heading = (
+                0 <= pr < self.rows
+                and 0 <= pc < self.cols
+                and self.true_map[pr, pc] == 0
+            )
+            forced_turn = not can_keep_heading
+
+        dr, dc = ACTION_TO_DELTA[executed_action]
         nr, nc = cr + dr, cc + dc
 
         collided = False
@@ -302,6 +332,7 @@ class CPPDiscreteEnv:
         self.prev_pos = prev
         self._sense_at(self.current_pos)
 
+        was_explored = bool(self.explored[self.current_pos]) if not collided else False
         local_tv_old = self._compute_local_tv(self.current_pos)
         newly_visited = self._mark_explored(self.current_pos)
         local_tv_new = self._compute_local_tv(self.current_pos)
@@ -318,11 +349,33 @@ class CPPDiscreteEnv:
             collided=collided,
             local_tv_velocity_norm=1.0,
         )
-        self.last_reward = compute_cpp_reward(rew_in, self.config.reward)
+        base_reward = compute_cpp_reward(rew_in, self.config.reward)
+        reward_turn = 0.0
+        if (
+            prev_action is not None
+            and executed_action != int(prev_action)
+            and not forced_turn
+        ):
+            reward_turn = float(self.config.reward.turn_change_penalty)
+
+        reward_overlap = 0.0
+        if (not collided) and was_explored:
+            reward_overlap = float(self.config.reward.revisit_penalty)
+
+        total_reward = float(base_reward.total + reward_turn + reward_overlap)
+        self.last_reward = CPPRewardBreakdown(
+            area=float(base_reward.area),
+            tv_local=float(base_reward.tv_local),
+            tv_global=float(base_reward.tv_global),
+            collision=float(base_reward.collision),
+            constant=float(base_reward.constant),
+            total=total_reward,
+        )
         self.recent_new_coverage.append(float(newly_visited))
 
         self.steps += 1
         self.path.append(self.current_pos)
+        self.prev_action = int(executed_action)
 
         done_reason = ""
         truncated = False
@@ -350,8 +403,12 @@ class CPPDiscreteEnv:
             "action_requested": int(requested_action),
             "action_executed": int(executed_action),
             "action_overridden": bool(action_overridden),
+            "forced_turn": bool(forced_turn),
             "action_mask_valid_count": int(np.count_nonzero(action_mask)),
             "action_mask": [int(v) for v in action_mask.astype(np.int8)],
+            "revisited_cell": bool((not collided) and was_explored),
+            "reward_turn": float(reward_turn),
+            "reward_overlap": float(reward_overlap),
             "coverage_cells": int(coverage_cells),
             "free_cells": int(self.free_total),
             "coverage_ratio": float(self._coverage_ratio()),

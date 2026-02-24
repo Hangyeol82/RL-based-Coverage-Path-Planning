@@ -22,10 +22,18 @@ class CPPRewardConfig:
     global_tv_reward_scale: float = 0.0
     global_tv_reward_max: float = 5.0
     global_tv_normalizer: float = 4.0
+    # If True, TV gradients across any edge touching obstacle cells are ignored.
+    tv_exclude_obstacle_edges: bool = True
 
     collision_reward: float = -10.0
     constant_reward: float = -0.1
     constant_reward_always: bool = True
+    # Discrete-grid shaping terms (applied in env step logic).
+    # - turn_change_penalty: applied when executed direction changes from previous step,
+    #   unless continuing previous direction is physically blocked.
+    # - revisit_penalty: applied when stepping onto an already explored free cell.
+    turn_change_penalty: float = -0.05
+    revisit_penalty: float = -0.1
 
 
 @dataclass(frozen=True)
@@ -138,6 +146,9 @@ def total_variation(
     img: np.ndarray,
     img2: Optional[np.ndarray] = None,
     mode: str = "sym-iso",
+    *,
+    obstacle_mask: Optional[np.ndarray] = None,
+    exclude_obstacle_edges: bool = False,
 ) -> float:
     """
     Compatible TV helper adapted from rl-cpp.
@@ -160,6 +171,18 @@ def total_variation(
         y = np.maximum(x, y)
         diff_v = np.minimum(diff_v, np.abs(y[1:, :] - y[:-1, :]))
         diff_h = np.minimum(diff_h, np.abs(y[:, 1:] - y[:, :-1]))
+
+    if exclude_obstacle_edges and obstacle_mask is not None:
+        obs = np.asarray(obstacle_mask, dtype=np.float32)
+        if obs.shape != x.shape:
+            raise ValueError(
+                f"obstacle_mask must match img shape, got {obs.shape} vs {x.shape}"
+            )
+        obs = obs > 0.5
+        touches_obs_v = obs[1:, :] | obs[:-1, :]
+        touches_obs_h = obs[:, 1:] | obs[:, :-1]
+        diff_v = np.where(touches_obs_v, 0.0, diff_v)
+        diff_h = np.where(touches_obs_h, 0.0, diff_h)
 
     if mode == "sym-iso":
         tv = (

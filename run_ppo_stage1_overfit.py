@@ -66,7 +66,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--init-from-bc",
         type=str,
-        default="learning/checkpoints/bc/bc_smoke_latest.pt",
+        default="learning/checkpoints/bc/bc_zigzag_empty_latest.pt",
         help="BC checkpoint for PPO warm-start. Set empty string to disable.",
     )
     p.add_argument("--init-from-bc-strict", action="store_true")

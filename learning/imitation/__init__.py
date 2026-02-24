@@ -3,8 +3,10 @@ from .epsilon_rollout import (
     DELTA_TO_ACTION,
     BCTensorDataset,
     RolloutTransition,
+    build_serpentine_path,
     build_bc_tensors_from_rollout,
     collect_epsilon_rollout,
+    collect_serpentine_rollout,
 )
 from learning.observation import MAPSObservationBuilder, MAPSObservationConfig
 from .policy_bc import BCPolicy, BCPolicyConfig
@@ -19,6 +21,7 @@ __all__ = [
     "BCTensorDataset",
     "BCPolicy",
     "BCPolicyConfig",
+    "build_serpentine_path",
     "MAPSObservationBuilder",
     "MAPSObservationConfig",
     "RolloutTransition",
@@ -26,4 +29,5 @@ __all__ = [
     "RobotStateObservationConfig",
     "build_bc_tensors_from_rollout",
     "collect_epsilon_rollout",
+    "collect_serpentine_rollout",
 ]
