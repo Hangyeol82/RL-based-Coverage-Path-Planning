@@ -86,6 +86,18 @@ def _parse_int_list(raw: str, *, name: str) -> List[int]:
     return vals
 
 
+def _parse_float_list(raw: str, *, name: str) -> List[float]:
+    vals: List[float] = []
+    for tok in raw.split(","):
+        s = tok.strip()
+        if not s:
+            continue
+        vals.append(float(s))
+    if not vals:
+        raise ValueError(f"{name} must not be empty")
+    return vals
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -102,6 +114,55 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="1,2,3,4,4",
         help="Comma list of difficulty levels per stage block.",
+    )
+    p.add_argument(
+        "--curriculum-mode",
+        type=str,
+        default="fixed",
+        choices=["fixed", "adaptive"],
+        help="fixed: switch by stage-timesteps, adaptive: promote by chunk metrics.",
+    )
+    p.add_argument(
+        "--adaptive-min-chunks",
+        type=int,
+        default=2,
+        help="Minimum chunks to stay before adaptive promotion checks are active.",
+    )
+    p.add_argument(
+        "--adaptive-window",
+        type=int,
+        default=2,
+        help="Recent chunk window used for adaptive promotion checks.",
+    )
+    p.add_argument(
+        "--adaptive-max-chunks-per-level",
+        type=int,
+        default=0,
+        help="Force promotion after this many chunks at one level (0 disables).",
+    )
+    p.add_argument(
+        "--adaptive-cov-thresholds",
+        type=str,
+        default="0.55,0.50,0.45,0.40",
+        help="Per-level mean coverage thresholds for promotion.",
+    )
+    p.add_argument(
+        "--adaptive-done-cov-thresholds",
+        type=str,
+        default="",
+        help="Optional per-level done-episode final coverage thresholds. Empty disables this gate.",
+    )
+    p.add_argument(
+        "--adaptive-cov-slope-min",
+        type=float,
+        default=-0.002,
+        help="Minimum slope of recent chunk mean coverage required for promotion.",
+    )
+    p.add_argument(
+        "--adaptive-collision-max",
+        type=float,
+        default=0.01,
+        help="Maximum recent chunk mean collision allowed for promotion.",
     )
     p.add_argument("--seed", type=int, default=101)
     p.add_argument(
@@ -171,6 +232,29 @@ def _safe_mean(rows: List[Dict], key: str) -> float:
     if len(vals) == 0:
         return float("nan")
     return float(np.mean(np.asarray(vals, dtype=np.float64)))
+
+
+def _safe_mean_vals(vals: List[float]) -> float:
+    clean = [float(v) for v in vals if not np.isnan(float(v))]
+    if len(clean) == 0:
+        return float("nan")
+    return float(np.mean(np.asarray(clean, dtype=np.float64)))
+
+
+def _trend_slope(vals: List[float]) -> float:
+    clean = [float(v) for v in vals if not np.isnan(float(v))]
+    n = len(clean)
+    if n < 2:
+        return 0.0
+    xs = np.arange(1, n + 1, dtype=np.float64)
+    ys = np.asarray(clean, dtype=np.float64)
+    mx = float(np.mean(xs))
+    my = float(np.mean(ys))
+    num = float(np.sum((xs - mx) * (ys - my)))
+    den = float(np.sum((xs - mx) ** 2))
+    if den <= 1e-12:
+        return 0.0
+    return num / den
 
 
 def _preset_for_chunk(
@@ -266,14 +350,32 @@ def main():
         raise ValueError("--total-timesteps must be positive")
     if args.chunk_timesteps <= 0:
         raise ValueError("--chunk-timesteps must be positive")
-    if args.stage_timesteps <= 0:
+    if args.curriculum_mode == "fixed" and args.stage_timesteps <= 0:
         raise ValueError("--stage-timesteps must be positive")
+    if args.adaptive_min_chunks <= 0:
+        raise ValueError("--adaptive-min-chunks must be positive")
+    if args.adaptive_window <= 0:
+        raise ValueError("--adaptive-window must be positive")
+    if args.adaptive_max_chunks_per_level < 0:
+        raise ValueError("--adaptive-max-chunks-per-level must be >= 0")
+    if not (0.0 <= float(args.adaptive_collision_max) <= 1.0):
+        raise ValueError("--adaptive-collision-max must be in [0, 1]")
     if args.map_size <= 1:
         raise ValueError("--map-size must be >= 2")
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
 
     phase_levels = _parse_int_list(args.phase_levels, name="phase-levels")
+    adaptive_cov_thresholds = _parse_float_list(
+        args.adaptive_cov_thresholds,
+        name="adaptive-cov-thresholds",
+    )
+    adaptive_done_cov_thresholds: List[float] = []
+    if args.adaptive_done_cov_thresholds.strip():
+        adaptive_done_cov_thresholds = _parse_float_list(
+            args.adaptive_done_cov_thresholds,
+            name="adaptive-done-cov-thresholds",
+        )
     repo_root = Path(__file__).resolve().parent
     runner = repo_root / "run_ppo_sb3.py"
     if not runner.exists():
@@ -305,21 +407,44 @@ def main():
     num_chunks = int(math.ceil(total / float(chunk)))
 
     print(
-        f"[INFO] total={total} chunk={chunk} stage={args.stage_timesteps} "
-        f"chunks={num_chunks} num_envs={args.num_envs} vec={args.vec_env}"
+        f"[INFO] total={total} chunk={chunk} mode={args.curriculum_mode} "
+        f"stage={args.stage_timesteps} chunks={num_chunks} "
+        f"num_envs={args.num_envs} vec={args.vec_env}"
     , flush=True)
     print(f"[INFO] out_dir={out_dir}", flush=True)
+    if args.curriculum_mode == "adaptive":
+        print(
+            "[INFO] adaptive gates:"
+            f" min_chunks={args.adaptive_min_chunks},"
+            f" window={args.adaptive_window},"
+            f" max_chunks_per_level={args.adaptive_max_chunks_per_level},"
+            f" cov_thresholds={adaptive_cov_thresholds},"
+            f" done_cov_thresholds={adaptive_done_cov_thresholds if adaptive_done_cov_thresholds else 'disabled'},"
+            f" cov_slope_min={args.adaptive_cov_slope_min},"
+            f" collision_max={args.adaptive_collision_max}",
+            flush=True,
+        )
 
     all_rollouts: List[Dict] = []
     progress_rows: List[Dict] = []
     prev_model_zip = ""
     done_steps = 0
     failed = False
+    adaptive_stage_idx = 0
+    adaptive_stage_chunks: List[Dict] = []
 
     for i in range(num_chunks):
         chunk_start = done_steps
         chunk_t = int(min(chunk, total - done_steps))
-        preset = _preset_for_chunk(phase_levels, int(args.stage_timesteps), chunk_start)
+        if args.curriculum_mode == "fixed":
+            preset = _preset_for_chunk(phase_levels, int(args.stage_timesteps), chunk_start)
+            stage_idx = int(chunk_start // int(args.stage_timesteps))
+        else:
+            stage_idx = int(adaptive_stage_idx)
+            level = int(phase_levels[min(stage_idx, len(phase_levels) - 1)])
+            if level not in PRESETS:
+                raise ValueError(f"Unsupported shape-grid level in phase-levels: {level}")
+            preset = PRESETS[level]
         map_seed = int(args.seed if args.map_seed_mode == "fixed" else (args.seed + i))
         run_seed = int(args.seed + i)
 
@@ -405,6 +530,8 @@ def main():
             "status": "ok",
             "chunk_timesteps": int(chunk_t),
             "timesteps_done": int(done_steps),
+            "curriculum_mode": str(args.curriculum_mode),
+            "curriculum_stage_index": int(stage_idx),
             "curriculum_level": int(preset.level),
             "curriculum_name": preset.name,
             "map_seed": int(map_seed),
@@ -421,6 +548,9 @@ def main():
             "model_zip": str(save_model_zip),
             "rollouts_seen": int(len(all_rollouts)),
         }
+        rec["chunk_mean_coverage_ratio"] = _safe_mean(rollouts, "coverage_ratio")
+        rec["chunk_mean_collision"] = _safe_mean(rollouts, "collision")
+        rec["chunk_mean_done_final_coverage_ratio"] = _safe_mean(rollouts, "episode_final_coverage_ratio")
         progress_rows.append(rec)
 
         print(
@@ -430,6 +560,105 @@ def main():
             f"cumulative(mean): cov={rec['cum_mean_coverage_ratio']:.4f}, "
             f"rew={rec['cum_mean_reward_total']:.4f}, coll={rec['cum_mean_collision']:.4f}"
         , flush=True)
+
+        if args.curriculum_mode == "adaptive":
+            adaptive_stage_chunks.append(rec)
+            if adaptive_stage_idx < (len(phase_levels) - 1):
+                chunks_here = len(adaptive_stage_chunks)
+                win = int(min(args.adaptive_window, chunks_here))
+                recent = adaptive_stage_chunks[-win:]
+                recent_cov = [float(r.get("chunk_mean_coverage_ratio", float("nan"))) for r in recent]
+                recent_coll = [float(r.get("chunk_mean_collision", float("nan"))) for r in recent]
+                recent_done_cov = [
+                    float(r.get("chunk_mean_done_final_coverage_ratio", float("nan")))
+                    for r in recent
+                ]
+                cov_mean = _safe_mean_vals(recent_cov)
+                coll_mean = _safe_mean_vals(recent_coll)
+                done_cov_mean = _safe_mean_vals(recent_done_cov)
+                cov_slope = _trend_slope(recent_cov)
+
+                thr_idx = min(adaptive_stage_idx, len(adaptive_cov_thresholds) - 1)
+                cov_thr = float(adaptive_cov_thresholds[thr_idx])
+                done_cov_thr = None
+                if len(adaptive_done_cov_thresholds) > 0:
+                    done_cov_thr = float(
+                        adaptive_done_cov_thresholds[
+                            min(adaptive_stage_idx, len(adaptive_done_cov_thresholds) - 1)
+                        ]
+                    )
+
+                cond_ready = chunks_here >= int(args.adaptive_min_chunks)
+                cond_cov = (not np.isnan(cov_mean)) and (cov_mean >= cov_thr)
+                cond_slope = float(cov_slope) >= float(args.adaptive_cov_slope_min)
+                cond_coll = (not np.isnan(coll_mean)) and (coll_mean <= float(args.adaptive_collision_max))
+                cond_done_cov = True
+                if done_cov_thr is not None:
+                    cond_done_cov = (not np.isnan(done_cov_mean)) and (done_cov_mean >= done_cov_thr)
+
+                converged = bool(cond_cov and cond_slope and cond_coll and cond_done_cov)
+                promote = bool(cond_ready and converged)
+                force_promote = bool(
+                    int(args.adaptive_max_chunks_per_level) > 0
+                    and chunks_here >= int(args.adaptive_max_chunks_per_level)
+                )
+                decision = "promote" if (promote or force_promote) else "hold"
+                reason = (
+                    "converged"
+                    if promote
+                    else (
+                        f"max_chunks={args.adaptive_max_chunks_per_level}"
+                        if force_promote
+                        else "not_ready_or_not_converged"
+                    )
+                )
+                rec["adaptive_window_chunks"] = int(win)
+                rec["adaptive_recent_cov_mean"] = float(cov_mean)
+                rec["adaptive_recent_cov_slope"] = float(cov_slope)
+                rec["adaptive_recent_collision_mean"] = float(coll_mean)
+                rec["adaptive_recent_done_cov_mean"] = float(done_cov_mean)
+                rec["adaptive_cov_threshold"] = float(cov_thr)
+                rec["adaptive_done_cov_threshold"] = (
+                    float(done_cov_thr) if done_cov_thr is not None else float("nan")
+                )
+                rec["adaptive_cond_ready"] = bool(cond_ready)
+                rec["adaptive_cond_cov"] = bool(cond_cov)
+                rec["adaptive_cond_slope"] = bool(cond_slope)
+                rec["adaptive_cond_collision"] = bool(cond_coll)
+                rec["adaptive_cond_done_cov"] = bool(cond_done_cov)
+                rec["adaptive_converged"] = bool(converged)
+                rec["adaptive_decision"] = str(decision)
+                rec["adaptive_reason"] = str(reason)
+
+                print(
+                    f"[ADAPTIVE] stage={adaptive_stage_idx} "
+                    f"recent_cov={cov_mean:.4f} (thr={cov_thr:.4f}) "
+                    f"slope={cov_slope:.5f} (min={args.adaptive_cov_slope_min:.5f}) "
+                    f"coll={coll_mean:.4f} (max={args.adaptive_collision_max:.4f}) "
+                    f"done_cov={done_cov_mean:.4f} (thr={done_cov_thr if done_cov_thr is not None else 'off'}) "
+                    f"converged={converged} ready={cond_ready} "
+                    f"decision={decision} reason={reason}",
+                    flush=True,
+                )
+                if promote or force_promote:
+                    print(
+                        f"[PROMOTE] stage={adaptive_stage_idx} -> {adaptive_stage_idx + 1} "
+                        f"reason={reason} "
+                        f"(cov_mean={cov_mean:.4f}, cov_thr={cov_thr:.4f}, "
+                        f"slope={cov_slope:.5f}, coll_mean={coll_mean:.4f}, "
+                        f"done_cov_mean={done_cov_mean:.4f})",
+                        flush=True,
+                    )
+                    adaptive_stage_idx += 1
+                    adaptive_stage_chunks = []
+            else:
+                rec["adaptive_decision"] = "hold"
+                rec["adaptive_reason"] = "max_stage_reached"
+                rec["adaptive_converged"] = True
+                print(
+                    f"[ADAPTIVE] stage={adaptive_stage_idx} decision=hold reason=max_stage_reached",
+                    flush=True,
+                )
 
         progress_jsonl = report_dir / "progress.jsonl"
         with progress_jsonl.open("a", encoding="utf-8") as f:
