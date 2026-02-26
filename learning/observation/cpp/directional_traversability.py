@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Optional, Set, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -31,58 +31,179 @@ def _neighbor_deltas(connectivity: int):
     raise ValueError("connectivity must be 4 or 8")
 
 
-def _flood_component(mask: np.ndarray, start: GridPos, connectivity: int) -> Set[GridPos]:
-    if mask.ndim != 2:
-        raise ValueError("mask must be 2D")
-    h, w = mask.shape
+def _side_cells(h: int, w: int, side: str):
+    if side == "left":
+        return [(r, 0) for r in range(h)]
+    if side == "right":
+        return [(r, w - 1) for r in range(h)]
+    if side == "up":
+        return [(0, c) for c in range(w)]
+    if side == "down":
+        return [(h - 1, c) for c in range(w)]
+    raise ValueError(f"Unknown side: {side}")
+
+
+def _point_connected(
+    passable_mask: np.ndarray,
+    *,
+    start: GridPos,
+    goal: GridPos,
+    connectivity: int,
+) -> bool:
+    h, w = passable_mask.shape
     sr, sc = start
-    if not (0 <= sr < h and 0 <= sc < w) or not bool(mask[sr, sc]):
-        return set()
+    gr, gc = goal
+    if not (0 <= sr < h and 0 <= sc < w):
+        return False
+    if not (0 <= gr < h and 0 <= gc < w):
+        return False
+    if not bool(passable_mask[sr, sc]) or not bool(passable_mask[gr, gc]):
+        return False
+    if (sr, sc) == (gr, gc):
+        return True
 
     q = deque([(sr, sc)])
     visited = {(sr, sc)}
     deltas = _neighbor_deltas(connectivity)
-
     while q:
         r, c = q.popleft()
         for dr, dc in deltas:
             nr, nc = r + dr, c + dc
             if nr < 0 or nr >= h or nc < 0 or nc >= w:
                 continue
-            if (nr, nc) in visited or not bool(mask[nr, nc]):
+            if (nr, nc) in visited or not bool(passable_mask[nr, nc]):
                 continue
+            if (nr, nc) == (gr, gc):
+                return True
             visited.add((nr, nc))
             q.append((nr, nc))
-    return visited
+    return False
 
 
-def _touch_flags(component: Set[GridPos], h: int, w: int):
-    left = any(c == 0 for _, c in component)
-    right = any(c == w - 1 for _, c in component)
-    up = any(r == 0 for r, _ in component)
-    down = any(r == h - 1 for r, _ in component)
-    nw = any((r == 0) or (c == 0) for r, c in component)
-    se = any((r == h - 1) or (c == w - 1) for r, c in component)
-    ne = any((r == 0) or (c == w - 1) for r, c in component)
-    sw = any((r == h - 1) or (c == 0) for r, c in component)
-    return left, right, up, down, nw, se, ne, sw
-
-
-def _direction_flags_from_mask(
+def _edge_pair_connected(
     passable_mask: np.ndarray,
     *,
-    start: GridPos,
+    side_a: str,
+    side_b: str,
     connectivity: int,
-) -> Tuple[bool, bool, bool, bool]:
-    sr, sc = start
-    if not bool(passable_mask[sr, sc]):
-        return False, False, False, False
-    comp = _flood_component(passable_mask, start=start, connectivity=connectivity)
-    if not comp:
-        return False, False, False, False
+) -> bool:
     h, w = passable_mask.shape
-    left, right, up, down, nw, se, ne, sw = _touch_flags(comp, h=h, w=w)
-    return bool(left and right), bool(up and down), bool(nw and se), bool(ne and sw)
+    if h <= 0 or w <= 0:
+        return False
+
+    sources = [p for p in _side_cells(h, w, side_a) if bool(passable_mask[p[0], p[1]])]
+    if not sources:
+        return False
+    targets = {p for p in _side_cells(h, w, side_b) if bool(passable_mask[p[0], p[1]])}
+    if not targets:
+        return False
+
+    for p in sources:
+        if p in targets:
+            return True
+
+    q = deque(sources)
+    visited = set(sources)
+    deltas = _neighbor_deltas(connectivity)
+    while q:
+        r, c = q.popleft()
+        for dr, dc in deltas:
+            nr, nc = r + dr, c + dc
+            if nr < 0 or nr >= h or nc < 0 or nc >= w:
+                continue
+            if (nr, nc) in visited or not bool(passable_mask[nr, nc]):
+                continue
+            if (nr, nc) in targets:
+                return True
+            visited.add((nr, nc))
+            q.append((nr, nc))
+    return False
+
+
+def _direction_flags_from_mask6(
+    passable_mask: np.ndarray,
+    *,
+    connectivity: int,
+) -> Tuple[bool, bool, bool, bool, bool, bool]:
+    h, w = passable_mask.shape
+    if h <= 0 or w <= 0:
+        return False, False, False, False, False, False
+
+    lr = _edge_pair_connected(
+        passable_mask,
+        side_a="left",
+        side_b="right",
+        connectivity=connectivity,
+    )
+    ud = _edge_pair_connected(
+        passable_mask,
+        side_a="up",
+        side_b="down",
+        connectivity=connectivity,
+    )
+    nw_se = _point_connected(
+        passable_mask,
+        start=(0, 0),
+        goal=(h - 1, w - 1),
+        connectivity=connectivity,
+    )
+    se_nw = _point_connected(
+        passable_mask,
+        start=(h - 1, w - 1),
+        goal=(0, 0),
+        connectivity=connectivity,
+    )
+    ne_sw = _point_connected(
+        passable_mask,
+        start=(0, w - 1),
+        goal=(h - 1, 0),
+        connectivity=connectivity,
+    )
+    sw_ne = _point_connected(
+        passable_mask,
+        start=(h - 1, 0),
+        goal=(0, w - 1),
+        connectivity=connectivity,
+    )
+    return lr, ud, nw_se, se_nw, ne_sw, sw_ne
+
+
+def _direction_flags_from_mask12(
+    passable_mask: np.ndarray,
+    *,
+    connectivity: int,
+) -> Tuple[bool, ...]:
+    h, w = passable_mask.shape
+    if h <= 0 or w <= 0:
+        return (False,) * 12
+
+    sides = ("up", "right", "down", "left")
+    pairs = (
+        ("up", "right"),
+        ("up", "down"),
+        ("up", "left"),
+        ("right", "up"),
+        ("right", "down"),
+        ("right", "left"),
+        ("down", "up"),
+        ("down", "right"),
+        ("down", "left"),
+        ("left", "up"),
+        ("left", "right"),
+        ("left", "down"),
+    )
+    _ = sides  # keep side order explicit for readability
+    vals = []
+    for side_a, side_b in pairs:
+        vals.append(
+            _edge_pair_connected(
+                passable_mask,
+                side_a=side_a,
+                side_b=side_b,
+                connectivity=connectivity,
+            )
+        )
+    return tuple(vals)
 
 
 def _normalize_patch_size(patch_size: int, limit: int) -> int:
@@ -108,17 +229,28 @@ def compute_directional_traversability(
     min_patch_known_ratio: float = 0.0,
     uncertain_fill: float = -1.0,
     unknown_fill: float = -1.0,
+    output_mode: str = "six",
     out: Optional[np.ndarray] = None,
     dirty_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Compute directional traversability maps for each cell.
 
-    Output shape: (4, H, W), channel order:
-    0) left <-> right
-    1) up <-> down
-    2) northwest <-> southeast
-    3) northeast <-> southwest
+    Output modes:
+    - six:
+      shape (6, H, W), channel order:
+      0) left <-> right
+      1) up <-> down
+      2) northwest -> southeast
+      3) southeast -> northwest
+      4) northeast -> southwest
+      5) southwest -> northeast
+    - port12:
+      shape (12, H, W), channel order:
+      0) up->right, 1) up->down, 2) up->left,
+      3) right->up, 4) right->down, 5) right->left,
+      6) down->up, 7) down->right, 8) down->left,
+      9) left->up, 10) left->right, 11) left->down
 
     Values:
     - unknown_fill for unknown/invalid computation
@@ -133,15 +265,19 @@ def compute_directional_traversability(
         raise ValueError("min_center_known_ratio must be in [0, 1]")
     if not (0.0 <= min_patch_known_ratio <= 1.0):
         raise ValueError("min_patch_known_ratio must be in [0, 1]")
+    mode = str(output_mode).strip().lower()
+    if mode not in {"six", "port12"}:
+        raise ValueError("output_mode must be one of {'six', 'port12'}")
 
     h, w = state_grid.shape
     p = _normalize_patch_size(patch_size, limit=max(h, w))
     center = p // 2
+    out_ch = 6 if mode == "six" else 12
     if out is None:
-        out_arr = np.full((4, h, w), unknown_fill, dtype=np.float32)
+        out_arr = np.full((out_ch, h, w), unknown_fill, dtype=np.float32)
     else:
-        if out.shape != (4, h, w):
-            raise ValueError("out shape must be (4, H, W) matching state_grid")
+        if out.shape != (out_ch, h, w):
+            raise ValueError(f"out shape must be ({out_ch}, H, W) matching state_grid")
         out_arr = out.astype(np.float32, copy=False)
 
     targets = None
@@ -195,15 +331,18 @@ def compute_directional_traversability(
         # High-confidence branch: strict free-only DTM.
         if trusted_local and state_center == FREE_STATE:
             free_mask = local == FREE_STATE
-            lr, ud, nwse, nesw = _direction_flags_from_mask(
-                free_mask,
-                start=(center, center),
-                connectivity=connectivity,
-            )
-            out_arr[0, r, c] = 1.0 if lr else 0.0
-            out_arr[1, r, c] = 1.0 if ud else 0.0
-            out_arr[2, r, c] = 1.0 if nwse else 0.0
-            out_arr[3, r, c] = 1.0 if nesw else 0.0
+            if mode == "six":
+                flags = _direction_flags_from_mask6(
+                    free_mask,
+                    connectivity=connectivity,
+                )
+            else:
+                flags = _direction_flags_from_mask12(
+                    free_mask,
+                    connectivity=connectivity,
+                )
+            for ch, flag in enumerate(flags):
+                out_arr[ch, r, c] = 1.0 if flag else 0.0
             continue
 
         # Observed blocked center should stay non-traversable.
@@ -218,23 +357,26 @@ def compute_directional_traversability(
         pess_mask = local == FREE_STATE
         opt_mask = (local == FREE_STATE) | (local == UNKNOWN_STATE)
 
-        p_lr, p_ud, p_nwse, p_nesw = _direction_flags_from_mask(
-            pess_mask,
-            start=(center, center),
-            connectivity=connectivity,
-        )
-        o_lr, o_ud, o_nwse, o_nesw = _direction_flags_from_mask(
-            opt_mask,
-            start=(center, center),
-            connectivity=connectivity,
-        )
+        if mode == "six":
+            pess_flags = _direction_flags_from_mask6(
+                pess_mask,
+                connectivity=connectivity,
+            )
+            opt_flags = _direction_flags_from_mask6(
+                opt_mask,
+                connectivity=connectivity,
+            )
+        else:
+            pess_flags = _direction_flags_from_mask12(
+                pess_mask,
+                connectivity=connectivity,
+            )
+            opt_flags = _direction_flags_from_mask12(
+                opt_mask,
+                connectivity=connectivity,
+            )
 
-        for ch, p_flag, o_flag in (
-            (0, p_lr, o_lr),
-            (1, p_ud, o_ud),
-            (2, p_nwse, o_nwse),
-            (3, p_nesw, o_nesw),
-        ):
+        for ch, p_flag, o_flag in zip(range(out_ch), pess_flags, opt_flags):
             if p_flag:
                 out_arr[ch, r, c] = 1.0
             elif not o_flag:

@@ -188,6 +188,7 @@ class CPPDiscreteEnv:
                 mode=self.config.tv_mode,
                 obstacle_mask=obs_local,
                 exclude_obstacle_edges=bool(self.config.reward.tv_exclude_obstacle_edges),
+                obstacle_edge_weight=float(self.config.reward.tv_obstacle_edge_weight),
             )
         )
 
@@ -201,6 +202,7 @@ class CPPDiscreteEnv:
                 mode=self.config.tv_mode,
                 obstacle_mask=obs,
                 exclude_obstacle_edges=bool(self.config.reward.tv_exclude_obstacle_edges),
+                obstacle_edge_weight=float(self.config.reward.tv_obstacle_edge_weight),
             )
         )
 

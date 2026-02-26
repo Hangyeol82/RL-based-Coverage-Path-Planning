@@ -22,8 +22,11 @@ class CPPRewardConfig:
     global_tv_reward_scale: float = 0.0
     global_tv_reward_max: float = 5.0
     global_tv_normalizer: float = 4.0
-    # If True, TV gradients across any edge touching obstacle cells are ignored.
+    # Legacy switch: apply attenuation on TV gradients across edges touching obstacles.
     tv_exclude_obstacle_edges: bool = True
+    # Attenuation factor for obstacle-touching edges in TV.
+    # 0.0: fully ignore (previous behavior), 1.0: no attenuation.
+    tv_obstacle_edge_weight: float = 0.35
 
     collision_reward: float = -10.0
     constant_reward: float = -0.1
@@ -149,6 +152,7 @@ def total_variation(
     *,
     obstacle_mask: Optional[np.ndarray] = None,
     exclude_obstacle_edges: bool = False,
+    obstacle_edge_weight: float = 0.0,
 ) -> float:
     """
     Compatible TV helper adapted from rl-cpp.
@@ -181,8 +185,10 @@ def total_variation(
         obs = obs > 0.5
         touches_obs_v = obs[1:, :] | obs[:-1, :]
         touches_obs_h = obs[:, 1:] | obs[:, :-1]
-        diff_v = np.where(touches_obs_v, 0.0, diff_v)
-        diff_h = np.where(touches_obs_h, 0.0, diff_h)
+        w = float(np.clip(float(obstacle_edge_weight), 0.0, 1.0))
+        # Keep a reduced penalty near obstacles instead of forcing it to zero.
+        diff_v = np.where(touches_obs_v, w * diff_v, diff_v)
+        diff_h = np.where(touches_obs_h, w * diff_h, diff_h)
 
     if mode == "sym-iso":
         tv = (

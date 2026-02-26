@@ -1,0 +1,3 @@
+rollout,timesteps,reward_area,reward_tv_i,reward_tv_g,reward_coll,reward_const,reward_turn,reward_overlap,reward_total,coverage_ratio,collision,action_override_rate,episode_done_count,episode_final_coverage_ratio,episode_final_collision,episode_final_steps
+1.0,128.0,0.5390625,-0.23298857882618904,0.0,0.0,-0.10000000000000002,-0.033984375,-0.04609375,0.12599579617381093,0.018218687122736422,0.0,0.046875,0.0,,,
+2.0,256.0,0.3828125,-0.0698873594403267,0.0,0.0,-0.10000000000000002,-0.0375,-0.061718749999999996,0.1137063905596733,0.04686714034205232,0.0,0.0234375,0.0,,,

@@ -113,7 +113,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--phase-levels",
         type=str,
-        default="1,2,3,4,4",
+        default="2,3,4,4",
         help="Comma list of difficulty levels per stage block.",
     )
     p.add_argument(
@@ -126,13 +126,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--adaptive-min-chunks",
         type=int,
-        default=2,
+        default=3,
         help="Minimum chunks to stay before adaptive promotion checks are active.",
     )
     p.add_argument(
         "--adaptive-window",
         type=int,
-        default=2,
+        default=3,
         help="Recent chunk window used for adaptive promotion checks.",
     )
     p.add_argument(
@@ -154,7 +154,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--adaptive-cov-thresholds",
         type=str,
-        default="0.55,0.50,0.45,0.40",
+        default="0.58,0.54,0.50,0.48",
         help="Per-level mean coverage thresholds for promotion.",
     )
     p.add_argument(
@@ -166,13 +166,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--adaptive-cov-slope-min",
         type=float,
-        default=-0.002,
+        default=0.0005,
         help="Minimum slope of recent chunk mean coverage required for promotion.",
     )
     p.add_argument(
         "--adaptive-collision-max",
         type=float,
-        default=0.01,
+        default=0.005,
         help="Maximum recent chunk mean collision allowed for promotion.",
     )
     p.add_argument("--seed", type=int, default=101)
@@ -187,6 +187,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
+    p.add_argument(
+        "--dtm-coarse-mode",
+        type=str,
+        default="bfs",
+        choices=["bfs", "aggregate", "aggregate_transfer"],
+        help="DTM multi-scale mode forwarded to run_ppo_sb3.py.",
+    )
+    p.add_argument(
+        "--dtm-output-mode",
+        type=str,
+        default="six",
+        choices=["six", "four", "port12"],
+        help="DTM output channels forwarded to run_ppo_sb3.py.",
+    )
     p.add_argument("--include-dtm", action="store_true")
 
     p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"])
@@ -219,6 +233,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=str, default="")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--continue-on-error", action="store_true")
+    p.add_argument(
+        "--eval-map-file",
+        type=str,
+        default="",
+        help="Optional fixed evaluation map path. If set, runs eval after each chunk.",
+    )
+    p.add_argument(
+        "--eval-every-chunks",
+        type=int,
+        default=1,
+        help="Run fixed eval every N chunks when --eval-map-file is set.",
+    )
+    p.add_argument(
+        "--eval-max-episode-steps",
+        type=int,
+        default=0,
+        help="Eval max steps override (0 => use --max-episode-steps).",
+    )
     return p.parse_args()
 
 
@@ -362,6 +394,10 @@ def _build_run_cmd(
         str(int(args.max_episode_steps)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
+        "--dtm-coarse-mode",
+        str(args.dtm_coarse_mode),
+        "--dtm-output-mode",
+        str(args.dtm_output_mode),
         "--map-source",
         "file",
         "--map-file",
@@ -390,6 +426,55 @@ def _build_run_cmd(
     return cmd
 
 
+def _run_fixed_eval(
+    *,
+    args: argparse.Namespace,
+    repo_root: Path,
+    eval_runner: Path,
+    model_zip: Path,
+    map_file: Path,
+    out_json: Path,
+    run_seed: int,
+) -> Dict:
+    cmd = [
+        args.python_bin,
+        str(eval_runner),
+        "--model",
+        str(model_zip),
+        "--device",
+        args.device,
+        "--map-source",
+        "file",
+        "--map-file",
+        str(map_file),
+        "--map-size",
+        str(int(args.map_size)),
+        "--seed",
+        str(int(run_seed)),
+        "--sensor-range",
+        str(int(args.sensor_range)),
+        "--max-episode-steps",
+        str(int(args.eval_max_episode_steps if args.eval_max_episode_steps > 0 else args.max_episode_steps)),
+        "--dtm-coarse-mode",
+        str(args.dtm_coarse_mode),
+        "--dtm-output-mode",
+        str(args.dtm_output_mode),
+        "--save-path-json",
+        str(out_json),
+        "--deterministic",
+    ]
+    if args.include_dtm:
+        cmd.append("--include-dtm")
+    if args.action_mask:
+        cmd.append("--action-mask")
+    else:
+        cmd.append("--no-action-mask")
+
+    subprocess.run(cmd, cwd=str(repo_root), check=True)
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
 def main():
     args = _parse_args()
     if args.total_timesteps <= 0:
@@ -410,6 +495,10 @@ def main():
         raise ValueError("--map-size must be >= 2")
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
+    if args.eval_every_chunks <= 0:
+        raise ValueError("--eval-every-chunks must be positive")
+    if args.eval_max_episode_steps < 0:
+        raise ValueError("--eval-max-episode-steps must be >= 0")
 
     phase_levels = _parse_int_list(args.phase_levels, name="phase-levels")
     adaptive_cov_thresholds = _parse_float_list(
@@ -426,17 +515,24 @@ def main():
     runner = repo_root / "run_ppo_sb3.py"
     if not runner.exists():
         raise FileNotFoundError(f"Runner not found: {runner}")
+    eval_runner = repo_root / "run_ppo_eval_path.py"
+    if args.eval_map_file.strip() and not eval_runner.exists():
+        raise FileNotFoundError(f"Eval runner not found: {eval_runner}")
 
     out_dir = _resolve_out_dir(args, repo_root)
     models_dir = out_dir / "models"
     logs_dir = out_dir / "logs"
     maps_dir = out_dir / "maps"
     report_dir = out_dir / "reports"
+    eval_dir = report_dir / "eval"
     for d in (models_dir, logs_dir, maps_dir, report_dir):
         d.mkdir(parents=True, exist_ok=True)
+    eval_dir.mkdir(parents=True, exist_ok=True)
 
     if args.overwrite:
         for p in list(models_dir.glob("*.zip")) + list(logs_dir.glob("*")) + list(maps_dir.glob("*.txt")):
+            p.unlink()
+        for p in list(eval_dir.glob("*.json")):
             p.unlink()
 
     bc_ckpt = ""
@@ -447,6 +543,15 @@ def main():
         if not p.exists():
             raise FileNotFoundError(f"BC checkpoint not found: {p}")
         bc_ckpt = str(p)
+
+    eval_map_path = None
+    if args.eval_map_file.strip():
+        p = Path(args.eval_map_file)
+        if not p.is_absolute():
+            p = repo_root / p
+        if not p.exists():
+            raise FileNotFoundError(f"Eval map not found: {p}")
+        eval_map_path = p
 
     total = int(args.total_timesteps)
     chunk = int(args.chunk_timesteps)
@@ -613,6 +718,41 @@ def main():
         rec["chunk_mean_coverage_ratio"] = _safe_mean(rollouts, "coverage_ratio")
         rec["chunk_mean_collision"] = _safe_mean(rollouts, "collision")
         rec["chunk_mean_done_final_coverage_ratio"] = _safe_mean(rollouts, "episode_final_coverage_ratio")
+
+        if eval_map_path is not None and ((i + 1) % int(args.eval_every_chunks) == 0):
+            eval_json = eval_dir / f"chunk{i+1:02d}_eval.json"
+            try:
+                eval_payload = _run_fixed_eval(
+                    args=args,
+                    repo_root=repo_root,
+                    eval_runner=eval_runner,
+                    model_zip=save_model_zip,
+                    map_file=eval_map_path,
+                    out_json=eval_json,
+                    run_seed=run_seed,
+                )
+                rec["eval_map_file"] = str(eval_map_path)
+                rec["eval_steps"] = int(eval_payload.get("steps", 0))
+                rec["eval_coverage_ratio"] = float(eval_payload.get("coverage_ratio", float("nan")))
+                rec["eval_collision_rate"] = float(eval_payload.get("collision_rate", float("nan")))
+                rec["eval_action_override_rate"] = float(
+                    eval_payload.get("action_override_rate", float("nan"))
+                )
+                rec["eval_total_reward_sum"] = float(eval_payload.get("total_reward_sum", float("nan")))
+                rec["eval_done_reason"] = str(eval_payload.get("done_reason", ""))
+                print(
+                    f"[EVAL] chunk={i+1} cov={rec['eval_coverage_ratio']:.4f} "
+                    f"coll_rate={rec['eval_collision_rate']:.4f} steps={rec['eval_steps']} "
+                    f"reason={rec['eval_done_reason']}",
+                    flush=True,
+                )
+            except subprocess.CalledProcessError as e:
+                rec["eval_failed"] = True
+                rec["eval_returncode"] = int(e.returncode)
+                print(
+                    f"[EVAL] chunk={i+1} failed(returncode={e.returncode})",
+                    flush=True,
+                )
         progress_rows.append(rec)
 
         print(

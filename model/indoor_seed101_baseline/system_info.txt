@@ -1,0 +1,8 @@
+- OS: Windows-2012ServerR2-6.3.9600-SP0 6.3.9600
+- Python: 3.10.11
+- Stable-Baselines3: 2.3.2
+- PyTorch: 2.3.1+cpu
+- GPU Enabled: False
+- Numpy: 1.26.4
+- Cloudpickle: 3.1.2
+- Gymnasium: 0.29.1

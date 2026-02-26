@@ -1,0 +1,42 @@
+[
+  {
+    "stage": 1,
+    "seed": 101,
+    "obstacle_cells": 409,
+    "free_cells": 615,
+    "obstacle_ratio": 0.3994140625,
+    "num_obstacles_meta": 15,
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32/stage1_seed101.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32/stage1_seed101.png"
+  },
+  {
+    "stage": 2,
+    "seed": 101,
+    "obstacle_cells": 304,
+    "free_cells": 720,
+    "obstacle_ratio": 0.296875,
+    "num_obstacles_meta": 15,
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32/stage2_seed101.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32/stage2_seed101.png"
+  },
+  {
+    "stage": 3,
+    "seed": 101,
+    "obstacle_cells": 313,
+    "free_cells": 711,
+    "obstacle_ratio": 0.3056640625,
+    "num_obstacles_meta": 15,
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32/stage3_seed101.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32/stage3_seed101.png"
+  },
+  {
+    "stage": 4,
+    "seed": 101,
+    "obstacle_cells": 319,
+    "free_cells": 705,
+    "obstacle_ratio": 0.3115234375,
+    "num_obstacles_meta": 15,
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32/stage4_seed101.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32/stage4_seed101.png"
+  }
+]

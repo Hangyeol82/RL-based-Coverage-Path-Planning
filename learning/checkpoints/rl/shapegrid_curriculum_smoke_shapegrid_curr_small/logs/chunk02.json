@@ -1,0 +1,80 @@
+{
+  "rollouts": [
+    {
+      "rollout": 1.0,
+      "timesteps": 128.0,
+      "reward_area": 0.4609375,
+      "reward_tv_i": -0.11234295032918452,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.10000000000000002,
+      "reward_turn": -0.030859374999999994,
+      "reward_overlap": -0.053906249999999996,
+      "reward_total": 0.16382892467081545,
+      "coverage_ratio": 0.033812248490945676,
+      "collision": 0.0,
+      "action_override_rate": 0.0625,
+      "episode_done_count": 0.0
+    },
+    {
+      "rollout": 2.0,
+      "timesteps": 256.0,
+      "reward_area": 0.4140625,
+      "reward_tv_i": -0.13451859056949617,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.10000000000000002,
+      "reward_turn": -0.03515625,
+      "reward_overlap": -0.05859374999999999,
+      "reward_total": 0.08579390943050381,
+      "coverage_ratio": 0.09372642102615696,
+      "collision": 0.0,
+      "action_override_rate": 0.015625,
+      "episode_done_count": 0.0
+    },
+    {
+      "rollout": 3.0,
+      "timesteps": 384.0,
+      "reward_area": 0.078125,
+      "reward_tv_i": -0.018592971563339236,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.10000000000000002,
+      "reward_turn": -0.0375,
+      "reward_overlap": -0.0921875,
+      "reward_total": -0.17015547156333924,
+      "coverage_ratio": 0.12039424044265597,
+      "collision": 0.0,
+      "action_override_rate": 0.0,
+      "episode_done_count": 0.0
+    },
+    {
+      "rollout": 4.0,
+      "timesteps": 512.0,
+      "reward_area": 0.3515625,
+      "reward_tv_i": -0.06722004115581512,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.10000000000000002,
+      "reward_turn": -0.032421875,
+      "reward_overlap": -0.06484375,
+      "reward_total": 0.08707683384418485,
+      "coverage_ratio": 0.1439732142857143,
+      "collision": 0.0,
+      "action_override_rate": 0.078125,
+      "episode_done_count": 0.0
+    }
+  ],
+  "track_keys": [
+    "reward_area",
+    "reward_tv_i",
+    "reward_tv_g",
+    "reward_coll",
+    "reward_const",
+    "reward_turn",
+    "reward_overlap",
+    "reward_total",
+    "coverage_ratio",
+    "collision"
+  ]
+}

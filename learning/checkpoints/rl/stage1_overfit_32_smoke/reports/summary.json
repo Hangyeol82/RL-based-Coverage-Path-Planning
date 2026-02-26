@@ -1,0 +1,185 @@
+{
+  "config": {
+    "manifest": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/manifest_32.json",
+    "group": "indoor",
+    "map_seeds": [
+      101
+    ],
+    "baseline_seeds": [
+      101
+    ],
+    "dtm_seeds": [
+      101
+    ],
+    "total_timesteps": 16,
+    "device": "cpu",
+    "num_envs": 1,
+    "vec_env": "dummy",
+    "subproc_start_method": "spawn",
+    "n_steps": 8,
+    "batch_size": 8,
+    "n_epochs": 1,
+    "sensor_range": 2,
+    "max_episode_steps": 64,
+    "map_size": 32,
+    "seed_mode": "map",
+    "seed_base": 100,
+    "init_from_bc": "learning/checkpoints/bc/bc_smoke_latest.pt",
+    "init_from_bc_strict": false,
+    "convergence_thresholds": {
+      "conv_window": 4,
+      "coverage_plateau_delta": 0.0005,
+      "coverage_slope_eps": 5e-05,
+      "reward_plateau_delta": 0.05,
+      "reward_slope_eps": 0.005,
+      "collision_plateau_delta": 0.01,
+      "collision_slope_eps": 0.001
+    }
+  },
+  "num_selected_maps": 1,
+  "num_reported_maps": 1,
+  "failures": [],
+  "aggregate": {
+    "num_maps": 1,
+    "delta_last": {
+      "reward_total_mean": -0.2573223352432252,
+      "coverage_ratio_mean": -0.004502881844380403,
+      "collision_mean": 0.0,
+      "reward_total_std": 0.0,
+      "coverage_ratio_std": 0.0,
+      "collision_std": 0.0
+    },
+    "wins": {
+      "reward_total": 0,
+      "coverage_ratio": 0,
+      "collision": 0
+    }
+  },
+  "per_map_diagnostics": [
+    {
+      "map_id": "indoor_seed101",
+      "baseline": {
+        "num_rollouts": 2,
+        "window": 2,
+        "last_timesteps": 16.0,
+        "metrics": {
+          "reward_total": {
+            "first": 0.3750000059604645,
+            "last": 0.35732233524322515,
+            "mean": 0.36616117060184483,
+            "early_mean": 0.36616117060184483,
+            "late_mean": 0.36616117060184483,
+            "late_minus_early": 0.0,
+            "slope": -0.017677670717239385
+          },
+          "coverage_ratio": {
+            "first": 0.005403458213256484,
+            "last": 0.013328530259365994,
+            "mean": 0.009365994236311239,
+            "early_mean": 0.009365994236311239,
+            "late_mean": 0.009365994236311239,
+            "late_minus_early": 0.0,
+            "slope": 0.007925072046109505
+          },
+          "collision": {
+            "first": 0.0,
+            "last": 0.0,
+            "mean": 0.0,
+            "early_mean": 0.0,
+            "late_mean": 0.0,
+            "late_minus_early": 0.0,
+            "slope": 0.0
+          },
+          "reward_area": {
+            "first": 0.625,
+            "last": 0.5,
+            "mean": 0.5625,
+            "early_mean": 0.5625,
+            "late_mean": 0.5625,
+            "late_minus_early": 0.0,
+            "slope": -0.12500000000000008
+          },
+          "reward_tv_i": {
+            "first": -0.1499999940395355,
+            "last": -0.042677664756774904,
+            "mean": -0.0963388293981552,
+            "early_mean": -0.0963388293981552,
+            "late_mean": -0.0963388293981552,
+            "late_minus_early": 0.0,
+            "slope": 0.1073223292827606
+          }
+        },
+        "convergence": {
+          "coverage_plateau_delta": true,
+          "coverage_plateau_slope": false,
+          "reward_plateau_delta": true,
+          "reward_plateau_slope": false,
+          "collision_plateau_delta": true,
+          "collision_plateau_slope": true,
+          "all_plateau": false
+        }
+      },
+      "dtm": {
+        "num_rollouts": 2,
+        "window": 2,
+        "last_timesteps": 16.0,
+        "metrics": {
+          "reward_total": {
+            "first": 0.3000000059604645,
+            "last": 0.09999999999999998,
+            "mean": 0.20000000298023224,
+            "early_mean": 0.20000000298023224,
+            "late_mean": 0.20000000298023224,
+            "late_minus_early": 0.0,
+            "slope": -0.20000000596046452
+          },
+          "coverage_ratio": {
+            "first": 0.005943804034582133,
+            "last": 0.008825648414985591,
+            "mean": 0.007384726224783862,
+            "early_mean": 0.007384726224783862,
+            "late_mean": 0.007384726224783862,
+            "late_minus_early": 0.0,
+            "slope": 0.0028818443804034576
+          },
+          "collision": {
+            "first": 0.0,
+            "last": 0.0,
+            "mean": 0.0,
+            "early_mean": 0.0,
+            "late_mean": 0.0,
+            "late_minus_early": 0.0,
+            "slope": 0.0
+          },
+          "reward_area": {
+            "first": 0.5,
+            "last": 0.25,
+            "mean": 0.375,
+            "early_mean": 0.375,
+            "late_mean": 0.375,
+            "late_minus_early": 0.0,
+            "slope": -0.25
+          },
+          "reward_tv_i": {
+            "first": -0.09999999403953551,
+            "last": -0.05,
+            "mean": -0.07499999701976776,
+            "early_mean": -0.07499999701976776,
+            "late_mean": -0.07499999701976776,
+            "late_minus_early": 0.0,
+            "slope": 0.04999999403953551
+          }
+        },
+        "convergence": {
+          "coverage_plateau_delta": true,
+          "coverage_plateau_slope": false,
+          "reward_plateau_delta": true,
+          "reward_plateau_slope": false,
+          "collision_plateau_delta": true,
+          "collision_plateau_slope": true,
+          "all_plateau": false
+        }
+      }
+    }
+  ]
+}

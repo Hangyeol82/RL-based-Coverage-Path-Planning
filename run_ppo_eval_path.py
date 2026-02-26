@@ -25,6 +25,7 @@ if "MPLCONFIGDIR" not in os.environ:
 import matplotlib.pyplot as plt
 import numpy as np
 
+from learning.observation import MultiScaleCPPObservationConfig
 from learning.reinforcement.cpp_env import CPPDiscreteEnvConfig
 from learning.reinforcement.reward import CPPRewardConfig
 from learning.reinforcement.sb3_env import CPPDiscreteGymEnv
@@ -52,6 +53,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
     p.add_argument("--include-dtm", action="store_true")
+    p.add_argument(
+        "--dtm-output-mode",
+        type=str,
+        default="four",
+        choices=["six", "four", "port12"],
+        help="DTM output channel mode for env observation.",
+    )
+    p.add_argument(
+        "--dtm-coarse-mode",
+        type=str,
+        default="bfs",
+        choices=["bfs", "aggregate", "aggregate_transfer"],
+        help="DTM coarse-level calculation mode for env observation.",
+    )
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument(
         "--action-mask",
@@ -271,6 +286,10 @@ def main():
         collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
+        observation=MultiScaleCPPObservationConfig(
+            dtm_output_mode=str(args.dtm_output_mode),
+            dtm_coarse_mode=str(args.dtm_coarse_mode),
+        ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
     )

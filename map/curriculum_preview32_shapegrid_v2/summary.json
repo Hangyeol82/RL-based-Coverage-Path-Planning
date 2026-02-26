@@ -1,0 +1,82 @@
+[
+  {
+    "level": 1,
+    "name": "easy",
+    "seed": 101,
+    "size": 32,
+    "obstacle_cells": 30,
+    "obstacle_ratio": 0.029296875,
+    "grid_step": 14,
+    "spawn_prob": 0.55,
+    "min_half_extent": 1,
+    "max_half_extent": 2,
+    "jitter": 1,
+    "clearance": 1,
+    "shape_types": [
+      "rect",
+      "circle"
+    ],
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_shapegrid_v2/shapegrid_lvl1_easy_seed101.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_shapegrid_v2/shapegrid_lvl1_easy_seed101.png"
+  },
+  {
+    "level": 2,
+    "name": "easy_plus",
+    "seed": 101,
+    "size": 32,
+    "obstacle_cells": 37,
+    "obstacle_ratio": 0.0361328125,
+    "grid_step": 12,
+    "spawn_prob": 0.6,
+    "min_half_extent": 1,
+    "max_half_extent": 2,
+    "jitter": 1,
+    "clearance": 1,
+    "shape_types": [
+      "rect",
+      "circle"
+    ],
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_shapegrid_v2/shapegrid_lvl2_easy_plus_seed101.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_shapegrid_v2/shapegrid_lvl2_easy_plus_seed101.png"
+  },
+  {
+    "level": 3,
+    "name": "medium",
+    "seed": 101,
+    "size": 32,
+    "obstacle_cells": 59,
+    "obstacle_ratio": 0.0576171875,
+    "grid_step": 10,
+    "spawn_prob": 0.65,
+    "min_half_extent": 1,
+    "max_half_extent": 3,
+    "jitter": 1,
+    "clearance": 1,
+    "shape_types": [
+      "rect",
+      "circle"
+    ],
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_shapegrid_v2/shapegrid_lvl3_medium_seed101.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_shapegrid_v2/shapegrid_lvl3_medium_seed101.png"
+  },
+  {
+    "level": 4,
+    "name": "hard",
+    "seed": 101,
+    "size": 32,
+    "obstacle_cells": 108,
+    "obstacle_ratio": 0.10546875,
+    "grid_step": 8,
+    "spawn_prob": 0.75,
+    "min_half_extent": 1,
+    "max_half_extent": 3,
+    "jitter": 1,
+    "clearance": 0,
+    "shape_types": [
+      "rect",
+      "circle"
+    ],
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_shapegrid_v2/shapegrid_lvl4_hard_seed101.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_shapegrid_v2/shapegrid_lvl4_hard_seed101.png"
+  }
+]

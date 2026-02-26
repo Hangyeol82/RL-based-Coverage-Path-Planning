@@ -1,0 +1,48 @@
+{
+  "rollouts": [
+    {
+      "rollout": 1.0,
+      "timesteps": 128.0,
+      "reward_area": 0.5,
+      "reward_tv_i": -0.2070733081549406,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.10000000000000002,
+      "reward_turn": -0.037500000000000006,
+      "reward_overlap": -0.049999999999999996,
+      "reward_total": 0.10542669184505937,
+      "coverage_ratio": 0.03495975855130784,
+      "collision": 0.0,
+      "action_override_rate": 0.0078125,
+      "episode_done_count": 0.0
+    },
+    {
+      "rollout": 2.0,
+      "timesteps": 256.0,
+      "reward_area": 0.3046875,
+      "reward_tv_i": -0.06142768114805222,
+      "reward_tv_g": 0.0,
+      "reward_coll": 0.0,
+      "reward_const": -0.10000000000000002,
+      "reward_turn": -0.036718749999999994,
+      "reward_overlap": -0.06953124999999999,
+      "reward_total": 0.037009818851947776,
+      "coverage_ratio": 0.0810173541247485,
+      "collision": 0.0,
+      "action_override_rate": 0.03125,
+      "episode_done_count": 0.0
+    }
+  ],
+  "track_keys": [
+    "reward_area",
+    "reward_tv_i",
+    "reward_tv_g",
+    "reward_coll",
+    "reward_const",
+    "reward_turn",
+    "reward_overlap",
+    "reward_total",
+    "coverage_ratio",
+    "collision"
+  ]
+}

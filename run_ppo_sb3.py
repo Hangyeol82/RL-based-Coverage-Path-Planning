@@ -17,6 +17,7 @@ from learning.common import (
     MultiLevelMAPSEncoderConfig,
     RobotStateEncoderConfig,
 )
+from learning.observation import MultiScaleCPPObservationConfig
 from learning.reinforcement.cpp_env import CPPDiscreteEnv, CPPDiscreteEnvConfig
 from learning.reinforcement.reward import CPPRewardConfig
 from learning.reinforcement.sb3_callbacks import RewardBreakdownCallback
@@ -75,6 +76,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sensor-range", type=int, default=2, help="2 -> 5x5 sensing window")
     p.add_argument("--max-episode-steps", type=int, default=1500)
     p.add_argument("--include-dtm", action="store_true")
+    p.add_argument(
+        "--dtm-coarse-mode",
+        type=str,
+        default="bfs",
+        choices=["bfs", "aggregate", "aggregate_transfer"],
+        help=(
+            "bfs: compute DTM at every scale; "
+            "aggregate: fine-scale BFS + max-pool upward; "
+            "aggregate_transfer: fine-scale BFS + transfer-graph coarse composition."
+        ),
+    )
+    p.add_argument(
+        "--dtm-output-mode",
+        type=str,
+        default="six",
+        choices=["six", "four", "port12"],
+        help="DTM output channels: six, four(legacy), or port12(side-to-side).",
+    )
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument(
@@ -354,6 +373,10 @@ def main():
         collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
+        observation=MultiScaleCPPObservationConfig(
+            dtm_coarse_mode=str(args.dtm_coarse_mode),
+            dtm_output_mode=str(args.dtm_output_mode),
+        ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
     )

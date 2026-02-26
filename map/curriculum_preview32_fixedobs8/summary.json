@@ -1,0 +1,42 @@
+[
+  {
+    "stage": 1,
+    "seed": 101,
+    "requested_num_obstacles": 8,
+    "obstacle_cells": 237,
+    "obstacle_ratio": 0.2314453125,
+    "num_obstacles_meta": 8,
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_fixedobs8/stage1_seed101_obs8.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_fixedobs8/stage1_seed101_obs8.png"
+  },
+  {
+    "stage": 2,
+    "seed": 101,
+    "requested_num_obstacles": 8,
+    "obstacle_cells": 162,
+    "obstacle_ratio": 0.158203125,
+    "num_obstacles_meta": 8,
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_fixedobs8/stage2_seed101_obs8.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_fixedobs8/stage2_seed101_obs8.png"
+  },
+  {
+    "stage": 3,
+    "seed": 101,
+    "requested_num_obstacles": 8,
+    "obstacle_cells": 111,
+    "obstacle_ratio": 0.1083984375,
+    "num_obstacles_meta": 8,
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_fixedobs8/stage3_seed101_obs8.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_fixedobs8/stage3_seed101_obs8.png"
+  },
+  {
+    "stage": 4,
+    "seed": 101,
+    "requested_num_obstacles": 8,
+    "obstacle_cells": 111,
+    "obstacle_ratio": 0.1083984375,
+    "num_obstacles_meta": 8,
+    "txt": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_fixedobs8/stage4_seed101_obs8.txt",
+    "png": "/Users/ihangyeol/Desktop/\u110c\u1169\u11af\u110b\u1165\u11b8 \u110c\u1161\u11a8\u1111\u116e\u11b7/RL based online CPP/map/curriculum_preview32_fixedobs8/stage4_seed101_obs8.png"
+  }
+]

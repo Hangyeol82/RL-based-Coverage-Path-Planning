@@ -112,7 +112,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--phase-levels",
         type=str,
-        default="1,2,3,4,4",
+        default="2,3,4,4",
         help="Comma list of difficulty levels per stage block.",
     )
     p.add_argument(
@@ -125,13 +125,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--adaptive-min-chunks",
         type=int,
-        default=2,
+        default=3,
         help="Minimum chunks to stay before adaptive promotion checks are active.",
     )
     p.add_argument(
         "--adaptive-window",
         type=int,
-        default=2,
+        default=3,
         help="Recent chunk window used for adaptive promotion checks.",
     )
     p.add_argument(
@@ -143,7 +143,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--adaptive-cov-thresholds",
         type=str,
-        default="0.55,0.50,0.45,0.40",
+        default="0.58,0.54,0.50,0.48",
         help="Per-level mean coverage thresholds for promotion.",
     )
     p.add_argument(
@@ -155,13 +155,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--adaptive-cov-slope-min",
         type=float,
-        default=-0.002,
+        default=0.0005,
         help="Minimum slope of recent chunk mean coverage required for promotion.",
     )
     p.add_argument(
         "--adaptive-collision-max",
         type=float,
-        default=0.01,
+        default=0.005,
         help="Maximum recent chunk mean collision allowed for promotion.",
     )
     p.add_argument("--seed", type=int, default=101)
@@ -176,6 +176,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
+    p.add_argument(
+        "--dtm-coarse-mode",
+        type=str,
+        default="bfs",
+        choices=["bfs", "aggregate", "aggregate_transfer"],
+        help="DTM multi-scale mode forwarded to run_ppo_sb3.py.",
+    )
+    p.add_argument(
+        "--dtm-output-mode",
+        type=str,
+        default="six",
+        choices=["six", "four", "port12"],
+        help="DTM output channels forwarded to run_ppo_sb3.py.",
+    )
     p.add_argument("--include-dtm", action="store_true")
 
     p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"])
@@ -316,6 +330,10 @@ def _build_run_cmd(
         str(int(args.max_episode_steps)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
+        "--dtm-coarse-mode",
+        str(args.dtm_coarse_mode),
+        "--dtm-output-mode",
+        str(args.dtm_output_mode),
         "--map-source",
         "file",
         "--map-file",
