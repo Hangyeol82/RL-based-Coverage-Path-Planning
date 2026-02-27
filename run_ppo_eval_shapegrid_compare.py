@@ -51,10 +51,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--map-size", type=int, default=32)
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
+    boundary_group = p.add_mutually_exclusive_group()
+    boundary_group.add_argument("--boundary-exit-features", dest="boundary_exit_features", action="store_true")
+    boundary_group.add_argument("--no-boundary-exit-features", dest="boundary_exit_features", action="store_false")
+    p.add_argument("--boundary-exit-threshold", type=float, default=0.0)
     p.add_argument(
         "--dtm-output-mode",
         type=str,
-        default="four",
+        default="six",
         choices=["six", "extent6", "four", "port12"],
         help="DTM output channel mode for env observation.",
     )
@@ -86,7 +90,7 @@ def _parse_args() -> argparse.Namespace:
     det_group = p.add_mutually_exclusive_group()
     det_group.add_argument("--deterministic", dest="deterministic", action="store_true")
     det_group.add_argument("--stochastic", dest="deterministic", action="store_false")
-    p.set_defaults(deterministic=True)
+    p.set_defaults(deterministic=True, boundary_exit_features=False)
     return p.parse_args()
 
 
@@ -239,6 +243,8 @@ def _evaluate_one_map(
     sensor_range: int,
     max_episode_steps: int,
     include_dtm: bool,
+    boundary_exit_features: bool,
+    boundary_exit_threshold: float,
     action_mask: bool,
     dtm_output_mode: str,
     dtm_coarse_mode: str,
@@ -262,6 +268,8 @@ def _evaluate_one_map(
         collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=bool(include_dtm),
+        use_boundary_exit_features=bool(boundary_exit_features),
+        boundary_exit_threshold=float(boundary_exit_threshold),
         observation=MultiScaleCPPObservationConfig(
             dtm_output_mode=str(dtm_output_mode),
             dtm_coarse_mode=str(dtm_coarse_mode),
@@ -422,6 +430,8 @@ def main() -> None:
                 sensor_range=int(args.sensor_range),
                 max_episode_steps=int(args.max_episode_steps),
                 include_dtm=bool(include_dtm),
+                boundary_exit_features=bool(args.boundary_exit_features),
+                boundary_exit_threshold=float(args.boundary_exit_threshold),
                 action_mask=bool(args.action_mask),
                 dtm_output_mode=str(args.dtm_output_mode),
                 dtm_coarse_mode=str(args.dtm_coarse_mode),

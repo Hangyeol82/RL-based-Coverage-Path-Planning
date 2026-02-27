@@ -102,6 +102,7 @@ class RobotStateObservationBuilder:
         robot_pos: GridPos,
         prev_pos: Optional[GridPos] = None,
         recent_new_coverage: Optional[Sequence[float]] = None,
+        extra_features: Optional[Sequence[float]] = None,
     ) -> np.ndarray:
         if occupancy.ndim != 2:
             raise ValueError("occupancy must be 2D")
@@ -121,4 +122,10 @@ class RobotStateObservationBuilder:
         direction = self._direction_one_hot(prev_pos, robot_pos)
         progress = np.array([self._coverage_progress(occupancy, explored)], dtype=np.float32)
         stagnation = np.array([self._stagnation_index(recent_new_coverage)], dtype=np.float32)
-        return np.concatenate([pos, direction, progress, stagnation], axis=0).astype(np.float32)
+        base = np.concatenate([pos, direction, progress, stagnation], axis=0).astype(np.float32)
+        if extra_features is None:
+            return base
+        extra = np.asarray(list(extra_features), dtype=np.float32).reshape(-1)
+        if extra.size == 0:
+            return base
+        return np.concatenate([base, extra], axis=0).astype(np.float32)

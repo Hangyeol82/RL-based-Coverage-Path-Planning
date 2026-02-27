@@ -476,7 +476,10 @@ def compute_directional_traversability(
                     connectivity=connectivity,
                 )
             for ch, flag in enumerate(flags):
-                out_arr[ch, r, c] = 1.0 if flag else 0.0
+                if mode == "extent6":
+                    out_arr[ch, r, c] = float(flag)
+                else:
+                    out_arr[ch, r, c] = 1.0 if bool(flag) else 0.0
             continue
 
         # Observed blocked center should stay non-traversable.

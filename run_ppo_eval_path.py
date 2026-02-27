@@ -52,11 +52,25 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
+    boundary_group = p.add_mutually_exclusive_group()
+    boundary_group.add_argument(
+        "--boundary-exit-features",
+        dest="boundary_exit_features",
+        action="store_true",
+        help="Enable per-level DTM boundary-exit features in robot_state.",
+    )
+    boundary_group.add_argument(
+        "--no-boundary-exit-features",
+        dest="boundary_exit_features",
+        action="store_false",
+        help="Disable DTM boundary-exit features in robot_state.",
+    )
+    p.add_argument("--boundary-exit-threshold", type=float, default=0.0)
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument(
         "--dtm-output-mode",
         type=str,
-        default="four",
+        default="six",
         choices=["six", "extent6", "four", "port12"],
         help="DTM output channel mode for env observation.",
     )
@@ -96,7 +110,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Sample actions from policy distribution.",
     )
-    p.set_defaults(action_mask=True)
+    p.set_defaults(action_mask=True, boundary_exit_features=False)
     p.set_defaults(deterministic=True)
 
     p.add_argument("--save-path-json", type=str, default="")
@@ -286,6 +300,8 @@ def main():
         collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
+        use_boundary_exit_features=bool(args.boundary_exit_features),
+        boundary_exit_threshold=float(args.boundary_exit_threshold),
         observation=MultiScaleCPPObservationConfig(
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_coarse_mode=str(args.dtm_coarse_mode),

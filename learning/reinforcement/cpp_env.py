@@ -46,6 +46,12 @@ class CPPDiscreteEnvConfig:
     # - invalid: out-of-bounds or known obstacle (1)
     # - valid: known free (0) or unknown (-1)
     use_action_mask: bool = False
+    # Optional robot-state augmentation from multi-scale DTM at robot's current cell.
+    # Per level: [can_exit_up, can_exit_right, can_exit_down, can_exit_left]
+    # Optional validity flag can be appended per level.
+    use_boundary_exit_features: bool = False
+    boundary_exit_threshold: float = 0.0
+    boundary_exit_include_valid: bool = True
 
     observation: MultiScaleCPPObservationConfig = field(
         default_factory=MultiScaleCPPObservationConfig,
@@ -93,6 +99,14 @@ class CPPDiscreteEnv:
             self.config.observation,
             include_dtm=self.config.include_dtm,
         )
+        self._boundary_maps_builder: Optional[MultiScaleCPPObservationBuilder] = None
+        if bool(self.config.use_boundary_exit_features) and (not bool(self.config.include_dtm)):
+            # Boundary features can be used as an MLP-side replacement even when
+            # DTM channels are not part of the CNN maps input.
+            self._boundary_maps_builder = MultiScaleCPPObservationBuilder(
+                self.config.observation,
+                include_dtm=True,
+            )
         self.robot_state_builder = RobotStateObservationBuilder(self.config.robot_state)
 
         self._default_start = self._resolve_start(start_pos)
@@ -113,6 +127,8 @@ class CPPDiscreteEnv:
             constant=0.0,
             total=0.0,
         )
+        self._milestone_hit_90 = False
+        self._milestone_hit_99 = False
         self.recent_new_coverage: Deque[float] = deque(
             maxlen=max(1, int(self.config.robot_state.stagnation_window)),
         )
@@ -159,6 +175,49 @@ class CPPDiscreteEnv:
     def _coverage_ratio(self) -> float:
         covered = int(np.count_nonzero(self.explored & self.free_mask))
         return float(covered) / float(max(1, self.free_total))
+
+    def _compute_milestone_reward(
+        self,
+        *,
+        prev_coverage_ratio: float,
+        curr_coverage_ratio: float,
+        collided: bool,
+    ) -> Tuple[float, bool, bool]:
+        cfg = self.config.reward
+        if (not bool(cfg.milestone_reward_enabled)) or bool(collided):
+            return 0.0, False, False
+
+        thr90 = float(cfg.milestone_threshold_90)
+        thr99 = float(cfg.milestone_threshold_99)
+        if not (0.0 < thr90 < 1.0 and 0.0 < thr99 <= 1.0 and thr90 < thr99):
+            return 0.0, False, False
+
+        area_unit = max(0.0, float(cfg.newly_visited_reward_scale))
+        bonus90 = (
+            max(0.0, float(cfg.milestone_lambda_90))
+            * max(0.0, 1.0 - thr90)
+            * float(self.free_total)
+            * area_unit
+        )
+        bonus99 = (
+            max(0.0, float(cfg.milestone_lambda_99))
+            * max(0.0, 1.0 - thr99)
+            * float(self.free_total)
+            * area_unit
+        )
+
+        hit90_now = False
+        hit99_now = False
+        reward = 0.0
+        if (not self._milestone_hit_90) and (prev_coverage_ratio < thr90 <= curr_coverage_ratio):
+            reward += float(bonus90)
+            self._milestone_hit_90 = True
+            hit90_now = True
+        if (not self._milestone_hit_99) and (prev_coverage_ratio < thr99 <= curr_coverage_ratio):
+            reward += float(bonus99)
+            self._milestone_hit_99 = True
+            hit99_now = True
+        return float(reward), bool(hit90_now), bool(hit99_now)
 
     def _coverage_map_float(self) -> np.ndarray:
         known_free = self.known_map == 0
@@ -212,17 +271,124 @@ class CPPDiscreteEnv:
             robot_pos=self.current_pos,
             explored=self.explored,
         )
+        boundary_exit_features: Optional[np.ndarray] = None
+        if self.config.use_boundary_exit_features:
+            if self.config.include_dtm:
+                boundary_levels = levels
+            else:
+                if self._boundary_maps_builder is None:
+                    raise RuntimeError("Boundary maps builder is not initialized")
+                boundary_levels = self._boundary_maps_builder.build_levels(
+                    self.known_map,
+                    robot_pos=self.current_pos,
+                    explored=self.explored,
+                )
+            boundary_exit_features = self._build_boundary_exit_features(boundary_levels)
         robot_state = self.robot_state_builder.build(
             occupancy=self.known_map,
             explored=self.explored,
             robot_pos=self.current_pos,
             prev_pos=self.prev_pos,
             recent_new_coverage=list(self.recent_new_coverage),
+            extra_features=boundary_exit_features,
         )
         return {
             "levels": levels,
             "robot_state": robot_state.astype(np.float32),
         }
+
+    def _dtm_channel_count(self) -> int:
+        mode = str(self.config.observation.dtm_output_mode).strip().lower()
+        if mode in {"six", "extent6"}:
+            return 6
+        if mode == "four":
+            return 4
+        if mode == "port12":
+            return 12
+        raise ValueError(f"Unsupported dtm_output_mode: {self.config.observation.dtm_output_mode}")
+
+    def _level_cell_index(self, level_id: int) -> GridPos:
+        local_count = len(self.config.observation.local_blocks)
+        if level_id < local_count:
+            c = int(self.config.observation.local_window_size) // 2
+            return int(c), int(c)
+        gsize = int(self.config.observation.global_window_size)
+        rr, cc = self.current_pos
+        gr = min(gsize - 1, max(0, int((float(rr) * float(gsize)) / float(max(1, self.rows)))))
+        gc = min(gsize - 1, max(0, int((float(cc) * float(gsize)) / float(max(1, self.cols)))))
+        return int(gr), int(gc)
+
+    def _exit_scores_from_dtm(self, dtm_values: np.ndarray) -> Tuple[float, float, float, float]:
+        mode = str(self.config.observation.dtm_output_mode).strip().lower()
+        vals = np.maximum(dtm_values.astype(np.float32), 0.0)
+        if mode in {"six", "extent6"}:
+            lr, ud, nw_se, se_nw, ne_sw, sw_ne = [float(v) for v in vals[:6]]
+            # Exit side can be reached if any transition path points to that side.
+            up = max(ud, se_nw, sw_ne)
+            right = max(lr, nw_se, sw_ne)
+            down = max(ud, nw_se, ne_sw)
+            left = max(lr, se_nw, ne_sw)
+            return up, right, down, left
+        if mode == "four":
+            lr, ud, d1, d2 = [float(v) for v in vals[:4]]
+            up = max(ud, d1, d2)
+            right = max(lr, d1, d2)
+            down = max(ud, d1, d2)
+            left = max(lr, d1, d2)
+            return up, right, down, left
+        if mode == "port12":
+            (
+                u_r,
+                u_d,
+                u_l,
+                r_u,
+                r_d,
+                r_l,
+                d_u,
+                d_r,
+                d_l,
+                l_u,
+                l_r,
+                l_d,
+            ) = [float(v) for v in vals[:12]]
+            up = max(r_u, d_u, l_u)
+            right = max(u_r, d_r, l_r)
+            down = max(u_d, r_d, l_d)
+            left = max(u_l, r_l, d_l)
+            return up, right, down, left
+        raise ValueError(f"Unsupported dtm_output_mode: {self.config.observation.dtm_output_mode}")
+
+    def _build_boundary_exit_features(self, levels: Dict[int, np.ndarray]) -> np.ndarray:
+        thr = float(self.config.boundary_exit_threshold)
+        if thr < 0.0:
+            thr = 0.0
+        if thr > 1.0:
+            thr = 1.0
+
+        dtm_ch = self._dtm_channel_count()
+        out: List[float] = []
+        for lv in range(self.maps_builder.num_levels):
+            level_arr = np.asarray(levels[lv], dtype=np.float32)
+            if level_arr.ndim != 3:
+                raise ValueError(f"Level tensor must be [C,H,W], got shape={level_arr.shape}")
+            ri, ci = self._level_cell_index(lv)
+            dtm = level_arr[3 : 3 + dtm_ch, ri, ci]
+            valid = float(np.all(dtm >= 0.0))
+            up_s, right_s, down_s, left_s = self._exit_scores_from_dtm(dtm)
+            if valid > 0.5:
+                out.extend(
+                    [
+                        1.0 if up_s > thr else 0.0,
+                        1.0 if right_s > thr else 0.0,
+                        1.0 if down_s > thr else 0.0,
+                        1.0 if left_s > thr else 0.0,
+                    ]
+                )
+            else:
+                out.extend([0.0, 0.0, 0.0, 0.0])
+            if self.config.boundary_exit_include_valid:
+                out.append(valid)
+        return np.asarray(out, dtype=np.float32)
 
     def get_action_mask(self) -> np.ndarray:
         """
@@ -275,6 +441,8 @@ class CPPDiscreteEnv:
         self.last_collision = False
         self.path = [self.current_pos]
         self.recent_new_coverage.clear()
+        self._milestone_hit_90 = False
+        self._milestone_hit_99 = False
 
         self.known_map.fill(-1)
         self.explored.fill(False)
@@ -335,11 +503,14 @@ class CPPDiscreteEnv:
         self._sense_at(self.current_pos)
 
         was_explored = bool(self.explored[self.current_pos]) if not collided else False
+        prev_coverage_cells = int(np.count_nonzero(self.explored & self.free_mask))
         local_tv_old = self._compute_local_tv(self.current_pos)
         newly_visited = self._mark_explored(self.current_pos)
         local_tv_new = self._compute_local_tv(self.current_pos)
         global_tv = self._compute_global_tv()
         coverage_cells = int(np.count_nonzero(self.explored & self.free_mask))
+        prev_coverage_ratio = float(prev_coverage_cells) / float(max(1, self.free_total))
+        curr_coverage_ratio = float(coverage_cells) / float(max(1, self.free_total))
 
         rew_in = CPPRewardInput(
             newly_visited=float(newly_visited),
@@ -364,7 +535,13 @@ class CPPDiscreteEnv:
         if (not collided) and was_explored:
             reward_overlap = float(self.config.reward.revisit_penalty)
 
-        total_reward = float(base_reward.total + reward_turn + reward_overlap)
+        reward_milestone, milestone_hit_90_now, milestone_hit_99_now = self._compute_milestone_reward(
+            prev_coverage_ratio=prev_coverage_ratio,
+            curr_coverage_ratio=curr_coverage_ratio,
+            collided=collided,
+        )
+
+        total_reward = float(base_reward.total + reward_turn + reward_overlap + reward_milestone)
         self.last_reward = CPPRewardBreakdown(
             area=float(base_reward.area),
             tv_local=float(base_reward.tv_local),
@@ -411,6 +588,11 @@ class CPPDiscreteEnv:
             "revisited_cell": bool((not collided) and was_explored),
             "reward_turn": float(reward_turn),
             "reward_overlap": float(reward_overlap),
+            "reward_milestone": float(reward_milestone),
+            "milestone_hit_90_now": bool(milestone_hit_90_now),
+            "milestone_hit_99_now": bool(milestone_hit_99_now),
+            "milestone_hit_90": bool(self._milestone_hit_90),
+            "milestone_hit_99": bool(self._milestone_hit_99),
             "coverage_cells": int(coverage_cells),
             "free_cells": int(self.free_total),
             "coverage_ratio": float(self._coverage_ratio()),

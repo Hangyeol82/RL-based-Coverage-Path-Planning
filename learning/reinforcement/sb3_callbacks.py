@@ -32,6 +32,7 @@ class RewardBreakdownCallback(BaseCallback):
         "reward_const",
         "reward_turn",
         "reward_overlap",
+        "reward_milestone",
         "reward_total",
         "coverage_ratio",
         "collision",

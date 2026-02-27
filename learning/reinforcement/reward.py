@@ -37,6 +37,13 @@ class CPPRewardConfig:
     # - revisit_penalty: applied when stepping onto an already explored free cell.
     turn_change_penalty: float = -0.05
     revisit_penalty: float = -0.1
+    # Coverage milestone shaping (applied in env step logic, once per episode).
+    # Bonus_i = milestone_lambda_i * (1 - milestone_threshold_i) * free_total * newly_visited_reward_scale
+    milestone_reward_enabled: bool = False
+    milestone_threshold_90: float = 0.90
+    milestone_threshold_99: float = 0.99
+    milestone_lambda_90: float = 0.2
+    milestone_lambda_99: float = 4.0
 
 
 @dataclass(frozen=True)

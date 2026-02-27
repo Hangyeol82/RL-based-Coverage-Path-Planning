@@ -186,12 +186,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--map-size", type=int, default=32)
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
+    boundary_group = p.add_mutually_exclusive_group()
+    boundary_group.add_argument("--boundary-exit-features", dest="boundary_exit_features", action="store_true")
+    boundary_group.add_argument("--no-boundary-exit-features", dest="boundary_exit_features", action="store_false")
+    p.add_argument("--boundary-exit-threshold", type=float, default=0.0)
+    milestone_group = p.add_mutually_exclusive_group()
+    milestone_group.add_argument("--milestone-reward", dest="milestone_reward", action="store_true")
+    milestone_group.add_argument("--no-milestone-reward", dest="milestone_reward", action="store_false")
+    p.add_argument("--milestone-threshold-90", type=float, default=0.90)
+    p.add_argument("--milestone-threshold-99", type=float, default=0.99)
+    p.add_argument("--milestone-lambda-90", type=float, default=0.2)
+    p.add_argument("--milestone-lambda-99", type=float, default=4.0)
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
     p.add_argument(
         "--model-size",
         type=str,
         default="small",
-        choices=["small", "large"],
+        choices=["small", "large", "xlarge"],
         help="Forwarded to run_ppo_sb3.py encoder size preset.",
     )
     p.add_argument(
@@ -226,7 +237,7 @@ def _parse_args() -> argparse.Namespace:
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument("--action-mask", dest="action_mask", action="store_true")
     mask_group.add_argument("--no-action-mask", dest="action_mask", action="store_false")
-    p.set_defaults(action_mask=True)
+    p.set_defaults(action_mask=True, milestone_reward=False, boundary_exit_features=False)
 
     p.add_argument(
         "--init-from-bc",
@@ -399,6 +410,16 @@ def _build_run_cmd(
         str(int(args.sensor_range)),
         "--max-episode-steps",
         str(int(args.max_episode_steps)),
+        "--boundary-exit-threshold",
+        str(float(args.boundary_exit_threshold)),
+        "--milestone-threshold-90",
+        str(float(args.milestone_threshold_90)),
+        "--milestone-threshold-99",
+        str(float(args.milestone_threshold_99)),
+        "--milestone-lambda-90",
+        str(float(args.milestone_lambda_90)),
+        "--milestone-lambda-99",
+        str(float(args.milestone_lambda_99)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
         "--model-size",
@@ -426,6 +447,14 @@ def _build_run_cmd(
         cmd.append("--action-mask")
     else:
         cmd.append("--no-action-mask")
+    if args.boundary_exit_features:
+        cmd.append("--boundary-exit-features")
+    else:
+        cmd.append("--no-boundary-exit-features")
+    if args.milestone_reward:
+        cmd.append("--milestone-reward")
+    else:
+        cmd.append("--no-milestone-reward")
     if init_from_bc:
         cmd += ["--init-from-bc", init_from_bc]
         if args.init_from_bc_strict:
@@ -464,6 +493,8 @@ def _run_fixed_eval(
         str(int(args.sensor_range)),
         "--max-episode-steps",
         str(int(args.eval_max_episode_steps if args.eval_max_episode_steps > 0 else args.max_episode_steps)),
+        "--boundary-exit-threshold",
+        str(float(args.boundary_exit_threshold)),
         "--dtm-coarse-mode",
         str(args.dtm_coarse_mode),
         "--dtm-output-mode",
@@ -474,6 +505,10 @@ def _run_fixed_eval(
     ]
     if args.include_dtm:
         cmd.append("--include-dtm")
+    if args.boundary_exit_features:
+        cmd.append("--boundary-exit-features")
+    else:
+        cmd.append("--no-boundary-exit-features")
     if args.action_mask:
         cmd.append("--action-mask")
     else:

@@ -75,6 +75,42 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--sensor-range", type=int, default=2, help="2 -> 5x5 sensing window")
     p.add_argument("--max-episode-steps", type=int, default=1500)
+    boundary_group = p.add_mutually_exclusive_group()
+    boundary_group.add_argument(
+        "--boundary-exit-features",
+        dest="boundary_exit_features",
+        action="store_true",
+        help="Append per-level DTM boundary-exit features to robot_state.",
+    )
+    boundary_group.add_argument(
+        "--no-boundary-exit-features",
+        dest="boundary_exit_features",
+        action="store_false",
+        help="Disable DTM boundary-exit features in robot_state.",
+    )
+    p.add_argument(
+        "--boundary-exit-threshold",
+        type=float,
+        default=0.0,
+        help="Threshold in [0,1] to binarize per-level exit scores.",
+    )
+    milestone_group = p.add_mutually_exclusive_group()
+    milestone_group.add_argument(
+        "--milestone-reward",
+        dest="milestone_reward",
+        action="store_true",
+        help="Enable one-time milestone reward bonuses at coverage thresholds.",
+    )
+    milestone_group.add_argument(
+        "--no-milestone-reward",
+        dest="milestone_reward",
+        action="store_false",
+        help="Disable milestone reward bonuses.",
+    )
+    p.add_argument("--milestone-threshold-90", type=float, default=0.90)
+    p.add_argument("--milestone-threshold-99", type=float, default=0.99)
+    p.add_argument("--milestone-lambda-90", type=float, default=0.2)
+    p.add_argument("--milestone-lambda-99", type=float, default=4.0)
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument(
         "--dtm-coarse-mode",
@@ -99,7 +135,7 @@ def _parse_args() -> argparse.Namespace:
         "--model-size",
         type=str,
         default="small",
-        choices=["small", "large"],
+        choices=["small", "large", "xlarge"],
         help="Policy encoder size preset.",
     )
     mask_group = p.add_mutually_exclusive_group()
@@ -145,7 +181,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Require exact BC->PPO encoder key/shape match. Default loads shape-compatible subset.",
     )
-    p.set_defaults(action_mask=True)
+    p.set_defaults(action_mask=True, milestone_reward=False, boundary_exit_features=False)
     return p.parse_args()
 
 
@@ -157,6 +193,13 @@ def _set_seed(seed: int):
 
 
 def _model_preset(model_size: str) -> Dict[str, object]:
+    if model_size == "xlarge":
+        return dict(
+            conv_channels=(64, 128),
+            level_embed_dim=256,
+            state_hidden_dims=(256, 256),
+            fusion_hidden_dims=(1024, 1024),
+        )
     if model_size == "large":
         return dict(
             conv_channels=(32, 64),
@@ -390,6 +433,11 @@ def main():
         collision_reward=-10.0,
         constant_reward=-0.1,
         constant_reward_always=True,
+        milestone_reward_enabled=bool(args.milestone_reward),
+        milestone_threshold_90=float(args.milestone_threshold_90),
+        milestone_threshold_99=float(args.milestone_threshold_99),
+        milestone_lambda_90=float(args.milestone_lambda_90),
+        milestone_lambda_99=float(args.milestone_lambda_99),
     )
     env_cfg = CPPDiscreteEnvConfig(
         sensor_range=args.sensor_range,
@@ -397,6 +445,8 @@ def main():
         collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
+        use_boundary_exit_features=bool(args.boundary_exit_features),
+        boundary_exit_threshold=float(args.boundary_exit_threshold),
         observation=MultiScaleCPPObservationConfig(
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_output_mode=str(args.dtm_output_mode),
@@ -406,6 +456,8 @@ def main():
     )
 
     probe = CPPDiscreteEnv(grid_map=grid, start_pos=start, config=env_cfg)
+    probe_obs = probe.reset()
+    robot_state_dim = int(np.asarray(probe_obs["robot_state"], dtype=np.float32).shape[0])
     model_cfg = _model_preset(str(args.model_size))
     maps_cfg = MultiLevelMAPSEncoderConfig(
         num_levels=probe.maps_builder.num_levels,
@@ -416,7 +468,7 @@ def main():
     )
     encoder_cfg = FusedMAPSStateEncoderConfig(
         maps=maps_cfg,
-        robot_state=RobotStateEncoderConfig(input_dim=9, hidden_dims=model_cfg["state_hidden_dims"]),
+        robot_state=RobotStateEncoderConfig(input_dim=robot_state_dim, hidden_dims=model_cfg["state_hidden_dims"]),
         fusion_hidden_dims=model_cfg["fusion_hidden_dims"],
     )
 
@@ -514,6 +566,20 @@ def main():
         f" vec_env={vec_env_mode}, n_steps={args.n_steps},"
         f" rollout_batch={args.n_steps * args.num_envs},"
         f" batch_size={args.batch_size}, n_epochs={args.n_epochs}"
+    )
+    print(
+        "Milestone reward:"
+        f" enabled={bool(args.milestone_reward)},"
+        f" t90={float(args.milestone_threshold_90):.3f},"
+        f" t99={float(args.milestone_threshold_99):.3f},"
+        f" lambda90={float(args.milestone_lambda_90):.3f},"
+        f" lambda99={float(args.milestone_lambda_99):.3f}"
+    )
+    print(
+        "Boundary-exit features:"
+        f" enabled={bool(args.boundary_exit_features)},"
+        f" threshold={float(args.boundary_exit_threshold):.3f},"
+        f" robot_state_dim={robot_state_dim}"
     )
     print(
         f"Model size: {args.model_size} | conv={model_cfg['conv_channels']} | "
