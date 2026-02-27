@@ -91,10 +91,17 @@ def _parse_args() -> argparse.Namespace:
         "--dtm-output-mode",
         type=str,
         default="six",
-        choices=["six", "four", "port12"],
-        help="DTM output channels: six, four(legacy), or port12(side-to-side).",
+        choices=["six", "extent6", "four", "port12"],
+        help="DTM output channels: six, extent6, four(legacy), or port12(side-to-side).",
     )
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
+    p.add_argument(
+        "--model-size",
+        type=str,
+        default="small",
+        choices=["small", "large"],
+        help="Policy encoder size preset.",
+    )
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument(
         "--action-mask",
@@ -147,6 +154,23 @@ def _set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _model_preset(model_size: str) -> Dict[str, object]:
+    if model_size == "large":
+        return dict(
+            conv_channels=(32, 64),
+            level_embed_dim=128,
+            state_hidden_dims=(128, 128),
+            fusion_hidden_dims=(512, 512),
+        )
+    # Legacy default.
+    return dict(
+        conv_channels=(16, 32),
+        level_embed_dim=64,
+        state_hidden_dims=(64, 64),
+        fusion_hidden_dims=(256, 256),
+    )
 
 
 def _select_device(device_arg: str) -> str:
@@ -382,17 +406,18 @@ def main():
     )
 
     probe = CPPDiscreteEnv(grid_map=grid, start_pos=start, config=env_cfg)
+    model_cfg = _model_preset(str(args.model_size))
     maps_cfg = MultiLevelMAPSEncoderConfig(
         num_levels=probe.maps_builder.num_levels,
         in_channels_per_level=probe.maps_builder.channels_per_level,
-        conv_channels=(16, 32),
-        level_embed_dim=64,
+        conv_channels=model_cfg["conv_channels"],
+        level_embed_dim=int(model_cfg["level_embed_dim"]),
         mode=args.maps_encoder_mode,
     )
     encoder_cfg = FusedMAPSStateEncoderConfig(
         maps=maps_cfg,
-        robot_state=RobotStateEncoderConfig(input_dim=9, hidden_dims=(64, 64)),
-        fusion_hidden_dims=(256, 256),
+        robot_state=RobotStateEncoderConfig(input_dim=9, hidden_dims=model_cfg["state_hidden_dims"]),
+        fusion_hidden_dims=model_cfg["fusion_hidden_dims"],
     )
 
     if args.vec_env == "auto":
@@ -489,6 +514,11 @@ def main():
         f" vec_env={vec_env_mode}, n_steps={args.n_steps},"
         f" rollout_batch={args.n_steps * args.num_envs},"
         f" batch_size={args.batch_size}, n_epochs={args.n_epochs}"
+    )
+    print(
+        f"Model size: {args.model_size} | conv={model_cfg['conv_channels']} | "
+        f"level_embed={model_cfg['level_embed_dim']} | "
+        f"state={model_cfg['state_hidden_dims']} | fusion={model_cfg['fusion_hidden_dims']}"
     )
     if args.load_model:
         print(f"Init mode: resume PPO from {args.load_model}")

@@ -54,6 +54,8 @@ class MultiScaleCPPObservationConfig:
     dtm_coarse_mode: str = "bfs"
     # DTM output channel mode:
     # - six: LR, UD, NW->SE, SE->NW, NE->SW, SW->NE
+    # - extent6: LR, UD, NW->SE, SE->NW, NE->SW, SW->NE extents in [0,1]
+    #   with unknown as -1
     # - four: legacy projection to LR, UD, NW-SE, NE-SW
     # - port12: directed side-to-side transitions
     #   [U->R, U->D, U->L, R->U, R->D, R->L, D->U, D->R, D->L, L->U, L->R, L->D]
@@ -87,6 +89,14 @@ class MultiScaleCPPObservationBuilder:
         "dtm_se_nw",
         "dtm_ne_sw",
         "dtm_sw_ne",
+    )
+    _DTM_CHANNELS_EXTENT6 = (
+        "dtm_extent_lr",
+        "dtm_extent_ud",
+        "dtm_extent_nw_se",
+        "dtm_extent_se_nw",
+        "dtm_extent_ne_sw",
+        "dtm_extent_sw_ne",
     )
     _DTM_CHANNELS_4 = ("dtm_lr", "dtm_ud", "dtm_nw_se", "dtm_ne_sw")
     _DTM_CHANNELS_12 = (
@@ -129,17 +139,28 @@ class MultiScaleCPPObservationBuilder:
             raise ValueError("dtm_patch_min_known_ratio must be in (0, 1]")
         if self.config.dtm_coarse_mode not in {"bfs", "aggregate", "aggregate_transfer"}:
             raise ValueError("dtm_coarse_mode must be one of {'bfs', 'aggregate', 'aggregate_transfer'}")
-        if self.config.dtm_output_mode not in {"six", "four", "port12"}:
-            raise ValueError("dtm_output_mode must be one of {'six', 'four', 'port12'}")
+        if self.config.dtm_output_mode not in {"six", "extent6", "four", "port12"}:
+            raise ValueError("dtm_output_mode must be one of {'six', 'extent6', 'four', 'port12'}")
+        if (
+            self.config.dtm_output_mode == "extent6"
+            and self.config.dtm_coarse_mode == "aggregate_transfer"
+        ):
+            raise ValueError(
+                "dtm_output_mode='extent6' is not supported with "
+                "dtm_coarse_mode='aggregate_transfer'. Use dtm_coarse_mode='bfs'."
+            )
 
     def _native_dtm_mode(self) -> str:
         # Keep legacy outputs backed by six-channel DTM.
         if self.config.dtm_output_mode in {"six", "four"}:
             return "six"
+        if self.config.dtm_output_mode == "extent6":
+            return "extent6"
         return "port12"
 
     def _native_dtm_channels(self) -> int:
-        return 6 if self._native_dtm_mode() == "six" else 12
+        mode = self._native_dtm_mode()
+        return 12 if mode == "port12" else 6
 
     @property
     def num_levels(self) -> int:
@@ -150,6 +171,8 @@ class MultiScaleCPPObservationBuilder:
         if self.include_dtm:
             if self.config.dtm_output_mode == "six":
                 dtm_names = self._DTM_CHANNELS_6
+            elif self.config.dtm_output_mode == "extent6":
+                dtm_names = self._DTM_CHANNELS_EXTENT6
             elif self.config.dtm_output_mode == "four":
                 dtm_names = self._DTM_CHANNELS_4
             else:
@@ -265,12 +288,14 @@ class MultiScaleCPPObservationBuilder:
         if dtm_map.ndim != 3:
             raise ValueError("dtm_map must be [C, H, W]")
         native_mode = self._native_dtm_mode()
-        expected_ch = 6 if native_mode == "six" else 12
+        expected_ch = 12 if native_mode == "port12" else 6
         if dtm_map.shape[0] != expected_ch:
             raise ValueError(
                 f"{native_mode}-channel DTM expected with shape[0] == {expected_ch}"
             )
         if self.config.dtm_output_mode == "port12":
+            return dtm_map
+        if self.config.dtm_output_mode == "extent6":
             return dtm_map
         if self.config.dtm_output_mode == "six":
             return dtm_map

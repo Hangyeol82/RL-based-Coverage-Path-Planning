@@ -188,6 +188,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-episode-steps", type=int, default=2000)
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
     p.add_argument(
+        "--model-size",
+        type=str,
+        default="small",
+        choices=["small", "large"],
+        help="Forwarded to run_ppo_sb3.py encoder size preset.",
+    )
+    p.add_argument(
         "--dtm-coarse-mode",
         type=str,
         default="bfs",
@@ -198,7 +205,7 @@ def _parse_args() -> argparse.Namespace:
         "--dtm-output-mode",
         type=str,
         default="six",
-        choices=["six", "four", "port12"],
+        choices=["six", "extent6", "four", "port12"],
         help="DTM output channels forwarded to run_ppo_sb3.py.",
     )
     p.add_argument("--include-dtm", action="store_true")
@@ -394,6 +401,8 @@ def _build_run_cmd(
         str(int(args.max_episode_steps)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
+        "--model-size",
+        args.model_size,
         "--dtm-coarse-mode",
         str(args.dtm_coarse_mode),
         "--dtm-output-mode",

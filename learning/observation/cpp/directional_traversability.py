@@ -120,6 +120,83 @@ def _edge_pair_connected(
     return False
 
 
+def _reach_ratio_between_sets(
+    passable_mask: np.ndarray,
+    *,
+    sources: list,
+    targets: list,
+    connectivity: int,
+) -> float:
+    h, w = passable_mask.shape
+    if h <= 0 or w <= 0:
+        return 0.0
+
+    src = [p for p in sources if bool(passable_mask[p[0], p[1]])]
+    if not src:
+        return 0.0
+    tgt = [p for p in targets if bool(passable_mask[p[0], p[1]])]
+    if not tgt:
+        return 0.0
+
+    q = deque(src)
+    visited = set(src)
+    deltas = _neighbor_deltas(connectivity)
+    while q:
+        r, c = q.popleft()
+        for dr, dc in deltas:
+            nr, nc = r + dr, c + dc
+            if nr < 0 or nr >= h or nc < 0 or nc >= w:
+                continue
+            if (nr, nc) in visited or not bool(passable_mask[nr, nc]):
+                continue
+            visited.add((nr, nc))
+            q.append((nr, nc))
+
+    reachable_targets = sum(1 for p in tgt if p in visited)
+    return float(reachable_targets) / float(len(tgt))
+
+
+def _edge_pair_reach_ratio(
+    passable_mask: np.ndarray,
+    *,
+    side_a: str,
+    side_b: str,
+    connectivity: int,
+) -> float:
+    h, w = passable_mask.shape
+    if h <= 0 or w <= 0:
+        return 0.0
+    return _reach_ratio_between_sets(
+        passable_mask,
+        sources=_side_cells(h, w, side_a),
+        targets=_side_cells(h, w, side_b),
+        connectivity=connectivity,
+    )
+
+
+def _corner_quadrant_reach_ratio(
+    passable_mask: np.ndarray,
+    *,
+    source_sides: Tuple[str, str],
+    target_sides: Tuple[str, str],
+    connectivity: int,
+) -> float:
+    h, w = passable_mask.shape
+    if h <= 0 or w <= 0:
+        return 0.0
+    src = _side_cells(h, w, source_sides[0]) + _side_cells(h, w, source_sides[1])
+    tgt = _side_cells(h, w, target_sides[0]) + _side_cells(h, w, target_sides[1])
+    # Deduplicate edge lists to avoid over-weighting shared corner cells.
+    src = list({p for p in src})
+    tgt = list({p for p in tgt})
+    return _reach_ratio_between_sets(
+        passable_mask,
+        sources=src,
+        targets=tgt,
+        connectivity=connectivity,
+    )
+
+
 def _direction_flags_from_mask6(
     passable_mask: np.ndarray,
     *,
@@ -163,6 +240,55 @@ def _direction_flags_from_mask6(
         passable_mask,
         start=(h - 1, 0),
         goal=(0, w - 1),
+        connectivity=connectivity,
+    )
+    return lr, ud, nw_se, se_nw, ne_sw, sw_ne
+
+
+def _direction_extent_from_mask6(
+    passable_mask: np.ndarray,
+    *,
+    connectivity: int,
+) -> Tuple[float, float, float, float, float, float]:
+    h, w = passable_mask.shape
+    if h <= 0 or w <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    lr = _edge_pair_reach_ratio(
+        passable_mask,
+        side_a="left",
+        side_b="right",
+        connectivity=connectivity,
+    )
+    ud = _edge_pair_reach_ratio(
+        passable_mask,
+        side_a="up",
+        side_b="down",
+        connectivity=connectivity,
+    )
+    # Diagonal extents use quadrant-to-opposite-quadrant reachability.
+    nw_se = _corner_quadrant_reach_ratio(
+        passable_mask,
+        source_sides=("up", "left"),
+        target_sides=("down", "right"),
+        connectivity=connectivity,
+    )
+    se_nw = _corner_quadrant_reach_ratio(
+        passable_mask,
+        source_sides=("down", "right"),
+        target_sides=("up", "left"),
+        connectivity=connectivity,
+    )
+    ne_sw = _corner_quadrant_reach_ratio(
+        passable_mask,
+        source_sides=("up", "right"),
+        target_sides=("down", "left"),
+        connectivity=connectivity,
+    )
+    sw_ne = _corner_quadrant_reach_ratio(
+        passable_mask,
+        source_sides=("down", "left"),
+        target_sides=("up", "right"),
         connectivity=connectivity,
     )
     return lr, ud, nw_se, se_nw, ne_sw, sw_ne
@@ -245,6 +371,9 @@ def compute_directional_traversability(
       3) southeast -> northwest
       4) northeast -> southwest
       5) southwest -> northeast
+    - extent6:
+      shape (6, H, W), same channel order as six.
+      Values are continuous traversability extents in [0, 1].
     - port12:
       shape (12, H, W), channel order:
       0) up->right, 1) up->down, 2) up->left,
@@ -266,13 +395,13 @@ def compute_directional_traversability(
     if not (0.0 <= min_patch_known_ratio <= 1.0):
         raise ValueError("min_patch_known_ratio must be in [0, 1]")
     mode = str(output_mode).strip().lower()
-    if mode not in {"six", "port12"}:
-        raise ValueError("output_mode must be one of {'six', 'port12'}")
+    if mode not in {"six", "extent6", "port12"}:
+        raise ValueError("output_mode must be one of {'six', 'extent6', 'port12'}")
 
     h, w = state_grid.shape
     p = _normalize_patch_size(patch_size, limit=max(h, w))
     center = p // 2
-    out_ch = 6 if mode == "six" else 12
+    out_ch = 12 if mode == "port12" else 6
     if out is None:
         out_arr = np.full((out_ch, h, w), unknown_fill, dtype=np.float32)
     else:
@@ -336,6 +465,11 @@ def compute_directional_traversability(
                     free_mask,
                     connectivity=connectivity,
                 )
+            elif mode == "extent6":
+                flags = _direction_extent_from_mask6(
+                    free_mask,
+                    connectivity=connectivity,
+                )
             else:
                 flags = _direction_flags_from_mask12(
                     free_mask,
@@ -366,6 +500,15 @@ def compute_directional_traversability(
                 opt_mask,
                 connectivity=connectivity,
             )
+        elif mode == "extent6":
+            pess_flags = _direction_extent_from_mask6(
+                pess_mask,
+                connectivity=connectivity,
+            )
+            opt_flags = _direction_extent_from_mask6(
+                opt_mask,
+                connectivity=connectivity,
+            )
         else:
             pess_flags = _direction_flags_from_mask12(
                 pess_mask,
@@ -377,10 +520,10 @@ def compute_directional_traversability(
             )
 
         for ch, p_flag, o_flag in zip(range(out_ch), pess_flags, opt_flags):
-            if p_flag:
-                out_arr[ch, r, c] = 1.0
-            elif not o_flag:
-                out_arr[ch, r, c] = 0.0
+            p_val = float(p_flag)
+            o_val = float(o_flag)
+            if abs(p_val - o_val) <= 1e-9:
+                out_arr[ch, r, c] = p_val
             else:
                 # Ambiguous with partial observability: keep unknown.
                 out_arr[ch, r, c] = float(uncertain_fill)
