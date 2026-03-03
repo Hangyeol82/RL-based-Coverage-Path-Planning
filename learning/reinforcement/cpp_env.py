@@ -301,6 +301,10 @@ class CPPDiscreteEnv:
         mode = str(self.config.observation.dtm_output_mode).strip().lower()
         if mode in {"six", "extent6"}:
             return 6
+        if mode == "axis2":
+            return 2
+        if mode == "axis2km":
+            return 4
         if mode == "four":
             return 4
         if mode == "port12":
@@ -328,6 +332,23 @@ class CPPDiscreteEnv:
             right = max(lr, nw_se, sw_ne)
             down = max(ud, nw_se, ne_sw)
             left = max(lr, se_nw, ne_sw)
+            return up, right, down, left
+        if mode == "axis2":
+            lr, ud = [float(v) for v in vals[:2]]
+            # Axis-only exits: no diagonal contribution.
+            up = ud
+            right = lr
+            down = ud
+            left = lr
+            return up, right, down, left
+        if mode == "axis2km":
+            lr_pass, ud_pass = [float(v) for v in vals[:2]]
+            # Axis-only exits from passable channels; known-mask channels are used
+            # only for validity gating.
+            up = ud_pass
+            right = lr_pass
+            down = ud_pass
+            left = lr_pass
             return up, right, down, left
         if mode == "four":
             lr, ud, d1, d2 = [float(v) for v in vals[:4]]
@@ -358,6 +379,15 @@ class CPPDiscreteEnv:
             return up, right, down, left
         raise ValueError(f"Unsupported dtm_output_mode: {self.config.observation.dtm_output_mode}")
 
+    def _dtm_valid_flag(self, dtm_values: np.ndarray) -> float:
+        mode = str(self.config.observation.dtm_output_mode).strip().lower()
+        vals = dtm_values.astype(np.float32)
+        if mode == "axis2km":
+            # [lr_pass, ud_pass, lr_known, ud_known]
+            known = vals[2:4]
+            return float(np.all(known >= 0.5))
+        return float(np.all(vals >= 0.0))
+
     def _build_boundary_exit_features(self, levels: Dict[int, np.ndarray]) -> np.ndarray:
         thr = float(self.config.boundary_exit_threshold)
         if thr < 0.0:
@@ -373,7 +403,7 @@ class CPPDiscreteEnv:
                 raise ValueError(f"Level tensor must be [C,H,W], got shape={level_arr.shape}")
             ri, ci = self._level_cell_index(lv)
             dtm = level_arr[3 : 3 + dtm_ch, ri, ci]
-            valid = float(np.all(dtm >= 0.0))
+            valid = self._dtm_valid_flag(dtm)
             up_s, right_s, down_s, left_s = self._exit_scores_from_dtm(dtm)
             if valid > 0.5:
                 out.extend(

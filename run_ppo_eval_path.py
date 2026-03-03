@@ -71,7 +71,7 @@ def _parse_args() -> argparse.Namespace:
         "--dtm-output-mode",
         type=str,
         default="six",
-        choices=["six", "extent6", "four", "port12"],
+        choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
         help="DTM output channel mode for env observation.",
     )
     p.add_argument(

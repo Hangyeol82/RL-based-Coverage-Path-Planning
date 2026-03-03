@@ -127,8 +127,11 @@ def _parse_args() -> argparse.Namespace:
         "--dtm-output-mode",
         type=str,
         default="six",
-        choices=["six", "extent6", "four", "port12"],
-        help="DTM output channels: six, extent6, four(legacy), or port12(side-to-side).",
+        choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
+        help=(
+            "DTM output channels: six, extent6, axis2(LR/UD), "
+            "axis2km(pass+known for LR/UD), four(legacy), or port12(side-to-side)."
+        ),
     )
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
     p.add_argument(
