@@ -219,6 +219,13 @@ def _parse_args() -> argparse.Namespace:
         choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
         help="DTM output channels forwarded to run_ppo_sb3.py.",
     )
+    p.add_argument(
+        "--obs-unknown-policy",
+        type=str,
+        default="keep",
+        choices=["keep", "as_free", "as_obstacle"],
+        help="Unknown-cell handling forwarded to run_ppo_sb3.py map-observation builder.",
+    )
     p.add_argument("--include-dtm", action="store_true")
 
     p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"])
@@ -246,6 +253,12 @@ def _parse_args() -> argparse.Namespace:
         help="BC checkpoint for first chunk only. Empty string disables BC init.",
     )
     p.add_argument("--init-from-bc-strict", action="store_true")
+    p.add_argument(
+        "--init-from-model",
+        type=str,
+        default="",
+        help="PPO .zip checkpoint for first chunk only. If set, overrides --init-from-bc.",
+    )
 
     p.add_argument("--run-tag", type=str, default="")
     p.add_argument("--out-dir", type=str, default="")
@@ -428,6 +441,8 @@ def _build_run_cmd(
         str(args.dtm_coarse_mode),
         "--dtm-output-mode",
         str(args.dtm_output_mode),
+        "--obs-unknown-policy",
+        str(args.obs_unknown_policy),
         "--map-source",
         "file",
         "--map-file",
@@ -499,6 +514,8 @@ def _run_fixed_eval(
         str(args.dtm_coarse_mode),
         "--dtm-output-mode",
         str(args.dtm_output_mode),
+        "--obs-unknown-policy",
+        str(args.obs_unknown_policy),
         "--save-path-json",
         str(out_json),
         "--deterministic",
@@ -588,6 +605,22 @@ def main():
             raise FileNotFoundError(f"BC checkpoint not found: {p}")
         bc_ckpt = str(p)
 
+    init_model_ckpt = ""
+    if args.init_from_model.strip():
+        p = Path(args.init_from_model)
+        if not p.is_absolute():
+            p = repo_root / p
+        if not p.exists():
+            raise FileNotFoundError(f"Init model checkpoint not found: {p}")
+        init_model_ckpt = str(p)
+
+    if bc_ckpt and init_model_ckpt:
+        print(
+            "[WARN] Both --init-from-bc and --init-from-model were provided. "
+            "Using --init-from-model for chunk 1 and ignoring BC init.",
+            flush=True,
+        )
+
     eval_map_path = None
     if args.eval_map_file.strip():
         p = Path(args.eval_map_file)
@@ -671,8 +704,11 @@ def main():
         save_json = logs_dir / f"chunk{i+1:02d}.json"
         save_csv = logs_dir / f"chunk{i+1:02d}.csv"
 
-        init_bc = bc_ckpt if i == 0 and bc_ckpt else ""
-        load_model = prev_model_zip if i > 0 else ""
+        init_bc = bc_ckpt if i == 0 and bc_ckpt and not init_model_ckpt else ""
+        if i == 0:
+            load_model = init_model_ckpt
+        else:
+            load_model = prev_model_zip
         cmd = _build_run_cmd(
             args,
             runner=runner,
