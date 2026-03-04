@@ -34,6 +34,11 @@ class MultiScaleCPPObservationConfig:
     # Occupancy coding.
     unknown_value: int = -1
     obstacle_value: int = 1
+    # Unknown handling for map-observation channels.
+    # - keep: keep unknown as-is (-1)
+    # - as_free: treat unknown as free for map channels
+    # - as_obstacle: treat unknown as obstacle for map channels
+    unknown_policy: str = "keep"
     # DTM config.
     dtm_patch_size: int = 7
     dtm_connectivity: int = 8
@@ -151,6 +156,8 @@ class MultiScaleCPPObservationBuilder:
             raise ValueError("dtm_patch_min_known_ratio must be in (0, 1]")
         if self.config.dtm_coarse_mode not in {"bfs", "aggregate", "aggregate_transfer"}:
             raise ValueError("dtm_coarse_mode must be one of {'bfs', 'aggregate', 'aggregate_transfer'}")
+        if self.config.unknown_policy not in {"keep", "as_free", "as_obstacle"}:
+            raise ValueError("unknown_policy must be one of {'keep', 'as_free', 'as_obstacle'}")
         if self.config.dtm_output_mode not in {"six", "extent6", "axis2", "axis2km", "four", "port12"}:
             raise ValueError(
                 "dtm_output_mode must be one of {'six', 'extent6', 'axis2', 'axis2km', 'four', 'port12'}"
@@ -681,8 +688,18 @@ class MultiScaleCPPObservationBuilder:
         if not (0 <= rr < h and 0 <= cc < w):
             raise ValueError(f"robot_pos {robot_pos} is out of bounds {(h, w)}")
 
+        # Optional unknown-policy ablation on map channels only.
+        occupancy_obs = occupancy
+        if self.config.unknown_policy != "keep":
+            occupancy_obs = occupancy.copy()
+            unknown_mask = occupancy_obs == self.config.unknown_value
+            if self.config.unknown_policy == "as_free":
+                occupancy_obs[unknown_mask] = 0
+            else:
+                occupancy_obs[unknown_mask] = self.config.obstacle_value
+
         known_free, known_obstacle, unknown = extract_known_masks(
-            occupancy,
+            occupancy_obs,
             unknown_value=self.config.unknown_value,
             obstacle_value=self.config.obstacle_value,
         )
@@ -693,7 +710,7 @@ class MultiScaleCPPObservationBuilder:
         covered_f = covered.astype(np.float32)
         obstacle_f = known_obstacle.astype(np.float32)
         frontier_f = frontier.astype(np.float32)
-        changed_f = self._compute_changed_mask(occupancy) if self.include_dtm else None
+        changed_f = self._compute_changed_mask(occupancy_obs) if self.include_dtm else None
         changed_f_float = changed_f.astype(np.float32) if changed_f is not None else None
         dtm_fine = None
         state_fine = None

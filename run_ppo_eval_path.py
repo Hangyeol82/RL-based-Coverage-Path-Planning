@@ -68,6 +68,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--boundary-exit-threshold", type=float, default=0.0)
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument(
+        "--obs-unknown-policy",
+        type=str,
+        default="keep",
+        choices=["keep", "as_free", "as_obstacle"],
+        help="How to handle unknown cells in map-observation channels.",
+    )
+    p.add_argument(
         "--dtm-output-mode",
         type=str,
         default="six",
@@ -282,8 +289,8 @@ def main():
     start = _pick_start(grid)
 
     reward_cfg = CPPRewardConfig(
-        newly_visited_reward_scale=1.0,
-        newly_visited_reward_max=2.0,
+        newly_visited_reward_scale=0.7,
+        newly_visited_reward_max=1.5,
         local_tv_reward_scale=1.0,
         local_tv_reward_max=5.0,
         local_tv_normalizer=2.5,
@@ -303,6 +310,7 @@ def main():
         use_boundary_exit_features=bool(args.boundary_exit_features),
         boundary_exit_threshold=float(args.boundary_exit_threshold),
         observation=MultiScaleCPPObservationConfig(
+            unknown_policy=str(args.obs_unknown_policy),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
         ),

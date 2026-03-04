@@ -12,8 +12,8 @@ class CPPRewardConfig:
     R = R_area + R_TV^I + R_TV^G + R_coll + R_const
     """
 
-    newly_visited_reward_scale: float = 1.0
-    newly_visited_reward_max: float = 2.0
+    newly_visited_reward_scale: float = 0.7
+    newly_visited_reward_max: float = 1.5
 
     local_tv_reward_scale: float = 1.0
     local_tv_reward_max: float = 5.0

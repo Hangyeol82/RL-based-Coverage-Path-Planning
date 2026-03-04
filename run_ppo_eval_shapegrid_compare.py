@@ -250,8 +250,8 @@ def _evaluate_one_map(
     dtm_coarse_mode: str,
 ) -> Dict[str, object]:
     reward_cfg = CPPRewardConfig(
-        newly_visited_reward_scale=1.0,
-        newly_visited_reward_max=2.0,
+        newly_visited_reward_scale=0.7,
+        newly_visited_reward_max=1.5,
         local_tv_reward_scale=1.0,
         local_tv_reward_max=5.0,
         local_tv_normalizer=2.5,

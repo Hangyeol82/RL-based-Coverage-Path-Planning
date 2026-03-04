@@ -208,6 +208,13 @@ def _parse_args() -> argparse.Namespace:
         choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
         help="DTM output channels forwarded to run_ppo_sb3.py.",
     )
+    p.add_argument(
+        "--obs-unknown-policy",
+        type=str,
+        default="keep",
+        choices=["keep", "as_free", "as_obstacle"],
+        help="Unknown-cell handling forwarded to run_ppo_sb3.py map-observation builder.",
+    )
     p.add_argument("--include-dtm", action="store_true")
 
     p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"])
@@ -364,6 +371,8 @@ def _build_run_cmd(
         str(args.dtm_coarse_mode),
         "--dtm-output-mode",
         str(args.dtm_output_mode),
+        "--obs-unknown-policy",
+        str(args.obs_unknown_policy),
         "--map-source",
         "file",
         "--map-file",

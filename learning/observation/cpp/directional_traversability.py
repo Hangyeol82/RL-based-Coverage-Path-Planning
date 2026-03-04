@@ -43,158 +43,132 @@ def _side_cells(h: int, w: int, side: str):
     raise ValueError(f"Unknown side: {side}")
 
 
-def _point_connected(
+def _component_labels(
     passable_mask: np.ndarray,
+    *,
+    connectivity: int,
+) -> np.ndarray:
+    """
+    Label connected components on a passable-mask patch.
+
+    Returns:
+    - labels: int32 [H, W], -1 for non-passable, otherwise component id >= 0.
+    """
+    h, w = passable_mask.shape
+    labels = np.full((h, w), -1, dtype=np.int32)
+    deltas = _neighbor_deltas(connectivity)
+
+    cid = 0
+    for r in range(h):
+        for c in range(w):
+            if (not bool(passable_mask[r, c])) or int(labels[r, c]) >= 0:
+                continue
+            q = deque([(r, c)])
+            labels[r, c] = cid
+            while q:
+                rr, cc = q.popleft()
+                for dr, dc in deltas:
+                    nr, nc = rr + dr, cc + dc
+                    if nr < 0 or nr >= h or nc < 0 or nc >= w:
+                        continue
+                    if (not bool(passable_mask[nr, nc])) or int(labels[nr, nc]) >= 0:
+                        continue
+                    labels[nr, nc] = cid
+                    q.append((nr, nc))
+            cid += 1
+    return labels
+
+
+def _component_ids_from_cells(
+    labels: np.ndarray,
+    *,
+    cells: list,
+) -> np.ndarray:
+    ids = []
+    h, w = labels.shape
+    for r, c in cells:
+        if r < 0 or r >= h or c < 0 or c >= w:
+            continue
+        cid = int(labels[r, c])
+        if cid >= 0:
+            ids.append(cid)
+    if not ids:
+        return np.empty((0,), dtype=np.int32)
+    return np.asarray(ids, dtype=np.int32)
+
+
+def _components_connected(
+    ids_a: np.ndarray,
+    ids_b: np.ndarray,
+) -> bool:
+    if ids_a.size == 0 or ids_b.size == 0:
+        return False
+    set_a = {int(x) for x in ids_a.tolist()}
+    for x in ids_b.tolist():
+        if int(x) in set_a:
+            return True
+    return False
+
+
+def _point_connected_labels(
+    labels: np.ndarray,
     *,
     start: GridPos,
     goal: GridPos,
-    connectivity: int,
 ) -> bool:
-    h, w = passable_mask.shape
+    h, w = labels.shape
     sr, sc = start
     gr, gc = goal
     if not (0 <= sr < h and 0 <= sc < w):
         return False
     if not (0 <= gr < h and 0 <= gc < w):
         return False
-    if not bool(passable_mask[sr, sc]) or not bool(passable_mask[gr, gc]):
+    s = int(labels[sr, sc])
+    g = int(labels[gr, gc])
+    if s < 0 or g < 0:
         return False
-    if (sr, sc) == (gr, gc):
-        return True
-
-    q = deque([(sr, sc)])
-    visited = {(sr, sc)}
-    deltas = _neighbor_deltas(connectivity)
-    while q:
-        r, c = q.popleft()
-        for dr, dc in deltas:
-            nr, nc = r + dr, c + dc
-            if nr < 0 or nr >= h or nc < 0 or nc >= w:
-                continue
-            if (nr, nc) in visited or not bool(passable_mask[nr, nc]):
-                continue
-            if (nr, nc) == (gr, gc):
-                return True
-            visited.add((nr, nc))
-            q.append((nr, nc))
-    return False
+    return s == g
 
 
-def _edge_pair_connected(
-    passable_mask: np.ndarray,
-    *,
-    side_a: str,
-    side_b: str,
-    connectivity: int,
-) -> bool:
-    h, w = passable_mask.shape
-    if h <= 0 or w <= 0:
-        return False
-
-    sources = [p for p in _side_cells(h, w, side_a) if bool(passable_mask[p[0], p[1]])]
-    if not sources:
-        return False
-    targets = {p for p in _side_cells(h, w, side_b) if bool(passable_mask[p[0], p[1]])}
-    if not targets:
-        return False
-
-    for p in sources:
-        if p in targets:
-            return True
-
-    q = deque(sources)
-    visited = set(sources)
-    deltas = _neighbor_deltas(connectivity)
-    while q:
-        r, c = q.popleft()
-        for dr, dc in deltas:
-            nr, nc = r + dr, c + dc
-            if nr < 0 or nr >= h or nc < 0 or nc >= w:
-                continue
-            if (nr, nc) in visited or not bool(passable_mask[nr, nc]):
-                continue
-            if (nr, nc) in targets:
-                return True
-            visited.add((nr, nc))
-            q.append((nr, nc))
-    return False
-
-
-def _reach_ratio_between_sets(
-    passable_mask: np.ndarray,
-    *,
-    sources: list,
-    targets: list,
-    connectivity: int,
+def _reach_ratio_from_component_ids(
+    source_ids: np.ndarray,
+    target_ids: np.ndarray,
 ) -> float:
-    h, w = passable_mask.shape
-    if h <= 0 or w <= 0:
+    if source_ids.size == 0 or target_ids.size == 0:
         return 0.0
-
-    src = [p for p in sources if bool(passable_mask[p[0], p[1]])]
-    if not src:
-        return 0.0
-    tgt = [p for p in targets if bool(passable_mask[p[0], p[1]])]
-    if not tgt:
-        return 0.0
-
-    q = deque(src)
-    visited = set(src)
-    deltas = _neighbor_deltas(connectivity)
-    while q:
-        r, c = q.popleft()
-        for dr, dc in deltas:
-            nr, nc = r + dr, c + dc
-            if nr < 0 or nr >= h or nc < 0 or nc >= w:
-                continue
-            if (nr, nc) in visited or not bool(passable_mask[nr, nc]):
-                continue
-            visited.add((nr, nc))
-            q.append((nr, nc))
-
-    reachable_targets = sum(1 for p in tgt if p in visited)
-    return float(reachable_targets) / float(len(tgt))
+    src = {int(x) for x in source_ids.tolist()}
+    reachable = 0
+    total = int(target_ids.size)
+    for x in target_ids.tolist():
+        if int(x) in src:
+            reachable += 1
+    return float(reachable) / float(max(1, total))
 
 
-def _edge_pair_reach_ratio(
-    passable_mask: np.ndarray,
-    *,
-    side_a: str,
-    side_b: str,
-    connectivity: int,
-) -> float:
-    h, w = passable_mask.shape
-    if h <= 0 or w <= 0:
-        return 0.0
-    return _reach_ratio_between_sets(
-        passable_mask,
-        sources=_side_cells(h, w, side_a),
-        targets=_side_cells(h, w, side_b),
-        connectivity=connectivity,
-    )
-
-
-def _corner_quadrant_reach_ratio(
-    passable_mask: np.ndarray,
+def _edge_pair_reach_ratio_labels(
+    labels: np.ndarray,
     *,
     source_sides: Tuple[str, str],
     target_sides: Tuple[str, str],
-    connectivity: int,
 ) -> float:
-    h, w = passable_mask.shape
+    h, w = labels.shape
     if h <= 0 or w <= 0:
         return 0.0
-    src = _side_cells(h, w, source_sides[0]) + _side_cells(h, w, source_sides[1])
-    tgt = _side_cells(h, w, target_sides[0]) + _side_cells(h, w, target_sides[1])
-    # Deduplicate edge lists to avoid over-weighting shared corner cells.
-    src = list({p for p in src})
-    tgt = list({p for p in tgt})
-    return _reach_ratio_between_sets(
-        passable_mask,
-        sources=src,
-        targets=tgt,
-        connectivity=connectivity,
+    src_cells = list(
+        {
+            *(_side_cells(h, w, source_sides[0])),
+            *(_side_cells(h, w, source_sides[1])),
+        }
     )
+    tgt_cells = list(
+        {
+            *(_side_cells(h, w, target_sides[0])),
+            *(_side_cells(h, w, target_sides[1])),
+        }
+    )
+    src_ids = _component_ids_from_cells(labels, cells=src_cells)
+    tgt_ids = _component_ids_from_cells(labels, cells=tgt_cells)
+    return _reach_ratio_from_component_ids(src_ids, tgt_ids)
 
 
 def _direction_flags_from_mask6(
@@ -206,42 +180,18 @@ def _direction_flags_from_mask6(
     if h <= 0 or w <= 0:
         return False, False, False, False, False, False
 
-    lr = _edge_pair_connected(
-        passable_mask,
-        side_a="left",
-        side_b="right",
-        connectivity=connectivity,
-    )
-    ud = _edge_pair_connected(
-        passable_mask,
-        side_a="up",
-        side_b="down",
-        connectivity=connectivity,
-    )
-    nw_se = _point_connected(
-        passable_mask,
-        start=(0, 0),
-        goal=(h - 1, w - 1),
-        connectivity=connectivity,
-    )
-    se_nw = _point_connected(
-        passable_mask,
-        start=(h - 1, w - 1),
-        goal=(0, 0),
-        connectivity=connectivity,
-    )
-    ne_sw = _point_connected(
-        passable_mask,
-        start=(0, w - 1),
-        goal=(h - 1, 0),
-        connectivity=connectivity,
-    )
-    sw_ne = _point_connected(
-        passable_mask,
-        start=(h - 1, 0),
-        goal=(0, w - 1),
-        connectivity=connectivity,
-    )
+    labels = _component_labels(passable_mask, connectivity=connectivity)
+    left_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "left"))
+    right_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "right"))
+    up_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "up"))
+    down_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "down"))
+
+    lr = _components_connected(left_ids, right_ids)
+    ud = _components_connected(up_ids, down_ids)
+    nw_se = _point_connected_labels(labels, start=(0, 0), goal=(h - 1, w - 1))
+    se_nw = _point_connected_labels(labels, start=(h - 1, w - 1), goal=(0, 0))
+    ne_sw = _point_connected_labels(labels, start=(0, w - 1), goal=(h - 1, 0))
+    sw_ne = _point_connected_labels(labels, start=(h - 1, 0), goal=(0, w - 1))
     return lr, ud, nw_se, se_nw, ne_sw, sw_ne
 
 
@@ -254,42 +204,34 @@ def _direction_extent_from_mask6(
     if h <= 0 or w <= 0:
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
-    lr = _edge_pair_reach_ratio(
-        passable_mask,
-        side_a="left",
-        side_b="right",
-        connectivity=connectivity,
-    )
-    ud = _edge_pair_reach_ratio(
-        passable_mask,
-        side_a="up",
-        side_b="down",
-        connectivity=connectivity,
-    )
+    labels = _component_labels(passable_mask, connectivity=connectivity)
+    left_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "left"))
+    right_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "right"))
+    up_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "up"))
+    down_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "down"))
+
+    lr = _reach_ratio_from_component_ids(left_ids, right_ids)
+    ud = _reach_ratio_from_component_ids(up_ids, down_ids)
     # Diagonal extents use quadrant-to-opposite-quadrant reachability.
-    nw_se = _corner_quadrant_reach_ratio(
-        passable_mask,
+    nw_se = _edge_pair_reach_ratio_labels(
+        labels,
         source_sides=("up", "left"),
         target_sides=("down", "right"),
-        connectivity=connectivity,
     )
-    se_nw = _corner_quadrant_reach_ratio(
-        passable_mask,
+    se_nw = _edge_pair_reach_ratio_labels(
+        labels,
         source_sides=("down", "right"),
         target_sides=("up", "left"),
-        connectivity=connectivity,
     )
-    ne_sw = _corner_quadrant_reach_ratio(
-        passable_mask,
+    ne_sw = _edge_pair_reach_ratio_labels(
+        labels,
         source_sides=("up", "right"),
         target_sides=("down", "left"),
-        connectivity=connectivity,
     )
-    sw_ne = _corner_quadrant_reach_ratio(
-        passable_mask,
+    sw_ne = _edge_pair_reach_ratio_labels(
+        labels,
         source_sides=("down", "left"),
         target_sides=("up", "right"),
-        connectivity=connectivity,
     )
     return lr, ud, nw_se, se_nw, ne_sw, sw_ne
 
@@ -302,6 +244,14 @@ def _direction_flags_from_mask12(
     h, w = passable_mask.shape
     if h <= 0 or w <= 0:
         return (False,) * 12
+
+    labels = _component_labels(passable_mask, connectivity=connectivity)
+    side_ids = {
+        "up": _component_ids_from_cells(labels, cells=_side_cells(h, w, "up")),
+        "right": _component_ids_from_cells(labels, cells=_side_cells(h, w, "right")),
+        "down": _component_ids_from_cells(labels, cells=_side_cells(h, w, "down")),
+        "left": _component_ids_from_cells(labels, cells=_side_cells(h, w, "left")),
+    }
 
     sides = ("up", "right", "down", "left")
     pairs = (
@@ -321,14 +271,7 @@ def _direction_flags_from_mask12(
     _ = sides  # keep side order explicit for readability
     vals = []
     for side_a, side_b in pairs:
-        vals.append(
-            _edge_pair_connected(
-                passable_mask,
-                side_a=side_a,
-                side_b=side_b,
-                connectivity=connectivity,
-            )
-        )
+        vals.append(_components_connected(side_ids[side_a], side_ids[side_b]))
     return tuple(vals)
 
 
