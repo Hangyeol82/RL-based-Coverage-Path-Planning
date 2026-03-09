@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -52,6 +53,9 @@ class CPPDiscreteEnvConfig:
     use_boundary_exit_features: bool = False
     boundary_exit_threshold: float = 0.0
     boundary_exit_include_valid: bool = True
+    profile_observation: bool = False
+    profile_interval_steps: int = 200
+    profile_name: str = ""
 
     observation: MultiScaleCPPObservationConfig = field(
         default_factory=MultiScaleCPPObservationConfig,
@@ -98,6 +102,7 @@ class CPPDiscreteEnv:
         self.maps_builder = MultiScaleCPPObservationBuilder(
             self.config.observation,
             include_dtm=self.config.include_dtm,
+            profile_enabled=bool(self.config.profile_observation),
         )
         self._boundary_maps_builder: Optional[MultiScaleCPPObservationBuilder] = None
         if bool(self.config.use_boundary_exit_features) and (not bool(self.config.include_dtm)):
@@ -106,8 +111,14 @@ class CPPDiscreteEnv:
             self._boundary_maps_builder = MultiScaleCPPObservationBuilder(
                 self.config.observation,
                 include_dtm=True,
+                profile_enabled=bool(self.config.profile_observation),
             )
         self.robot_state_builder = RobotStateObservationBuilder(self.config.robot_state)
+        self._profile_observation = bool(self.config.profile_observation)
+        self._profile_interval_steps = max(1, int(self.config.profile_interval_steps))
+        self._profile_name = str(self.config.profile_name).strip()
+        self._obs_profile_totals: Dict[str, float] = {}
+        self._obs_profile_calls = 0
 
         self._default_start = self._resolve_start(start_pos)
         self.known_map = np.full_like(self.true_map, fill_value=-1, dtype=np.int32)
@@ -266,13 +277,19 @@ class CPPDiscreteEnv:
         )
 
     def _build_observation(self) -> Dict[str, object]:
+        t_total = perf_counter() if self._profile_observation else 0.0
+        t0 = perf_counter() if self._profile_observation else 0.0
         levels = self.maps_builder.build_levels(
             self.known_map,
             robot_pos=self.current_pos,
             explored=self.explored,
         )
+        if self._profile_observation:
+            self._profile_add("env_build_levels", perf_counter() - t0)
+            self._merge_builder_profile(self.maps_builder.profile_snapshot(reset=True), prefix="maps")
         boundary_exit_features: Optional[np.ndarray] = None
         if self.config.use_boundary_exit_features:
+            t0 = perf_counter() if self._profile_observation else 0.0
             if self.config.include_dtm:
                 boundary_levels = levels
             else:
@@ -283,7 +300,15 @@ class CPPDiscreteEnv:
                     robot_pos=self.current_pos,
                     explored=self.explored,
                 )
+                if self._profile_observation:
+                    self._merge_builder_profile(
+                        self._boundary_maps_builder.profile_snapshot(reset=True),
+                        prefix="boundary_maps",
+                    )
             boundary_exit_features = self._build_boundary_exit_features(boundary_levels)
+            if self._profile_observation:
+                self._profile_add("boundary_exit_features", perf_counter() - t0)
+        t0 = perf_counter() if self._profile_observation else 0.0
         robot_state = self.robot_state_builder.build(
             occupancy=self.known_map,
             explored=self.explored,
@@ -292,10 +317,64 @@ class CPPDiscreteEnv:
             recent_new_coverage=list(self.recent_new_coverage),
             extra_features=boundary_exit_features,
         )
+        if self._profile_observation:
+            self._profile_add("robot_state", perf_counter() - t0)
+            self._profile_add("observation_total", perf_counter() - t_total)
+            self._obs_profile_calls += 1
+            self._maybe_report_observation_profile()
         return {
             "levels": levels,
             "robot_state": robot_state.astype(np.float32),
         }
+
+    def _profile_add(self, key: str, dt: float):
+        if not self._profile_observation:
+            return
+        self._obs_profile_totals[key] = float(self._obs_profile_totals.get(key, 0.0)) + float(dt)
+
+    def _merge_builder_profile(self, snapshot: Dict[str, float], *, prefix: str):
+        if not self._profile_observation:
+            return
+        for key, value in snapshot.items():
+            if key == "calls":
+                self._profile_add(f"{prefix}_calls", float(value))
+            else:
+                self._profile_add(f"{prefix}_{key}", float(value))
+
+    def _maybe_report_observation_profile(self):
+        if not self._profile_observation:
+            return
+        if self._obs_profile_calls % self._profile_interval_steps != 0:
+            return
+        denom = float(max(1, self._profile_interval_steps))
+        prefix = self._profile_name or "obs"
+        keys = [
+            "observation_total",
+            "env_build_levels",
+            "maps_build_levels_total",
+            "maps_prep_masks_frontier",
+            "maps_dtm_fine",
+            "maps_local_reduce",
+            "maps_local_dtm",
+            "maps_local_pack",
+            "maps_global_reduce",
+            "maps_global_dtm",
+            "maps_global_pack",
+            "boundary_exit_features",
+            "robot_state",
+        ]
+        parts = []
+        for key in keys:
+            val = self._obs_profile_totals.get(key, None)
+            if val is None:
+                continue
+            parts.append(f"{key}={1000.0 * float(val) / denom:.2f}ms")
+        print(
+            f"[OBS-PROFILE] {prefix} calls={self._obs_profile_calls} "
+            + " ".join(parts),
+            flush=True,
+        )
+        self._obs_profile_totals = {}
 
     def _dtm_channel_count(self) -> int:
         mode = str(self.config.observation.dtm_output_mode).strip().lower()
@@ -476,6 +555,9 @@ class CPPDiscreteEnv:
 
         self.known_map.fill(-1)
         self.explored.fill(False)
+        self.maps_builder.reset_incremental_state()
+        if self._boundary_maps_builder is not None:
+            self._boundary_maps_builder.reset_incremental_state()
         self._sense_at(self.current_pos)
         self._mark_explored(self.current_pos)
 

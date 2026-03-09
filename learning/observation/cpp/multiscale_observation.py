@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -142,13 +143,22 @@ class MultiScaleCPPObservationBuilder:
         config: Optional[MultiScaleCPPObservationConfig] = None,
         *,
         include_dtm: bool = False,
+        profile_enabled: bool = False,
     ):
         self.config = config or MultiScaleCPPObservationConfig()
         self.include_dtm = bool(include_dtm)
+        self._profile_enabled = bool(profile_enabled)
+        self._profile_totals: Dict[str, float] = {}
+        self._profile_calls = 0
+        self._coarse_cache: Dict[int, Dict[str, np.ndarray]] = {}
         # Incremental DTM cache:
         # - track last occupancy snapshot
         # - update only cells impacted by newly observed occupancy changes
         self._prev_occupancy: Optional[np.ndarray] = None
+        self._prev_explored: Optional[np.ndarray] = None
+        self._prev_covered: Optional[np.ndarray] = None
+        self._prev_known_obstacle: Optional[np.ndarray] = None
+        self._prev_frontier: Optional[np.ndarray] = None
         self._dtm_cache: Dict[int, np.ndarray] = {}
         if not (0.0 < float(self.config.dtm_min_known_ratio) <= 1.0):
             raise ValueError("dtm_min_known_ratio must be in (0, 1]")
@@ -170,6 +180,36 @@ class MultiScaleCPPObservationBuilder:
                 "dtm_output_mode='extent6' is not supported with "
                 "dtm_coarse_mode='aggregate_transfer'. Use dtm_coarse_mode='bfs'."
             )
+
+    def enable_profiling(self, enabled: bool = True):
+        self._profile_enabled = bool(enabled)
+        if not enabled:
+            self.reset_profile()
+
+    def reset_profile(self):
+        self._profile_totals = {}
+        self._profile_calls = 0
+
+    def reset_incremental_state(self):
+        self._coarse_cache = {}
+        self._prev_occupancy = None
+        self._prev_explored = None
+        self._prev_covered = None
+        self._prev_known_obstacle = None
+        self._prev_frontier = None
+        self._dtm_cache.clear()
+
+    def profile_snapshot(self, *, reset: bool = False) -> Dict[str, float]:
+        snap: Dict[str, float] = {"calls": float(self._profile_calls)}
+        snap.update(self._profile_totals)
+        if reset:
+            self.reset_profile()
+        return snap
+
+    def _profile_add(self, key: str, dt: float):
+        if not self._profile_enabled:
+            return
+        self._profile_totals[key] = float(self._profile_totals.get(key, 0.0)) + float(dt)
 
     def _native_dtm_mode(self) -> str:
         # Keep legacy outputs backed by six-channel DTM.
@@ -216,12 +256,174 @@ class MultiScaleCPPObservationBuilder:
     def _compute_changed_mask(self, occupancy: np.ndarray) -> np.ndarray:
         # First frame (or map shape change): force full DTM refresh.
         if self._prev_occupancy is None or self._prev_occupancy.shape != occupancy.shape:
-            self._dtm_cache.clear()
+            self.reset_incremental_state()
             changed = np.ones_like(occupancy, dtype=bool)
         else:
             changed = occupancy != self._prev_occupancy
         self._prev_occupancy = occupancy.copy()
         return changed
+
+    @staticmethod
+    def _compute_array_change(
+        current: np.ndarray,
+        previous: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        curr = np.asarray(current)
+        if previous is None or previous.shape != curr.shape:
+            return np.ones_like(curr, dtype=bool), curr.copy()
+        return curr != previous, curr.copy()
+
+    @staticmethod
+    def _dirty_blocks_from_changed(changed_mask: np.ndarray, block: int) -> np.ndarray:
+        h, w = changed_mask.shape
+        ch = (h + block - 1) // block
+        cw = (w + block - 1) // block
+        dirty = np.zeros((ch, cw), dtype=bool)
+        coords = np.argwhere(changed_mask)
+        if coords.size == 0:
+            return dirty
+        dirty[coords[:, 0] // block, coords[:, 1] // block] = True
+        return dirty
+
+    @staticmethod
+    def _dirty_global_from_changed(changed_mask: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+        h, w = changed_mask.shape
+        dirty = np.zeros((out_h, out_w), dtype=bool)
+        coords = np.argwhere(changed_mask)
+        if coords.size == 0 or h <= 0 or w <= 0:
+            return dirty
+        rr = np.minimum(out_h - 1, (coords[:, 0] * out_h) // h)
+        cc = np.minimum(out_w - 1, (coords[:, 1] * out_w) // w)
+        dirty[rr, cc] = True
+        return dirty
+
+    @staticmethod
+    def _global_edges(size: int, out_size: int) -> np.ndarray:
+        edges = np.linspace(0, size, out_size + 1, dtype=np.int32)
+        edges[-1] = size
+        return edges
+
+    def _update_block_mean_inplace(
+        self,
+        cache: np.ndarray,
+        source: np.ndarray,
+        *,
+        block: int,
+        dirty_mask: np.ndarray,
+    ):
+        h, w = source.shape
+        for r, c in np.argwhere(dirty_mask):
+            rs = int(r) * block
+            re = min(h, rs + block)
+            cs = int(c) * block
+            ce = min(w, cs + block)
+            cache[int(r), int(c)] = float(np.mean(source[rs:re, cs:ce]))
+
+    def _update_block_max_inplace(
+        self,
+        cache: np.ndarray,
+        source: np.ndarray,
+        *,
+        block: int,
+        dirty_mask: np.ndarray,
+    ):
+        h, w = source.shape
+        for r, c in np.argwhere(dirty_mask):
+            rs = int(r) * block
+            re = min(h, rs + block)
+            cs = int(c) * block
+            ce = min(w, cs + block)
+            cache[int(r), int(c)] = float(np.max(source[rs:re, cs:ce]))
+
+    def _update_block_state_inplace(
+        self,
+        cache: np.ndarray,
+        *,
+        known_free: np.ndarray,
+        known_obstacle: np.ndarray,
+        unknown: np.ndarray,
+        block: int,
+        dirty_mask: np.ndarray,
+    ):
+        h, w = known_free.shape
+        thr = float(self.config.dtm_min_known_ratio)
+        for r, c in np.argwhere(dirty_mask):
+            rs = int(r) * block
+            re = min(h, rs + block)
+            cs = int(c) * block
+            ce = min(w, cs + block)
+            free_count = int(np.count_nonzero(known_free[rs:re, cs:ce]))
+            obst_count = int(np.count_nonzero(known_obstacle[rs:re, cs:ce]))
+            unknown_count = int(np.count_nonzero(unknown[rs:re, cs:ce]))
+            cell_count = (re - rs) * (ce - cs)
+            known_ratio = 1.0 - (float(unknown_count) / float(max(1, cell_count)))
+            if known_ratio < thr:
+                cache[int(r), int(c)] = UNKNOWN_STATE
+            elif free_count > 0 and obst_count == 0:
+                cache[int(r), int(c)] = FREE_STATE
+            else:
+                cache[int(r), int(c)] = BLOCKED_STATE
+
+    def _update_global_mean_inplace(
+        self,
+        cache: np.ndarray,
+        source: np.ndarray,
+        *,
+        dirty_mask: np.ndarray,
+    ):
+        h, w = source.shape
+        out_h, out_w = cache.shape
+        row_edges = self._global_edges(h, out_h)
+        col_edges = self._global_edges(w, out_w)
+        for r, c in np.argwhere(dirty_mask):
+            rs, re = int(row_edges[int(r)]), int(row_edges[int(r) + 1])
+            cs, ce = int(col_edges[int(c)]), int(col_edges[int(c) + 1])
+            cache[int(r), int(c)] = float(np.mean(source[rs:re, cs:ce]))
+
+    def _update_global_max_inplace(
+        self,
+        cache: np.ndarray,
+        source: np.ndarray,
+        *,
+        dirty_mask: np.ndarray,
+    ):
+        h, w = source.shape
+        out_h, out_w = cache.shape
+        row_edges = self._global_edges(h, out_h)
+        col_edges = self._global_edges(w, out_w)
+        for r, c in np.argwhere(dirty_mask):
+            rs, re = int(row_edges[int(r)]), int(row_edges[int(r) + 1])
+            cs, ce = int(col_edges[int(c)]), int(col_edges[int(c) + 1])
+            cache[int(r), int(c)] = float(np.max(source[rs:re, cs:ce]))
+
+    def _update_global_state_inplace(
+        self,
+        cache: np.ndarray,
+        *,
+        known_free: np.ndarray,
+        known_obstacle: np.ndarray,
+        unknown: np.ndarray,
+        dirty_mask: np.ndarray,
+    ):
+        h, w = known_free.shape
+        out_h, out_w = cache.shape
+        row_edges = self._global_edges(h, out_h)
+        col_edges = self._global_edges(w, out_w)
+        thr = float(self.config.dtm_min_known_ratio)
+        for r, c in np.argwhere(dirty_mask):
+            rs, re = int(row_edges[int(r)]), int(row_edges[int(r) + 1])
+            cs, ce = int(col_edges[int(c)]), int(col_edges[int(c) + 1])
+            free_count = int(np.count_nonzero(known_free[rs:re, cs:ce]))
+            obst_count = int(np.count_nonzero(known_obstacle[rs:re, cs:ce]))
+            unknown_count = int(np.count_nonzero(unknown[rs:re, cs:ce]))
+            cell_count = (re - rs) * (ce - cs)
+            known_ratio = 1.0 - (float(unknown_count) / float(max(1, cell_count)))
+            if known_ratio < thr:
+                cache[int(r), int(c)] = UNKNOWN_STATE
+            elif free_count > 0 and obst_count == 0:
+                cache[int(r), int(c)] = FREE_STATE
+            else:
+                cache[int(r), int(c)] = BLOCKED_STATE
 
     def _effective_patch_radius(self, limit: int) -> int:
         p = int(self.config.dtm_patch_size)
@@ -651,6 +853,188 @@ class MultiScaleCPPObservationBuilder:
 
         return np.stack(channels, axis=0).astype(np.float32)
 
+    def _get_local_level_maps(
+        self,
+        *,
+        level_id: int,
+        block: int,
+        covered_f: np.ndarray,
+        obstacle_f: np.ndarray,
+        frontier_f: np.ndarray,
+        known_f: np.ndarray,
+        known_free: np.ndarray,
+        known_obstacle: np.ndarray,
+        unknown: np.ndarray,
+        covered_changed: np.ndarray,
+        obstacle_changed: np.ndarray,
+        frontier_changed: np.ndarray,
+        occupancy_changed: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        h, w = covered_f.shape
+        ch = (h + block - 1) // block
+        cw = (w + block - 1) // block
+        cache = self._coarse_cache.get(level_id, None)
+        full_refresh = cache is None
+        if (not full_refresh) and (
+            cache["coverage"].shape != (ch, cw)
+            or cache["obstacle"].shape != (ch, cw)
+            or cache["frontier"].shape != (ch, cw)
+        ):
+            full_refresh = True
+
+        if full_refresh:
+            cov = block_reduce_mean(covered_f, block)
+            known_ratio = block_reduce_mean(known_f, block)
+            obs = block_reduce_mean(obstacle_f, block)
+            frn = block_reduce_max(frontier_f, block)
+            state = None
+            if self.include_dtm:
+                state = block_reduce_state(
+                    known_free,
+                    known_obstacle,
+                    unknown,
+                    block,
+                    min_known_ratio=self.config.dtm_min_known_ratio,
+                )
+            self._coarse_cache[level_id] = {
+                "coverage": cov,
+                "known_ratio": known_ratio,
+                "obstacle": obs,
+                "frontier": frn,
+                "state": state,
+            }
+            return cov, known_ratio, obs, frn, state
+
+        cov = cache["coverage"]
+        known_ratio = cache["known_ratio"]
+        obs = cache["obstacle"]
+        frn = cache["frontier"]
+        state = cache.get("state", None)
+
+        dirty_cov = self._dirty_blocks_from_changed(covered_changed, block)
+        dirty_obs = self._dirty_blocks_from_changed(obstacle_changed, block)
+        dirty_frn = self._dirty_blocks_from_changed(frontier_changed, block)
+        dirty_occ = self._dirty_blocks_from_changed(occupancy_changed, block)
+
+        if np.any(dirty_cov):
+            self._update_block_mean_inplace(cov, covered_f, block=block, dirty_mask=dirty_cov)
+        if np.any(dirty_obs):
+            self._update_block_mean_inplace(obs, obstacle_f, block=block, dirty_mask=dirty_obs)
+        if np.any(dirty_frn):
+            self._update_block_max_inplace(frn, frontier_f, block=block, dirty_mask=dirty_frn)
+        if np.any(dirty_occ):
+            self._update_block_mean_inplace(known_ratio, known_f, block=block, dirty_mask=dirty_occ)
+            if self.include_dtm:
+                if state is None or state.shape != (ch, cw):
+                    state = block_reduce_state(
+                        known_free,
+                        known_obstacle,
+                        unknown,
+                        block,
+                        min_known_ratio=self.config.dtm_min_known_ratio,
+                    )
+                else:
+                    self._update_block_state_inplace(
+                        state,
+                        known_free=known_free,
+                        known_obstacle=known_obstacle,
+                        unknown=unknown,
+                        block=block,
+                        dirty_mask=dirty_occ,
+                    )
+                cache["state"] = state
+        return cov, known_ratio, obs, frn, state
+
+    def _get_global_level_maps(
+        self,
+        *,
+        level_id: int,
+        out_size: int,
+        covered_f: np.ndarray,
+        obstacle_f: np.ndarray,
+        frontier_f: np.ndarray,
+        known_f: np.ndarray,
+        known_free: np.ndarray,
+        known_obstacle: np.ndarray,
+        unknown: np.ndarray,
+        covered_changed: np.ndarray,
+        obstacle_changed: np.ndarray,
+        frontier_changed: np.ndarray,
+        occupancy_changed: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        cache = self._coarse_cache.get(level_id, None)
+        full_refresh = cache is None
+        shape = (out_size, out_size)
+        if (not full_refresh) and (
+            cache["coverage"].shape != shape
+            or cache["obstacle"].shape != shape
+            or cache["frontier"].shape != shape
+        ):
+            full_refresh = True
+
+        if full_refresh:
+            cov = global_reduce_mean(covered_f, out_size, out_size)
+            known_ratio = global_reduce_mean(known_f, out_size, out_size)
+            obs = global_reduce_mean(obstacle_f, out_size, out_size)
+            frn = global_reduce_max(frontier_f, out_size, out_size)
+            state = None
+            if self.include_dtm:
+                state = global_reduce_state(
+                    known_free,
+                    known_obstacle,
+                    unknown,
+                    out_size,
+                    out_size,
+                    min_known_ratio=self.config.dtm_min_known_ratio,
+                )
+            self._coarse_cache[level_id] = {
+                "coverage": cov,
+                "known_ratio": known_ratio,
+                "obstacle": obs,
+                "frontier": frn,
+                "state": state,
+            }
+            return cov, known_ratio, obs, frn, state
+
+        cov = cache["coverage"]
+        known_ratio = cache["known_ratio"]
+        obs = cache["obstacle"]
+        frn = cache["frontier"]
+        state = cache.get("state", None)
+        dirty_cov = self._dirty_global_from_changed(covered_changed, out_size, out_size)
+        dirty_obs = self._dirty_global_from_changed(obstacle_changed, out_size, out_size)
+        dirty_frn = self._dirty_global_from_changed(frontier_changed, out_size, out_size)
+        dirty_occ = self._dirty_global_from_changed(occupancy_changed, out_size, out_size)
+
+        if np.any(dirty_cov):
+            self._update_global_mean_inplace(cov, covered_f, dirty_mask=dirty_cov)
+        if np.any(dirty_obs):
+            self._update_global_mean_inplace(obs, obstacle_f, dirty_mask=dirty_obs)
+        if np.any(dirty_frn):
+            self._update_global_max_inplace(frn, frontier_f, dirty_mask=dirty_frn)
+        if np.any(dirty_occ):
+            self._update_global_mean_inplace(known_ratio, known_f, dirty_mask=dirty_occ)
+            if self.include_dtm:
+                if state is None or state.shape != shape:
+                    state = global_reduce_state(
+                        known_free,
+                        known_obstacle,
+                        unknown,
+                        out_size,
+                        out_size,
+                        min_known_ratio=self.config.dtm_min_known_ratio,
+                    )
+                else:
+                    self._update_global_state_inplace(
+                        state,
+                        known_free=known_free,
+                        known_obstacle=known_obstacle,
+                        unknown=unknown,
+                        dirty_mask=dirty_occ,
+                    )
+                cache["state"] = state
+        return cov, known_ratio, obs, frn, state
+
     @staticmethod
     def _phase_sincos(coord: int, coarse_size: float) -> Tuple[float, float]:
         # Cyclic encoding removes discontinuity at coarse-cell boundaries.
@@ -678,6 +1062,7 @@ class MultiScaleCPPObservationBuilder:
         robot_pos: GridPos,
         explored: np.ndarray,
     ) -> Dict[int, np.ndarray]:
+        t_total = perf_counter() if self._profile_enabled else 0.0
         if occupancy.ndim != 2:
             raise ValueError("occupancy must be 2D")
         if explored.shape != occupancy.shape:
@@ -698,6 +1083,7 @@ class MultiScaleCPPObservationBuilder:
             else:
                 occupancy_obs[unknown_mask] = self.config.obstacle_value
 
+        t0 = perf_counter() if self._profile_enabled else 0.0
         known_free, known_obstacle, unknown = extract_known_masks(
             occupancy_obs,
             unknown_value=self.config.unknown_value,
@@ -706,15 +1092,25 @@ class MultiScaleCPPObservationBuilder:
         known_f = (~unknown).astype(np.float32)
         covered = explored.astype(bool) & known_free
         frontier = compute_frontier_map(known_free, unknown)
+        if self._profile_enabled:
+            self._profile_add("prep_masks_frontier", perf_counter() - t0)
+
+        occupancy_changed = self._compute_changed_mask(occupancy_obs)
+        covered_changed, self._prev_covered = self._compute_array_change(covered, self._prev_covered)
+        obstacle_changed, self._prev_known_obstacle = self._compute_array_change(
+            known_obstacle, self._prev_known_obstacle
+        )
+        frontier_changed, self._prev_frontier = self._compute_array_change(frontier, self._prev_frontier)
+        _, self._prev_explored = self._compute_array_change(explored, self._prev_explored)
 
         covered_f = covered.astype(np.float32)
         obstacle_f = known_obstacle.astype(np.float32)
         frontier_f = frontier.astype(np.float32)
-        changed_f = self._compute_changed_mask(occupancy_obs) if self.include_dtm else None
-        changed_f_float = changed_f.astype(np.float32) if changed_f is not None else None
+        changed_f = occupancy_changed if self.include_dtm else None
         dtm_fine = None
         state_fine = None
         if self.include_dtm and self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
+            t0 = perf_counter() if self._profile_enabled else 0.0
             state_fine = np.full(occupancy.shape, BLOCKED_STATE, dtype=np.int8)
             state_fine[unknown] = UNKNOWN_STATE
             state_fine[known_free] = FREE_STATE
@@ -724,26 +1120,35 @@ class MultiScaleCPPObservationBuilder:
                 known_ratio_map=known_f,
                 changed_mask=changed_f,
             )
+            if self._profile_enabled:
+                self._profile_add("dtm_fine", perf_counter() - t0)
 
         levels: Dict[int, np.ndarray] = {}
 
         # Local robot-centered levels.
         for lv, block in enumerate(self.config.local_blocks):
-            cov_coarse = block_reduce_mean(covered_f, block)
-            known_ratio_coarse = block_reduce_mean(known_f, block)
-            obs_coarse = block_reduce_mean(obstacle_f, block)
-            frn_coarse = block_reduce_max(frontier_f, block)
-            state_coarse = None
+            t0 = perf_counter() if self._profile_enabled else 0.0
+            cov_coarse, known_ratio_coarse, obs_coarse, frn_coarse, state_coarse = self._get_local_level_maps(
+                level_id=lv,
+                block=block,
+                covered_f=covered_f,
+                obstacle_f=obstacle_f,
+                frontier_f=frontier_f,
+                known_f=known_f,
+                known_free=known_free,
+                known_obstacle=known_obstacle,
+                unknown=unknown,
+                covered_changed=covered_changed,
+                obstacle_changed=obstacle_changed,
+                frontier_changed=frontier_changed,
+                occupancy_changed=occupancy_changed,
+            )
+            if self._profile_enabled:
+                self._profile_add("local_reduce", perf_counter() - t0)
             dtm_coarse = None
             if self.include_dtm:
+                t1 = perf_counter() if self._profile_enabled else 0.0
                 if self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
-                    state_coarse = block_reduce_state(
-                        known_free,
-                        known_obstacle,
-                        unknown,
-                        block,
-                        min_known_ratio=self.config.dtm_min_known_ratio,
-                    )
                     if block == 1:
                         dtm_coarse = dtm_fine
                     elif self.config.dtm_coarse_mode == "aggregate_transfer":
@@ -756,20 +1161,15 @@ class MultiScaleCPPObservationBuilder:
                     else:
                         dtm_coarse = self._aggregate_dtm_block(dtm_fine, block)
                 else:
-                    state_coarse = block_reduce_state(
-                        known_free,
-                        known_obstacle,
-                        unknown,
-                        block,
-                        min_known_ratio=self.config.dtm_min_known_ratio,
-                    )
-                    changed_coarse = block_reduce_max(changed_f_float, block) > 0.0
+                    changed_coarse = self._dirty_blocks_from_changed(occupancy_changed, block)
                     dtm_coarse = self._update_dtm_level(
                         level_id=lv,
                         state_map=state_coarse,
                         known_ratio_map=known_ratio_coarse,
                         changed_mask=changed_coarse,
                     )
+                if self._profile_enabled:
+                    self._profile_add("local_dtm", perf_counter() - t1)
 
             center_coarse = (rr // block, cc // block)
             cell_phase_local = self._compute_cell_phase(
@@ -777,6 +1177,7 @@ class MultiScaleCPPObservationBuilder:
                 coarse_h=float(block),
                 coarse_w=float(block),
             )
+            t2 = perf_counter() if self._profile_enabled else 0.0
             levels[lv] = self._build_level_channels(
                 cov_coarse,
                 obs_coarse,
@@ -788,34 +1189,45 @@ class MultiScaleCPPObservationBuilder:
                 out_size=self.config.local_window_size,
                 cell_phase=cell_phase_local,
             )
+            if self._profile_enabled:
+                self._profile_add("local_pack", perf_counter() - t2)
 
         # Global non-centered level.
         gsize = self.config.global_window_size
-        cov_global = global_reduce_mean(covered_f, gsize, gsize)
-        known_ratio_global = global_reduce_mean(known_f, gsize, gsize)
-        obs_global = global_reduce_mean(obstacle_f, gsize, gsize)
-        frn_global = global_reduce_max(frontier_f, gsize, gsize)
-        state_global = None
+        t0 = perf_counter() if self._profile_enabled else 0.0
+        level_id = len(self.config.local_blocks)
+        cov_global, known_ratio_global, obs_global, frn_global, state_global = self._get_global_level_maps(
+            level_id=level_id,
+            out_size=gsize,
+            covered_f=covered_f,
+            obstacle_f=obstacle_f,
+            frontier_f=frontier_f,
+            known_f=known_f,
+            known_free=known_free,
+            known_obstacle=known_obstacle,
+            unknown=unknown,
+            covered_changed=covered_changed,
+            obstacle_changed=obstacle_changed,
+            frontier_changed=frontier_changed,
+            occupancy_changed=occupancy_changed,
+        )
+        if self._profile_enabled:
+            self._profile_add("global_reduce", perf_counter() - t0)
         dtm_global = None
         if self.include_dtm:
+            t1 = perf_counter() if self._profile_enabled else 0.0
             if self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
                 dtm_global = self._aggregate_dtm_global(dtm_fine, gsize, gsize)
             else:
-                state_global = global_reduce_state(
-                    known_free,
-                    known_obstacle,
-                    unknown,
-                    gsize,
-                    gsize,
-                    min_known_ratio=self.config.dtm_min_known_ratio,
-                )
-                changed_global = global_reduce_max(changed_f_float, gsize, gsize) > 0.0
+                changed_global = self._dirty_global_from_changed(occupancy_changed, gsize, gsize)
                 dtm_global = self._update_dtm_level(
-                    level_id=len(self.config.local_blocks),
+                    level_id=level_id,
                     state_map=state_global,
                     known_ratio_map=known_ratio_global,
                     changed_mask=changed_global,
                 )
+            if self._profile_enabled:
+                self._profile_add("global_dtm", perf_counter() - t1)
 
         # Global coarse cell size can be non-integer when map size is not divisible by gsize.
         global_cell_h = float(max(1, h)) / float(max(1, gsize))
@@ -826,6 +1238,7 @@ class MultiScaleCPPObservationBuilder:
             coarse_w=global_cell_w,
         )
 
+        t2 = perf_counter() if self._profile_enabled else 0.0
         levels[len(self.config.local_blocks)] = self._build_level_channels(
             cov_global,
             obs_global,
@@ -837,4 +1250,8 @@ class MultiScaleCPPObservationBuilder:
             out_size=gsize,
             cell_phase=cell_phase_global,
         )
+        if self._profile_enabled:
+            self._profile_add("global_pack", perf_counter() - t2)
+            self._profile_add("build_levels_total", perf_counter() - t_total)
+            self._profile_calls += 1
         return levels

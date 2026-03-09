@@ -88,6 +88,47 @@ def _iterate_blocks(h: int, w: int, block: int):
             yield r, c, rs, re, cs, ce, ch, cw
 
 
+def _block_shape(size: int, block: int) -> int:
+    return (size + block - 1) // block
+
+
+def _block_cell_counts(h: int, w: int, block: int) -> np.ndarray:
+    ch = _block_shape(h, block)
+    cw = _block_shape(w, block)
+    row_sizes = np.full(ch, block, dtype=np.int32)
+    col_sizes = np.full(cw, block, dtype=np.int32)
+    if ch > 0 and (h % block) != 0:
+        row_sizes[-1] = h - (ch - 1) * block
+    if cw > 0 and (w % block) != 0:
+        col_sizes[-1] = w - (cw - 1) * block
+    return row_sizes[:, None] * col_sizes[None, :]
+
+
+def _reshape_blocks(
+    arr: np.ndarray,
+    block: int,
+    *,
+    pad_value,
+    dtype,
+) -> np.ndarray:
+    h, w = arr.shape
+    ch = _block_shape(h, block)
+    cw = _block_shape(w, block)
+    work = np.asarray(arr, dtype=dtype)
+    pad_h = ch * block - h
+    pad_w = cw * block - w
+    if pad_h > 0 or pad_w > 0:
+        padded = np.pad(
+            work,
+            ((0, pad_h), (0, pad_w)),
+            mode="constant",
+            constant_values=pad_value,
+        )
+    else:
+        padded = work
+    return padded.reshape(ch, block, cw, block).transpose(0, 2, 1, 3)
+
+
 def block_reduce_mean(arr: np.ndarray, block: int) -> np.ndarray:
     if arr.ndim != 2:
         raise ValueError("arr must be 2D")
@@ -95,13 +136,10 @@ def block_reduce_mean(arr: np.ndarray, block: int) -> np.ndarray:
         raise ValueError("block must be positive")
 
     h, w = arr.shape
-    ch = (h + block - 1) // block
-    cw = (w + block - 1) // block
-    out = np.zeros((ch, cw), dtype=np.float32)
-
-    for r, c, rs, re, cs, ce, _, _ in _iterate_blocks(h, w, block):
-        out[r, c] = float(np.mean(arr[rs:re, cs:ce]))
-    return out
+    blocks = _reshape_blocks(arr, block, pad_value=0.0, dtype=np.float32)
+    sums = blocks.sum(axis=(2, 3), dtype=np.float32)
+    counts = _block_cell_counts(h, w, block).astype(np.float32)
+    return sums / counts
 
 
 def block_reduce_max(arr: np.ndarray, block: int) -> np.ndarray:
@@ -110,14 +148,13 @@ def block_reduce_max(arr: np.ndarray, block: int) -> np.ndarray:
     if block <= 0:
         raise ValueError("block must be positive")
 
-    h, w = arr.shape
-    ch = (h + block - 1) // block
-    cw = (w + block - 1) // block
-    out = np.zeros((ch, cw), dtype=np.float32)
-
-    for r, c, rs, re, cs, ce, _, _ in _iterate_blocks(h, w, block):
-        out[r, c] = float(np.max(arr[rs:re, cs:ce]))
-    return out
+    blocks = _reshape_blocks(
+        arr,
+        block,
+        pad_value=np.finfo(np.float32).min,
+        dtype=np.float32,
+    )
+    return blocks.max(axis=(2, 3))
 
 
 def block_reduce_state(
@@ -142,23 +179,22 @@ def block_reduce_state(
         raise ValueError("min_known_ratio must be in (0, 1]")
 
     h, w = known_free.shape
-    ch = (h + block - 1) // block
-    cw = (w + block - 1) // block
+    ch = _block_shape(h, block)
+    cw = _block_shape(w, block)
     out = np.full((ch, cw), BLOCKED_STATE, dtype=np.int8)
 
-    for r, c, rs, re, cs, ce, _, _ in _iterate_blocks(h, w, block):
-        free_count = int(np.count_nonzero(known_free[rs:re, cs:ce]))
-        obst_count = int(np.count_nonzero(known_obstacle[rs:re, cs:ce]))
-        unknown_count = int(np.count_nonzero(unknown[rs:re, cs:ce]))
-        cell_count = (re - rs) * (ce - cs)
-        known_ratio = 1.0 - (float(unknown_count) / float(max(1, cell_count)))
+    free_counts = _reshape_blocks(known_free, block, pad_value=0, dtype=np.int32).sum(axis=(2, 3), dtype=np.int32)
+    obst_counts = _reshape_blocks(known_obstacle, block, pad_value=0, dtype=np.int32).sum(
+        axis=(2, 3), dtype=np.int32
+    )
+    unknown_counts = _reshape_blocks(unknown, block, pad_value=0, dtype=np.int32).sum(axis=(2, 3), dtype=np.int32)
+    cell_counts = _block_cell_counts(h, w, block)
+    known_ratio = 1.0 - (unknown_counts.astype(np.float32) / cell_counts.astype(np.float32))
 
-        if known_ratio < min_known_ratio:
-            out[r, c] = UNKNOWN_STATE
-        elif free_count > 0 and obst_count == 0:
-            out[r, c] = FREE_STATE
-        else:
-            out[r, c] = BLOCKED_STATE
+    unknown_mask = known_ratio < float(min_known_ratio)
+    free_mask = (~unknown_mask) & (free_counts > 0) & (obst_counts == 0)
+    out[unknown_mask] = UNKNOWN_STATE
+    out[free_mask] = FREE_STATE
     return out
 
 
