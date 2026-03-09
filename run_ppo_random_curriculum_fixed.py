@@ -11,6 +11,12 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from MapGenerator import MapGenerator
+from map_generators.curriculum_profiles import (
+    available_curriculum_profiles,
+    default_stages_for_profile,
+    stage_difficulty_label,
+    stage_token,
+)
 
 
 def _parse_int_list(raw: str, *, name: str) -> List[int]:
@@ -52,6 +58,13 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="2,3,4",
         help="Comma list of random-map stages to use, e.g. 2,3,4.",
+    )
+    p.add_argument(
+        "--curriculum-profile",
+        type=str,
+        default="legacy4",
+        choices=available_curriculum_profiles(),
+        help="Random-map curriculum profile name.",
     )
     p.add_argument(
         "--phase-ratios",
@@ -379,8 +392,12 @@ def main() -> None:
         raise ValueError("--ent-coef-boost-chunks must be >= 0")
 
     phase_levels = _parse_int_list(args.phase_levels, name="phase-levels")
-    if any(level not in {1, 2, 3, 4} for level in phase_levels):
-        raise ValueError("phase-levels must contain only random-map stages 1..4")
+    allowed_levels = set(default_stages_for_profile(args.curriculum_profile))
+    if any(level not in allowed_levels for level in phase_levels):
+        raise ValueError(
+            f"phase-levels must be a subset of {sorted(allowed_levels)} "
+            f"for profile {args.curriculum_profile}"
+        )
     phase_ratios = _phase_weights(phase_levels, args.phase_ratios)
 
     repo_root = Path(__file__).resolve().parent
@@ -438,7 +455,7 @@ def main() -> None:
     )
     print(f"[INFO] out_dir={out_dir}", flush=True)
     print(
-        f"[INFO] phases={phase_levels} ratios={phase_ratios} "
+        f"[INFO] profile={args.curriculum_profile} phases={phase_levels} ratios={phase_ratios} "
         f"(equal={'yes' if not args.phase_ratios.strip() else 'no'})",
         flush=True,
     )
@@ -478,13 +495,20 @@ def main() -> None:
 
         map_seed = int(args.seed if args.map_seed_mode == "fixed" else (args.seed + i))
         run_seed = int(args.seed + i)
-        gen = MapGenerator(height=args.map_size, width=args.map_size, seed=map_seed)
+        gen = MapGenerator(
+            height=args.map_size,
+            width=args.map_size,
+            seed=map_seed,
+            curriculum_profile=args.curriculum_profile,
+        )
         grid, meta = gen.generate_map(stage=stage_level, return_metadata=True)
         grid = np.asarray(grid, dtype=np.int32)
         obs_cells = int(np.count_nonzero(grid == 1))
         obs_ratio = float(obs_cells) / float(grid.size)
+        stage_label = stage_difficulty_label(args.curriculum_profile, stage_level)
+        stage_name_token = stage_token(args.curriculum_profile, stage_level)
 
-        map_txt = maps_dir / f"chunk{i+1:03d}_S{stage_level}_seed{map_seed}.txt"
+        map_txt = maps_dir / f"chunk{i+1:03d}_S{stage_name_token}_seed{map_seed}.txt"
         _write_map_txt(map_txt, grid)
 
         save_model_base = models_dir / f"chunk{i+1:03d}"
@@ -510,7 +534,7 @@ def main() -> None:
 
         print(
             f"\n[CHUNK {i+1}/{num_chunks}] steps={chunk_t} "
-            f"stage={stage_level} map_seed={map_seed} "
+            f"stage={stage_level}({stage_label}) map_seed={map_seed} "
             f"obs_ratio={obs_ratio:.3f} obs_inst={len(meta)} ent_coef={ent_coef:.6f}",
             flush=True,
         )
@@ -549,7 +573,9 @@ def main() -> None:
             merged = dict(row)
             merged["chunk"] = int(i + 1)
             merged["chunk_level"] = int(stage_level)
-            merged["chunk_name"] = f"random_stage{stage_level}"
+            merged["chunk_name"] = f"{args.curriculum_profile}_stage{stage_name_token}"
+            merged["chunk_difficulty_label"] = str(stage_label)
+            merged["curriculum_profile"] = str(args.curriculum_profile)
             merged["map_seed"] = int(map_seed)
             merged["run_seed"] = int(run_seed)
             merged["chunk_timesteps_target"] = int(chunk_t)
@@ -567,7 +593,9 @@ def main() -> None:
             "timesteps_done": int(done_steps),
             "curriculum_stage_index": int(stage_idx),
             "curriculum_level": int(stage_level),
-            "curriculum_name": f"random_stage{stage_level}",
+            "curriculum_name": f"{args.curriculum_profile}_stage{stage_name_token}",
+            "curriculum_profile": str(args.curriculum_profile),
+            "curriculum_difficulty_label": str(stage_label),
             "map_seed": int(map_seed),
             "run_seed": int(run_seed),
             "map_file": str(map_txt),

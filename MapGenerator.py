@@ -3,35 +3,49 @@ import random
 import sys
 from collections import deque
 
+from map_generators.curriculum_profiles import get_curriculum_profile, stage_difficulty_label
+
+
 class MapGenerator:
-    def __init__(self, height, width, seed=None):
+    def __init__(self, height, width, seed=None, curriculum_profile="legacy4"):
         """
         :param height: 맵의 높이 (행 개수, Y)
         :param width: 맵의 너비 (열 개수, X)
         :param seed: 랜덤 시드 값
+        :param curriculum_profile: 난이도 프로파일 이름
         """
         self.height = height
         self.width = width
         self.seed = seed
+        self.curriculum_profile = str(curriculum_profile).strip().lower()
         self.rng = random.Random(seed)
         self.np_rng = np.random.RandomState(seed)
-        
+        profile = get_curriculum_profile(self.curriculum_profile)
+
         # 난이도별 설정
-        self.stage_config = {
-            1: {'types': ['rect'], 'overlap_prob': 0.3},
-            2: {'types': ['rect', 'u_shape'], 'overlap_prob': 0.3},
-            3: {'types': ['rect', 'u_shape', 'false_hole'], 'overlap_prob': 0.3},
-            4: {'types': ['rect', 'u_shape', 'false_hole'], 'overlap_prob': 0.5},
-        }
+        # - obs_per_1k_range: obstacles per 1000 cells when num_obstacles is None
+        # - size_ratio_range: obstacle side length ratio against map H/W
+        self.stage_config = profile["stages"]
+        self.default_stages = tuple(int(x) for x in profile["default_stages"])
+
+    def stage_label(self, stage):
+        return stage_difficulty_label(self.curriculum_profile, int(stage))
 
     def generate_map(self, stage=1, num_obstacles=None, return_metadata=False):
         """
         맵을 생성하여 반환합니다.
-        :param stage: 난이도 (1~4)
+        :param stage: 난이도 ID (profile-defined)
         :param num_obstacles: 장애물 개수 (None이면 면적 기반 자동 설정)
         :param return_metadata: True일 경우 (grid, metadata) 튜플 반환
         :return: grid (2D numpy array) or (grid, metadata)
         """
+        if int(stage) not in self.stage_config:
+            fallback = self.default_stages[0]
+            print(
+                f"Warning: stage {stage} is not defined in profile {self.curriculum_profile}. "
+                f"Using stage {fallback} instead."
+            )
+            stage = fallback
         max_global_retries = 20
         
         for _ in range(max_global_retries):
@@ -99,18 +113,20 @@ class MapGenerator:
         config = self.stage_config.get(stage, self.stage_config[1])
         allowed_types = config['types']
         overlap_prob_threshold = config['overlap_prob']
+        min_u_shape = int(config.get('min_u_shape', 0))
+        u_shape_allowed = 'u_shape' in allowed_types
         
         if num_obstacles is None:
-            # 맵 크기 비례 자동 설정 (대략 면적의 5% 정도 개수?)
-            # 장애물 크기가 다양하므로 개수는 적당히 설정
             area = self.height * self.width
-            min_obs = max(3, int(area / 150)) # 1500칸 기준 10개
-            max_obs = max(5, int(area / 60))  # 1500칸 기준 25개
+            min_per_1k, max_per_1k = config.get('obs_per_1k_range', (6, 10))
+            min_obs = max(2, int(round(area * float(min_per_1k) / 1000.0)))
+            max_obs = max(min_obs, int(round(area * float(max_per_1k) / 1000.0)))
             target_obs = self.rng.randint(min_obs, max_obs)
         else:
             target_obs = num_obstacles
             
         count = 0
+        u_shape_count = 0
         attempts = 0
         max_attempts = target_obs * 50 # 칸 채우기 실패 방지용 limit
         
@@ -118,18 +134,39 @@ class MapGenerator:
             attempts += 1
             
             # 1. 장애물 타입 및 파라미터 선정
-            o_type = self.rng.choice(allowed_types)
+            remaining_slots = max(0, target_obs - count)
+            u_shape_missing = max(0, min_u_shape - u_shape_count)
+            if u_shape_allowed and u_shape_missing > 0 and remaining_slots <= u_shape_missing:
+                # 남은 슬롯이 부족해지기 전에 U-shape을 강제 배치.
+                o_type = 'u_shape'
+            elif u_shape_allowed and u_shape_missing > 0 and self.rng.random() < 0.45:
+                # 초반에도 U-shape이 어느 정도 섞이도록 확률 가중.
+                o_type = 'u_shape'
+            else:
+                o_type = self.rng.choice(allowed_types)
             
-            # 크기 샘플링 (맵 크기의 10% ~ 25% 수준)
-            min_len = 3
-            max_h = max(min_len, int(self.height * 0.25))
-            max_w = max(min_len, int(self.width * 0.25))
-            
-            h = self.rng.randint(min_len, max_h)
-            w = self.rng.randint(min_len, max_w)
-            
+            # 크기 샘플링 (stage별 비율 사용)
+            min_ratio, max_ratio = config.get('size_ratio_range', (0.10, 0.25))
+            min_len = 2
+            min_h = max(min_len, int(round(self.height * float(min_ratio))))
+            max_h = max(min_h, int(round(self.height * float(max_ratio))))
+            min_w = max(min_len, int(round(self.width * float(min_ratio))))
+            max_w = max(min_w, int(round(self.width * float(max_ratio))))
+
+            if o_type in {'u_shape', 'false_hole'}:
+                # Ensure U-shapes remain visually meaningful.
+                min_uh, min_uw = config.get('u_shape_min_size', (5, 4))
+                min_h = max(min_h, int(min_uh))
+                min_w = max(min_w, int(min_uw))
+                max_h = max(max_h, min_h)
+                max_w = max(max_w, min_w)
+
+            h = self.rng.randint(min_h, max_h)
+            w = self.rng.randint(min_w, max_w)
+
+            # Keep side walls thin to preserve clear U geometry.
             thickness = 1
-            if min(h, w) > 4:
+            if o_type == 'rect' and min(h, w) > 4:
                 thickness = self.rng.randint(1, min(h, w) // 3)
             
             # 2. Shape 생성 (Local Coordinates)
@@ -195,6 +232,8 @@ class MapGenerator:
                     grid[r, c] = 1
                 
                 count += 1
+                if o_type == 'u_shape':
+                    u_shape_count += 1
                 metadata.append({
                     'id': count,
                     'type': o_type,
@@ -203,7 +242,9 @@ class MapGenerator:
                     'angle': angle
                 })
                 
-        return grid, metadata, True
+        enough_u_shape = (not u_shape_allowed) or (u_shape_count >= min_u_shape)
+        success = (count >= target_obs) and enough_u_shape
+        return grid, metadata, success
 
     def _get_rect_cells(self, h, w):
         """
