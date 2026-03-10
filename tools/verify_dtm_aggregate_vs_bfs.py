@@ -142,7 +142,7 @@ def main() -> None:
     ap.add_argument("--width", type=int, default=32)
     ap.add_argument("--block", type=int, default=4)
     ap.add_argument("--patch-size", type=int, default=7)
-    ap.add_argument("--connectivity", type=int, choices=[4, 8], default=8)
+    ap.add_argument("--connectivity", type=int, choices=[4, 8], default=4)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument(
         "--output-mode",

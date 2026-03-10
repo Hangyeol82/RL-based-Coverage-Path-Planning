@@ -44,7 +44,7 @@ def main():
         local_window_size=7,
         global_window_size=4,
         dtm_patch_size=7,
-        dtm_connectivity=8,
+        dtm_connectivity=4,
         dtm_require_fully_known_patch=False,
         dtm_min_known_ratio=0.6,
     )

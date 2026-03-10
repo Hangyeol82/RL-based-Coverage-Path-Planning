@@ -140,6 +140,13 @@ def _parse_args() -> argparse.Namespace:
             "axis2km(pass+known for LR/UD), four(legacy), or port12(side-to-side)."
         ),
     )
+    p.add_argument(
+        "--dtm-connectivity",
+        type=int,
+        default=4,
+        choices=[4, 8],
+        help="Connectivity used inside DTM connectivity checks. 4 matches the environment action space.",
+    )
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
     p.add_argument(
         "--model-size",
@@ -461,6 +468,7 @@ def main():
             unknown_policy=str(args.obs_unknown_policy),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_output_mode=str(args.dtm_output_mode),
+            dtm_connectivity=int(args.dtm_connectivity),
         ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,

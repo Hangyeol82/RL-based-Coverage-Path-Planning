@@ -42,7 +42,7 @@ class MultiScaleCPPObservationConfig:
     unknown_policy: str = "keep"
     # DTM config.
     dtm_patch_size: int = 7
-    dtm_connectivity: int = 8
+    dtm_connectivity: int = 4
     dtm_require_fully_known_patch: bool = False
     # Unknown relaxation: if a coarse cell has enough known area, treat it as
     # known for DTM state construction.

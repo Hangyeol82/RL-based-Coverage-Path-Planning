@@ -110,7 +110,7 @@ def main() -> None:
     ap.add_argument("--dtm-output-mode", type=str, default="extent6", choices=["six", "four", "extent6", "port12"])
     ap.add_argument("--dtm-coarse-mode", type=str, default="bfs", choices=["bfs", "aggregate", "aggregate_transfer"])
     ap.add_argument("--dtm-patch-size", type=int, default=7)
-    ap.add_argument("--dtm-connectivity", type=int, default=8, choices=[4, 8])
+    ap.add_argument("--dtm-connectivity", type=int, default=4, choices=[4, 8])
     ap.add_argument("--dtm-min-known-ratio", type=float, default=0.6)
     ap.add_argument("--dtm-patch-min-known-ratio", type=float, default=0.6)
     args = ap.parse_args()

@@ -45,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
         default="keep",
         choices=["keep", "as_free", "as_obstacle"],
     )
+    p.add_argument("--dtm-connectivity", type=int, default=4, choices=[4, 8])
     return p.parse_args()
 
 
@@ -111,6 +112,7 @@ def main():
             unknown_policy=str(args.obs_unknown_policy),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_output_mode=str(args.dtm_output_mode),
+            dtm_connectivity=int(args.dtm_connectivity),
         ),
         reward=CPPRewardConfig(),
     )

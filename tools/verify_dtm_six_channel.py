@@ -190,7 +190,7 @@ def main() -> None:
     ap.add_argument("--height", type=int, default=17)
     ap.add_argument("--width", type=int, default=19)
     ap.add_argument("--patch-size", type=int, default=7)
-    ap.add_argument("--connectivity", type=int, default=8, choices=[4, 8])
+    ap.add_argument("--connectivity", type=int, default=4, choices=[4, 8])
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--output-mode", type=str, default="six", choices=["six", "port12"])
     args = ap.parse_args()

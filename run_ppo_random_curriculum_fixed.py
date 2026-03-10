@@ -120,6 +120,13 @@ def _parse_args() -> argparse.Namespace:
         help="DTM output channels forwarded to run_ppo_sb3.py.",
     )
     p.add_argument(
+        "--dtm-connectivity",
+        type=int,
+        default=4,
+        choices=[4, 8],
+        help="DTM connectivity forwarded to run_ppo_sb3.py. 4 matches the environment action space.",
+    )
+    p.add_argument(
         "--obs-unknown-policy",
         type=str,
         default="keep",
@@ -336,6 +343,8 @@ def _build_run_cmd(
         str(args.dtm_coarse_mode),
         "--dtm-output-mode",
         str(args.dtm_output_mode),
+        "--dtm-connectivity",
+        str(int(args.dtm_connectivity)),
         "--obs-unknown-policy",
         str(args.obs_unknown_policy),
         "--map-source",
