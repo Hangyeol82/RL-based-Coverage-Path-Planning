@@ -1089,9 +1089,9 @@ class MultiScaleCPPObservationBuilder:
             unknown_value=self.config.unknown_value,
             obstacle_value=self.config.obstacle_value,
         )
-        known_f = (~unknown).astype(np.float32)
         covered = explored.astype(bool) & known_free
-        frontier = compute_frontier_map(known_free, unknown)
+        frontier = compute_frontier_map(covered, known_obstacle)
+        known_f = (~unknown).astype(np.float32)
         if self._profile_enabled:
             self._profile_add("prep_masks_frontier", perf_counter() - t0)
 

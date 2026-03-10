@@ -31,20 +31,25 @@ def extract_known_masks(
     return known_free, known_obstacle, unknown
 
 
-def compute_frontier_map(known_free: np.ndarray, unknown: np.ndarray) -> np.ndarray:
+def compute_frontier_map(covered: np.ndarray, known_obstacle: np.ndarray) -> np.ndarray:
     """
-    Frontier is known-free cells adjacent (4-neighborhood) to unknown cells.
-    Obstacles are excluded by construction.
+    Frontier is the one-cell band between covered space and not-yet-covered
+    non-obstacle space, matching the rl-cpp paper/repo convention.
     """
-    if known_free.shape != unknown.shape:
-        raise ValueError("known_free and unknown shapes must match")
+    if covered.shape != known_obstacle.shape:
+        raise ValueError("covered and known_obstacle shapes must match")
 
-    adj_unknown = np.zeros_like(unknown, dtype=bool)
-    adj_unknown[:-1, :] |= unknown[1:, :]
-    adj_unknown[1:, :] |= unknown[:-1, :]
-    adj_unknown[:, :-1] |= unknown[:, 1:]
-    adj_unknown[:, 1:] |= unknown[:, :-1]
-    return known_free & adj_unknown
+    covered = np.asarray(covered, dtype=bool) & (~np.asarray(known_obstacle, dtype=bool))
+    known_obstacle = np.asarray(known_obstacle, dtype=bool)
+
+    padded = np.pad(covered, ((1, 1), (1, 1)), mode="constant", constant_values=False)
+    dilated = np.zeros_like(covered, dtype=bool)
+    for dr in range(3):
+        for dc in range(3):
+            dilated |= padded[dr : dr + covered.shape[0], dc : dc + covered.shape[1]]
+
+    free_uncovered = (~covered) & (~known_obstacle)
+    return dilated & free_uncovered
 
 
 def center_crop_with_pad(
