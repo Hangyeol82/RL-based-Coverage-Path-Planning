@@ -901,6 +901,8 @@ class MultiScaleCPPObservationBuilder:
         known_ratio_parent: np.ndarray,
         row_edges: np.ndarray,
         col_edges: np.ndarray,
+        out: Optional[np.ndarray] = None,
+        dirty_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Compose coarse-cell DTM directly from child-cell exits.
@@ -937,19 +939,33 @@ class MultiScaleCPPObservationBuilder:
         if known_ratio_parent.shape != (ch, cw):
             raise ValueError("known_ratio_parent shape mismatch")
 
-        out = np.full((expected_ch, ch, cw), float(self.config.dtm_unknown_fill), dtype=np.float32)
-        for r in range(ch):
-            rs = int(row_edges[r])
-            re = int(row_edges[r + 1])
-            for c in range(cw):
-                cs = int(col_edges[c])
-                ce = int(col_edges[c + 1])
-                out[:, r, c] = self._aggregate_transfer_flags_block(
-                    dtm_child[:, rs:re, cs:ce],
-                    state_child[rs:re, cs:ce],
-                    dtm_mode=dtm_mode,
-                )
-        return out
+        if out is None:
+            out_arr = np.full((expected_ch, ch, cw), float(self.config.dtm_unknown_fill), dtype=np.float32)
+        else:
+            if out.shape != (expected_ch, ch, cw):
+                raise ValueError("out shape mismatch in _compose_dtm_partition_from_children")
+            out_arr = out.astype(np.float32, copy=False)
+
+        if dirty_mask is None:
+            targets = np.argwhere(np.ones((ch, cw), dtype=bool))
+        else:
+            if dirty_mask.shape != (ch, cw):
+                raise ValueError("dirty_mask shape mismatch in _compose_dtm_partition_from_children")
+            targets = np.argwhere(dirty_mask)
+            if targets.size == 0:
+                return out_arr
+
+        for r, c in targets:
+            rs = int(row_edges[int(r)])
+            re = int(row_edges[int(r) + 1])
+            cs = int(col_edges[int(c)])
+            ce = int(col_edges[int(c) + 1])
+            out_arr[:, int(r), int(c)] = self._aggregate_transfer_flags_block(
+                dtm_child[:, rs:re, cs:ce],
+                state_child[rs:re, cs:ce],
+                dtm_mode=dtm_mode,
+            )
+        return out_arr
 
     def _compose_dtm_block_from_children(
         self,
@@ -959,6 +975,8 @@ class MultiScaleCPPObservationBuilder:
         known_ratio_parent: np.ndarray,
         block_r: int,
         block_c: Optional[int] = None,
+        out: Optional[np.ndarray] = None,
+        dirty_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if block_r <= 0:
             raise ValueError("block_r must be positive")
@@ -979,6 +997,8 @@ class MultiScaleCPPObservationBuilder:
             known_ratio_parent=known_ratio_parent,
             row_edges=row_edges,
             col_edges=col_edges,
+            out=out,
+            dirty_mask=dirty_mask,
         )
 
     def _build_level_channels(
@@ -1368,12 +1388,29 @@ class MultiScaleCPPObservationBuilder:
                             changed_mask=changed_coarse,
                         )
                     elif dtm_fine is not None and state_fine is not None:
-                        dtm_coarse = self._compose_dtm_block_from_children(
-                            dtm_child=dtm_fine,
-                            state_child=state_fine,
-                            known_ratio_parent=known_ratio_coarse,
-                            block_r=block,
-                        )
+                        dirty_parent = self._dirty_blocks_from_changed(occupancy_changed, block)
+                        cache = self._dtm_cache.get(lv, None)
+                        if cache is not None and cache.shape == (
+                            self._native_dtm_channels(),
+                            state_coarse.shape[0],
+                            state_coarse.shape[1],
+                        ):
+                            dtm_coarse = self._compose_dtm_block_from_children(
+                                dtm_child=dtm_fine,
+                                state_child=state_fine,
+                                known_ratio_parent=known_ratio_coarse,
+                                block_r=block,
+                                out=cache,
+                                dirty_mask=dirty_parent,
+                            )
+                        else:
+                            dtm_coarse = self._compose_dtm_block_from_children(
+                                dtm_child=dtm_fine,
+                                state_child=state_fine,
+                                known_ratio_parent=known_ratio_coarse,
+                                block_r=block,
+                            )
+                        self._dtm_cache[lv] = dtm_coarse
                     else:
                         changed_coarse = self._dirty_blocks_from_changed(occupancy_changed, block)
                         dtm_coarse = self._update_dtm_level(
@@ -1437,13 +1474,31 @@ class MultiScaleCPPObservationBuilder:
                 if dtm_fine is not None and state_fine is not None:
                     row_edges = self._global_edges(h, gsize)
                     col_edges = self._global_edges(w, gsize)
-                    dtm_global = self._compose_dtm_partition_from_children(
-                        dtm_child=dtm_fine,
-                        state_child=state_fine,
-                        known_ratio_parent=known_ratio_global,
-                        row_edges=row_edges,
-                        col_edges=col_edges,
-                    )
+                    dirty_parent = self._dirty_global_from_changed(occupancy_changed, gsize, gsize)
+                    cache = self._dtm_cache.get(level_id, None)
+                    if cache is not None and cache.shape == (
+                        self._native_dtm_channels(),
+                        gsize,
+                        gsize,
+                    ):
+                        dtm_global = self._compose_dtm_partition_from_children(
+                            dtm_child=dtm_fine,
+                            state_child=state_fine,
+                            known_ratio_parent=known_ratio_global,
+                            row_edges=row_edges,
+                            col_edges=col_edges,
+                            out=cache,
+                            dirty_mask=dirty_parent,
+                        )
+                    else:
+                        dtm_global = self._compose_dtm_partition_from_children(
+                            dtm_child=dtm_fine,
+                            state_child=state_fine,
+                            known_ratio_parent=known_ratio_global,
+                            row_edges=row_edges,
+                            col_edges=col_edges,
+                        )
+                    self._dtm_cache[level_id] = dtm_global
                 else:
                     changed_global = self._dirty_global_from_changed(occupancy_changed, gsize, gsize)
                     dtm_global = self._update_dtm_level(
