@@ -212,8 +212,11 @@ class MultiScaleCPPObservationBuilder:
         self._profile_totals[key] = float(self._profile_totals.get(key, 0.0)) + float(dt)
 
     def _native_dtm_mode(self) -> str:
-        # Keep legacy outputs backed by six-channel DTM.
-        if self.config.dtm_output_mode in {"six", "axis2", "axis2km", "four"}:
+        # For recursive coarse-cell composition, axis projections need full
+        # side-to-side connectivity, not only LR/UD summaries.
+        if self.config.dtm_output_mode in {"axis2", "axis2km", "port12"}:
+            return "port12"
+        if self.config.dtm_output_mode in {"six", "four"}:
             return "six"
         if self.config.dtm_output_mode == "extent6":
             return "extent6"
@@ -459,6 +462,49 @@ class MultiScaleCPPObservationBuilder:
                 out[dst_r0:dst_r1, dst_c0:dst_c1] |= src[src_r0:src_r1, src_c0:src_c1]
         return out
 
+    def _compute_level0_native_dtm(
+        self,
+        state_map: np.ndarray,
+        *,
+        out: Optional[np.ndarray] = None,
+        dirty_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Level-0 DTM uses per-cell semantics, not patch-level spanning semantics.
+
+        A single free cell is internally traversable across all exits.
+        A blocked cell is non-traversable.
+        An unknown cell stays unknown.
+        """
+        h, w = state_map.shape
+        native_mode = self._native_dtm_mode()
+        dtm_ch = 12 if native_mode == "port12" else 6
+        if out is None:
+            dtm = np.full((dtm_ch, h, w), float(self.config.dtm_unknown_fill), dtype=np.float32)
+        else:
+            if out.shape != (dtm_ch, h, w):
+                raise ValueError(f"out shape must be ({dtm_ch}, H, W) matching state_map")
+            dtm = out.astype(np.float32, copy=False)
+
+        if dirty_mask is None:
+            targets = np.argwhere(np.ones_like(state_map, dtype=bool))
+        else:
+            if dirty_mask.shape != state_map.shape:
+                raise ValueError("dirty_mask shape must match state_map")
+            targets = np.argwhere(dirty_mask)
+            if targets.size == 0:
+                return dtm
+
+        for r, c in targets:
+            st = int(state_map[int(r), int(c)])
+            if st == int(UNKNOWN_STATE):
+                dtm[:, int(r), int(c)] = float(self.config.dtm_unknown_fill)
+            elif st == int(FREE_STATE):
+                dtm[:, int(r), int(c)] = 1.0
+            else:
+                dtm[:, int(r), int(c)] = 0.0
+        return dtm
+
     def _update_dtm_level(
         self,
         *,
@@ -471,6 +517,23 @@ class MultiScaleCPPObservationBuilder:
         cache = self._dtm_cache.get(level_id, None)
         dtm_ch = self._native_dtm_channels()
         full_refresh = cache is None or cache.shape != (dtm_ch, h, w)
+
+        # Level 0 represents single cells. Traversability should therefore be
+        # interpreted inside the cell itself, not over a surrounding patch.
+        if level_id == 0:
+            if full_refresh:
+                dtm = self._compute_level0_native_dtm(state_map)
+                self._dtm_cache[level_id] = dtm
+                return dtm
+            if not np.any(changed_mask):
+                return cache
+            dtm = self._compute_level0_native_dtm(
+                state_map,
+                out=cache,
+                dirty_mask=changed_mask,
+            )
+            self._dtm_cache[level_id] = dtm
+            return dtm
 
         if full_refresh:
             dtm = compute_directional_traversability(
@@ -527,15 +590,35 @@ class MultiScaleCPPObservationBuilder:
         if self.config.dtm_output_mode == "six":
             return dtm_map
         if self.config.dtm_output_mode == "axis2":
+            if dtm_map.shape[0] == 12:
+                out = np.empty((2, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
+                out[0] = np.maximum(dtm_map[10], dtm_map[5])  # L->R or R->L
+                out[1] = np.maximum(dtm_map[1], dtm_map[6])   # U->D or D->U
+                return out
             if dtm_map.shape[0] != 6:
-                raise ValueError("axis2 projection expects six-channel source DTM")
+                raise ValueError("axis2 projection expects six- or port12-channel source DTM")
             out = np.empty((2, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
             out[0] = dtm_map[0]  # LR
             out[1] = dtm_map[1]  # UD
             return out
         if self.config.dtm_output_mode == "axis2km":
+            if dtm_map.shape[0] == 12:
+                lr_fwd = dtm_map[10]  # L->R
+                lr_rev = dtm_map[5]   # R->L
+                ud_fwd = dtm_map[1]   # U->D
+                ud_rev = dtm_map[6]   # D->U
+                lr = np.maximum(lr_fwd, lr_rev)
+                ud = np.maximum(ud_fwd, ud_rev)
+                lr_known = np.minimum((lr_fwd >= 0.0).astype(np.float32), (lr_rev >= 0.0).astype(np.float32))
+                ud_known = np.minimum((ud_fwd >= 0.0).astype(np.float32), (ud_rev >= 0.0).astype(np.float32))
+                out = np.empty((4, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
+                out[0] = (lr > 0.0).astype(np.float32)
+                out[1] = (ud > 0.0).astype(np.float32)
+                out[2] = lr_known
+                out[3] = ud_known
+                return out
             if dtm_map.shape[0] != 6:
-                raise ValueError("axis2km projection expects six-channel source DTM")
+                raise ValueError("axis2km projection expects six- or port12-channel source DTM")
             lr = dtm_map[0]
             ud = dtm_map[1]
             out = np.empty((4, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
@@ -593,13 +676,35 @@ class MultiScaleCPPObservationBuilder:
         def add_edge(u: int, v: int):
             adj[u].append(v)
 
-        def is_free(r: int, c: int) -> bool:
-            return int(state_block[r, c]) == int(FREE_STATE)
+        if dtm_mode == "six":
+            side_related = {
+                0: (1, 2, 3, 4, 5),  # up
+                1: (0, 2, 3, 4, 5),  # right
+                2: (1, 2, 3, 4, 5),  # down
+                3: (0, 2, 3, 4, 5),  # left
+            }
+        else:
+            side_related = {
+                0: (0, 1, 2, 3, 6, 9),      # up
+                1: (0, 3, 4, 5, 7, 10),     # right
+                2: (1, 4, 6, 7, 8, 11),     # down
+                3: (2, 5, 8, 9, 10, 11),    # left
+            }
+
+        def side_known(r: int, c: int, p: int) -> bool:
+            ch = dtm_block[:, r, c]
+            rel = side_related[p]
+            return bool(np.any(ch[list(rel)] >= 0.0))
+
+        def side_open(r: int, c: int, p: int) -> bool:
+            ch = dtm_block[:, r, c]
+            rel = side_related[p]
+            return bool(np.any(ch[list(rel)] > 0.5))
 
         # Intra-cell transfer edges from 6-channel DTM.
         for r in range(bh):
             for c in range(bw):
-                if not is_free(r, c):
+                if not np.any(dtm_block[:, r, c] >= 0.0):
                     continue
                 ch = dtm_block[:, r, c]
                 n = nid(r, c, 0)
@@ -665,14 +770,12 @@ class MultiScaleCPPObservationBuilder:
         # Inter-cell boundary crossings (undirected if both fine cells are free).
         for r in range(bh):
             for c in range(bw):
-                if not is_free(r, c):
-                    continue
-                if c + 1 < bw and is_free(r, c + 1):
+                if c + 1 < bw and side_open(r, c, 1) and side_open(r, c + 1, 3):
                     u = nid(r, c, 1)      # east of left cell
                     v = nid(r, c + 1, 3)  # west of right cell
                     add_edge(u, v)
                     add_edge(v, u)
-                if r + 1 < bh and is_free(r + 1, c):
+                if r + 1 < bh and side_open(r, c, 2) and side_open(r + 1, c, 0):
                     u = nid(r, c, 2)      # south of top cell
                     v = nid(r + 1, c, 0)  # north of bottom cell
                     add_edge(u, v)
@@ -701,7 +804,9 @@ class MultiScaleCPPObservationBuilder:
         def port_node(r: int, c: int, p: int):
             if r < 0 or r >= bh or c < 0 or c >= bw:
                 return None
-            if not is_free(r, c):
+            if not side_known(r, c, p):
+                return None
+            if not side_open(r, c, p):
                 return None
             return nid(r, c, p)
 
@@ -787,6 +892,94 @@ class MultiScaleCPPObservationBuilder:
                     dtm_mode=dtm_mode,
                 )
         return out
+
+    def _compose_dtm_partition_from_children(
+        self,
+        *,
+        dtm_child: np.ndarray,
+        state_child: np.ndarray,
+        known_ratio_parent: np.ndarray,
+        row_edges: np.ndarray,
+        col_edges: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Compose coarse-cell DTM directly from child-cell exits.
+
+        Unlike block_reduce_state()-based coarse DTM, mixed obstacle/free cells are
+        not collapsed to BLOCKED before checking connectivity.
+
+        Online semantics:
+        - parent known ratio does NOT blank out the whole coarse cell
+        - each side-pair is marked passable only if a path is proven through known
+          child cells
+        - uncertainty is carried by the child-side known/open flags themselves
+        """
+        dtm_mode = self._native_dtm_mode()
+        expected_ch = 6 if dtm_mode == "six" else 12
+        if dtm_child.ndim != 3 or dtm_child.shape[0] != expected_ch:
+            raise ValueError(f"dtm_child must be [{expected_ch}, H, W]")
+        if state_child.shape != dtm_child.shape[1:]:
+            raise ValueError("state_child shape mismatch")
+
+        h, w = state_child.shape
+        row_edges = np.asarray(row_edges, dtype=np.int32)
+        col_edges = np.asarray(col_edges, dtype=np.int32)
+        if row_edges.ndim != 1 or col_edges.ndim != 1:
+            raise ValueError("row_edges and col_edges must be 1D")
+        if len(row_edges) < 2 or len(col_edges) < 2:
+            raise ValueError("row_edges and col_edges must have at least two entries")
+        if int(row_edges[0]) != 0 or int(col_edges[0]) != 0:
+            raise ValueError("row_edges/col_edges must start at 0")
+        if int(row_edges[-1]) != h or int(col_edges[-1]) != w:
+            raise ValueError("row_edges/col_edges must end at child grid size")
+        ch = len(row_edges) - 1
+        cw = len(col_edges) - 1
+        if known_ratio_parent.shape != (ch, cw):
+            raise ValueError("known_ratio_parent shape mismatch")
+
+        out = np.full((expected_ch, ch, cw), float(self.config.dtm_unknown_fill), dtype=np.float32)
+        for r in range(ch):
+            rs = int(row_edges[r])
+            re = int(row_edges[r + 1])
+            for c in range(cw):
+                cs = int(col_edges[c])
+                ce = int(col_edges[c + 1])
+                out[:, r, c] = self._aggregate_transfer_flags_block(
+                    dtm_child[:, rs:re, cs:ce],
+                    state_child[rs:re, cs:ce],
+                    dtm_mode=dtm_mode,
+                )
+        return out
+
+    def _compose_dtm_block_from_children(
+        self,
+        *,
+        dtm_child: np.ndarray,
+        state_child: np.ndarray,
+        known_ratio_parent: np.ndarray,
+        block_r: int,
+        block_c: Optional[int] = None,
+    ) -> np.ndarray:
+        if block_r <= 0:
+            raise ValueError("block_r must be positive")
+        if block_c is None:
+            block_c = block_r
+        if block_c <= 0:
+            raise ValueError("block_c must be positive")
+        h, w = state_child.shape
+        ch = (h + block_r - 1) // block_r
+        cw = (w + block_c - 1) // block_c
+        row_edges = np.asarray([min(h, i * block_r) for i in range(ch + 1)], dtype=np.int32)
+        col_edges = np.asarray([min(w, i * block_c) for i in range(cw + 1)], dtype=np.int32)
+        row_edges[-1] = h
+        col_edges[-1] = w
+        return self._compose_dtm_partition_from_children(
+            dtm_child=dtm_child,
+            state_child=state_child,
+            known_ratio_parent=known_ratio_parent,
+            row_edges=row_edges,
+            col_edges=col_edges,
+        )
 
     def _build_level_channels(
         self,
@@ -1109,7 +1302,11 @@ class MultiScaleCPPObservationBuilder:
         changed_f = occupancy_changed if self.include_dtm else None
         dtm_fine = None
         state_fine = None
-        if self.include_dtm and self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
+        need_fine_dtm = self.include_dtm and (
+            self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}
+            or len(self.config.local_blocks) > 1
+        )
+        if need_fine_dtm:
             t0 = perf_counter() if self._profile_enabled else 0.0
             state_fine = np.full(occupancy.shape, BLOCKED_STATE, dtype=np.int8)
             state_fine[unknown] = UNKNOWN_STATE
@@ -1124,6 +1321,7 @@ class MultiScaleCPPObservationBuilder:
                 self._profile_add("dtm_fine", perf_counter() - t0)
 
         levels: Dict[int, np.ndarray] = {}
+        local_native_levels = []
 
         # Local robot-centered levels.
         for lv, block in enumerate(self.config.local_blocks):
@@ -1161,15 +1359,32 @@ class MultiScaleCPPObservationBuilder:
                     else:
                         dtm_coarse = self._aggregate_dtm_block(dtm_fine, block)
                 else:
-                    changed_coarse = self._dirty_blocks_from_changed(occupancy_changed, block)
-                    dtm_coarse = self._update_dtm_level(
-                        level_id=lv,
-                        state_map=state_coarse,
-                        known_ratio_map=known_ratio_coarse,
-                        changed_mask=changed_coarse,
-                    )
+                    if lv == 0:
+                        changed_coarse = self._dirty_blocks_from_changed(occupancy_changed, block)
+                        dtm_coarse = self._update_dtm_level(
+                            level_id=lv,
+                            state_map=state_coarse,
+                            known_ratio_map=known_ratio_coarse,
+                            changed_mask=changed_coarse,
+                        )
+                    elif dtm_fine is not None and state_fine is not None:
+                        dtm_coarse = self._compose_dtm_block_from_children(
+                            dtm_child=dtm_fine,
+                            state_child=state_fine,
+                            known_ratio_parent=known_ratio_coarse,
+                            block_r=block,
+                        )
+                    else:
+                        changed_coarse = self._dirty_blocks_from_changed(occupancy_changed, block)
+                        dtm_coarse = self._update_dtm_level(
+                            level_id=lv,
+                            state_map=state_coarse,
+                            known_ratio_map=known_ratio_coarse,
+                            changed_mask=changed_coarse,
+                        )
                 if self._profile_enabled:
                     self._profile_add("local_dtm", perf_counter() - t1)
+                local_native_levels.append((block, dtm_coarse, state_coarse))
 
             center_coarse = (rr // block, cc // block)
             cell_phase_local = self._compute_cell_phase(
@@ -1219,13 +1434,24 @@ class MultiScaleCPPObservationBuilder:
             if self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
                 dtm_global = self._aggregate_dtm_global(dtm_fine, gsize, gsize)
             else:
-                changed_global = self._dirty_global_from_changed(occupancy_changed, gsize, gsize)
-                dtm_global = self._update_dtm_level(
-                    level_id=level_id,
-                    state_map=state_global,
-                    known_ratio_map=known_ratio_global,
-                    changed_mask=changed_global,
-                )
+                if dtm_fine is not None and state_fine is not None:
+                    row_edges = self._global_edges(h, gsize)
+                    col_edges = self._global_edges(w, gsize)
+                    dtm_global = self._compose_dtm_partition_from_children(
+                        dtm_child=dtm_fine,
+                        state_child=state_fine,
+                        known_ratio_parent=known_ratio_global,
+                        row_edges=row_edges,
+                        col_edges=col_edges,
+                    )
+                else:
+                    changed_global = self._dirty_global_from_changed(occupancy_changed, gsize, gsize)
+                    dtm_global = self._update_dtm_level(
+                        level_id=level_id,
+                        state_map=state_global,
+                        known_ratio_map=known_ratio_global,
+                        changed_mask=changed_global,
+                    )
             if self._profile_enabled:
                 self._profile_add("global_dtm", perf_counter() - t1)
 
