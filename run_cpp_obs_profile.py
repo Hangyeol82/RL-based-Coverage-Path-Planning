@@ -22,6 +22,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--map-stage", type=int, default=3)
     p.add_argument("--seed", type=int, default=101)
     p.add_argument("--sensor-range", type=int, default=2)
+    p.add_argument(
+        "--local-blocks",
+        type=str,
+        default="",
+        help="Optional comma list overriding MAPS local block sizes, e.g. 1,2,4,8",
+    )
     p.add_argument("--max-episode-steps", type=int, default=6000)
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--warmup-steps", type=int, default=50)
@@ -47,6 +53,27 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dtm-connectivity", type=int, default=4, choices=[4, 8])
     return p.parse_args()
+
+
+def _parse_local_blocks(raw: str):
+    s = str(raw).strip()
+    if not s:
+        return None
+    vals = []
+    for tok in s.split(","):
+        t = tok.strip()
+        if not t:
+            continue
+        vals.append(int(t))
+    if not vals:
+        return None
+    if any(v <= 0 for v in vals):
+        raise ValueError("--local-blocks values must be positive")
+    if sorted(vals) != vals:
+        raise ValueError("--local-blocks must be in increasing order")
+    if len(set(vals)) != len(vals):
+        raise ValueError("--local-blocks must not contain duplicates")
+    return tuple(vals)
 
 
 def _prepare_square_map(base_map: np.ndarray, size: int) -> np.ndarray:
@@ -97,6 +124,7 @@ def main():
     args = _parse_args()
     rng = np.random.default_rng(int(args.seed))
     grid = _build_map(args)
+    local_blocks = _parse_local_blocks(args.local_blocks)
     if int(grid[0, 0]) == 1:
         grid[0, 0] = 0
     start = _pick_start(grid)
@@ -109,6 +137,7 @@ def main():
         profile_interval_steps=int(args.profile_interval),
         profile_name=f"{'dtm' if args.include_dtm else 'base'}_{args.map_size}",
         observation=MultiScaleCPPObservationConfig(
+            local_blocks=local_blocks or MultiScaleCPPObservationConfig().local_blocks,
             unknown_policy=str(args.obs_unknown_policy),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_output_mode=str(args.dtm_output_mode),

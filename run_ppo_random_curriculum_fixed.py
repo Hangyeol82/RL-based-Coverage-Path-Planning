@@ -82,6 +82,12 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--map-size", type=int, default=32)
     p.add_argument("--sensor-range", type=int, default=2)
+    p.add_argument(
+        "--local-blocks",
+        type=str,
+        default="",
+        help="Optional comma list forwarded to run_ppo_sb3.py, e.g. 1,2,4,8",
+    )
     p.add_argument("--max-episode-steps", type=int, default=2000)
 
     boundary_group = p.add_mutually_exclusive_group()
@@ -323,6 +329,8 @@ def _build_run_cmd(
         "0",
         "--sensor-range",
         str(int(args.sensor_range)),
+        "--local-blocks",
+        str(args.local_blocks),
         "--max-episode-steps",
         str(int(args.max_episode_steps)),
         "--boundary-exit-threshold",
