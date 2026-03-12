@@ -103,6 +103,13 @@ RANDOM64_EASYMID2: StageMap = {
 }
 
 
+INDOOR64_ROOMMERGE: StageMap = {
+    1: _with_label({}, "1"),
+    2: _with_label({}, "2"),
+    3: _with_label({}, "3"),
+}
+
+
 _PROFILE_TABLE: Dict[str, Dict[str, object]] = {
     "legacy4": {
         "profile_name": "legacy4",
@@ -114,6 +121,12 @@ _PROFILE_TABLE: Dict[str, Dict[str, object]] = {
         "profile_name": "random64_easymid2",
         "description": "64x64 3-level curriculum with semantics 1 / 1.5 / 2.",
         "stages": RANDOM64_EASYMID2,
+        "default_stages": (1, 2, 3),
+    },
+    "indoor64_roommerge": {
+        "profile_name": "indoor64_roommerge",
+        "description": "64x64 indoor curriculum with room-merging stages 1 / 2 / 3.",
+        "stages": INDOOR64_ROOMMERGE,
         "default_stages": (1, 2, 3),
     },
 }

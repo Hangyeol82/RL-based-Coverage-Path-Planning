@@ -11,6 +11,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from MapGenerator import MapGenerator
+from map_generators import build_indoor_curriculum_map
 from map_generators.curriculum_profiles import (
     available_curriculum_profiles,
     default_stages_for_profile,
@@ -512,13 +513,21 @@ def main() -> None:
 
         map_seed = int(args.seed if args.map_seed_mode == "fixed" else (args.seed + i))
         run_seed = int(args.seed + i)
-        gen = MapGenerator(
-            height=args.map_size,
-            width=args.map_size,
-            seed=map_seed,
-            curriculum_profile=args.curriculum_profile,
-        )
-        grid, meta = gen.generate_map(stage=stage_level, return_metadata=True)
+        if args.curriculum_profile == "indoor64_roommerge":
+            grid, meta = build_indoor_curriculum_map(
+                size=args.map_size,
+                seed=map_seed,
+                stage=stage_level,
+                return_metadata=True,
+            )
+        else:
+            gen = MapGenerator(
+                height=args.map_size,
+                width=args.map_size,
+                seed=map_seed,
+                curriculum_profile=args.curriculum_profile,
+            )
+            grid, meta = gen.generate_map(stage=stage_level, return_metadata=True)
         grid = np.asarray(grid, dtype=np.int32)
         obs_cells = int(np.count_nonzero(grid == 1))
         obs_ratio = float(obs_cells) / float(grid.size)
