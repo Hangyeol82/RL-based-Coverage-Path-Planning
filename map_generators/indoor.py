@@ -4,6 +4,7 @@ import numpy as np
 
 
 GridPos = Tuple[int, int]
+Edge = Tuple[GridPos, GridPos]
 
 
 def _room_neighbors(r: int, c: int, rows: int, cols: int) -> List[GridPos]:
@@ -21,6 +22,89 @@ def _room_neighbors(r: int, c: int, rows: int, cols: int) -> List[GridPos]:
 
 def _canon_edge(a: GridPos, b: GridPos) -> Tuple[GridPos, GridPos]:
     return (a, b) if a <= b else (b, a)
+
+
+def _sample_clustered_edges(
+    edges: List[Edge],
+    count: int,
+    rng: np.random.RandomState,
+    grow_prob: float,
+    seed_edge_count: int,
+) -> List[Edge]:
+    count = max(0, int(count))
+    if count <= 0 or not edges:
+        return []
+
+    grow_prob = float(np.clip(grow_prob, 0.0, 1.0))
+    seed_edge_count = max(1, min(int(seed_edge_count), count))
+    remaining = list(edges)
+    rng.shuffle(remaining)
+    selected: List[Edge] = []
+    frontier_nodes = set()
+
+    seed_candidates = list(remaining)
+    rng.shuffle(seed_candidates)
+    for edge in seed_candidates:
+        if len(selected) >= seed_edge_count:
+            break
+        a, b = edge
+        if a in frontier_nodes or b in frontier_nodes:
+            continue
+        selected.append(edge)
+        frontier_nodes.add(a)
+        frontier_nodes.add(b)
+        remaining.remove(edge)
+
+    while remaining and len(selected) < seed_edge_count:
+        edge = remaining.pop(0)
+        selected.append(edge)
+        frontier_nodes.add(edge[0])
+        frontier_nodes.add(edge[1])
+
+    while remaining and len(selected) < count:
+        candidate_pool = []
+        if rng.rand() < grow_prob:
+            candidate_pool = [edge for edge in remaining if edge[0] in frontier_nodes or edge[1] in frontier_nodes]
+        if not candidate_pool:
+            candidate_pool = remaining
+        pick_idx = int(rng.randint(0, len(candidate_pool)))
+        edge = candidate_pool[pick_idx]
+        remaining.remove(edge)
+        selected.append(edge)
+        frontier_nodes.add(edge[0])
+        frontier_nodes.add(edge[1])
+    return selected
+
+
+def _merge_cluster_sizes(rows: int, cols: int, merge_edges: List[Edge]) -> List[int]:
+    if not merge_edges:
+        return []
+
+    parent = {}
+
+    def find(x: GridPos) -> GridPos:
+        parent.setdefault(x, x)
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(a: GridPos, b: GridPos) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for rr in range(rows):
+        for cc in range(cols):
+            parent[(rr, cc)] = (rr, cc)
+    for a, b in merge_edges:
+        union(a, b)
+
+    sizes = {}
+    for node in parent:
+        root = find(node)
+        sizes[root] = sizes.get(root, 0) + 1
+    return sorted((size for size in sizes.values() if size > 1), reverse=True)
 
 
 def _sample_non_overlapping_intervals(
@@ -63,7 +147,12 @@ def build_indoor_map(
     door_width: int = 1,
     extra_connection_prob: float = 0.35,
     two_door_prob: float = 0.2,
+    merge_edge_count: int = 0,
+    merge_room_ratio: float = 0.0,
+    merge_grow_prob: float = 0.75,
+    merge_seed_edge_count: int = 1,
     ensure_start_clear: bool = True,
+    return_metadata: bool = False,
 ) -> np.ndarray:
     rng = np.random.RandomState(seed)
     size = int(size)
@@ -72,6 +161,7 @@ def build_indoor_map(
     door_width = max(1, int(door_width))
     extra_connection_prob = float(np.clip(extra_connection_prob, 0.0, 1.0))
     two_door_prob = float(np.clip(two_door_prob, 0.0, 1.0))
+    merge_room_ratio = float(np.clip(merge_room_ratio, 0.0, 1.0))
 
     rows = max(2, (size - wall_thickness) // (room_inner + wall_thickness))
     cols = max(2, (size - wall_thickness) // (room_inner + wall_thickness))
@@ -125,30 +215,106 @@ def build_indoor_map(
         if rng.rand() < extra_connection_prob:
             active_edges.add(ce)
 
+    merge_edge_count = max(0, int(merge_edge_count))
+    if merge_edge_count <= 0 and merge_room_ratio > 0.0:
+        merge_edge_count = max(1, int(round(rows * cols * merge_room_ratio)))
+    merge_edge_count = min(merge_edge_count, len(active_edges))
+    merge_edges = set(
+        _sample_clustered_edges(
+            sorted(active_edges),
+            merge_edge_count,
+            rng,
+            merge_grow_prob,
+            merge_seed_edge_count,
+        )
+    )
+
     for a, b in sorted(active_edges):
         ar, ac = a
         br, bc = b
-        door_count = 2 if (rng.rand() < two_door_prob) else 1
         if ar == br:
             left_c = min(ac, bc)
             wall_c0 = off_c + (left_c + 1) * (room_inner + wall_thickness)
             seg_r0 = off_r + ar * (room_inner + wall_thickness) + wall_thickness
             seg_r1 = seg_r0 + room_inner
-            intervals = _sample_non_overlapping_intervals(seg_r1 - seg_r0, door_width, door_count, rng)
-            for s, e in intervals:
-                grid[seg_r0 + s : seg_r0 + e, wall_c0 : wall_c0 + wall_thickness] = 0
+            if _canon_edge(a, b) in merge_edges:
+                grid[seg_r0:seg_r1, wall_c0 : wall_c0 + wall_thickness] = 0
+            else:
+                door_count = 2 if (rng.rand() < two_door_prob) else 1
+                intervals = _sample_non_overlapping_intervals(seg_r1 - seg_r0, door_width, door_count, rng)
+                for s, e in intervals:
+                    grid[seg_r0 + s : seg_r0 + e, wall_c0 : wall_c0 + wall_thickness] = 0
         else:
             top_r = min(ar, br)
             wall_r0 = off_r + (top_r + 1) * (room_inner + wall_thickness)
             seg_c0 = off_c + ac * (room_inner + wall_thickness) + wall_thickness
             seg_c1 = seg_c0 + room_inner
-            intervals = _sample_non_overlapping_intervals(seg_c1 - seg_c0, door_width, door_count, rng)
-            for s, e in intervals:
-                grid[wall_r0 : wall_r0 + wall_thickness, seg_c0 + s : seg_c0 + e] = 0
+            if _canon_edge(a, b) in merge_edges:
+                grid[wall_r0 : wall_r0 + wall_thickness, seg_c0:seg_c1] = 0
+            else:
+                door_count = 2 if (rng.rand() < two_door_prob) else 1
+                intervals = _sample_non_overlapping_intervals(seg_c1 - seg_c0, door_width, door_count, rng)
+                for s, e in intervals:
+                    grid[wall_r0 : wall_r0 + wall_thickness, seg_c0 + s : seg_c0 + e] = 0
 
     if ensure_start_clear:
         grid[0, 0] = 0
         if size > 1:
             grid[0, 1] = 0
             grid[1, 0] = 0
-    return grid
+    if not return_metadata:
+        return grid
+
+    metadata = {
+        "size": int(size),
+        "seed": int(seed),
+        "rows": int(rows),
+        "cols": int(cols),
+        "room_inner": int(room_inner),
+        "wall_thickness": int(wall_thickness),
+        "door_width": int(door_width),
+        "active_edge_count": int(len(active_edges)),
+        "merge_edge_count": int(len(merge_edges)),
+        "merge_room_ratio": float(merge_room_ratio),
+        "merge_grow_prob": float(merge_grow_prob),
+        "merge_seed_edge_count": int(merge_seed_edge_count),
+        "merge_cluster_sizes": _merge_cluster_sizes(rows, cols, sorted(merge_edges)),
+    }
+    return grid, metadata
+
+
+INDOOR_CURRICULUM_SPECS = {
+    1: {"merge_edge_count": 48, "merge_grow_prob": 0.78, "merge_seed_edge_count": 6},
+    2: {"merge_edge_count": 30, "merge_grow_prob": 0.76, "merge_seed_edge_count": 5},
+    3: {"merge_edge_count": 0, "merge_grow_prob": 0.0, "merge_seed_edge_count": 1},
+}
+
+
+def build_indoor_curriculum_map(
+    *,
+    size: int,
+    seed: int,
+    stage: int,
+    room_inner: int = 8,
+    wall_thickness: int = 1,
+    door_width: int = 2,
+    extra_connection_prob: float = 0.35,
+    two_door_prob: float = 0.2,
+    ensure_start_clear: bool = True,
+    return_metadata: bool = False,
+):
+    if int(stage) not in INDOOR_CURRICULUM_SPECS:
+        raise ValueError(f"unsupported indoor curriculum stage: {stage}")
+    spec = dict(INDOOR_CURRICULUM_SPECS[int(stage)])
+    return build_indoor_map(
+        size=size,
+        seed=seed,
+        room_inner=room_inner,
+        wall_thickness=wall_thickness,
+        door_width=door_width,
+        extra_connection_prob=extra_connection_prob,
+        two_door_prob=two_door_prob,
+        ensure_start_clear=ensure_start_clear,
+        return_metadata=return_metadata,
+        **spec,
+    )
