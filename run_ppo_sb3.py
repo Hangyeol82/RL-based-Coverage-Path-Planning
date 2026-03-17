@@ -140,10 +140,11 @@ def _parse_args() -> argparse.Namespace:
         "--dtm-output-mode",
         type=str,
         default="six",
-        choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
+        choices=["six", "extent6", "axis2", "axis2km", "four", "port6", "port12"],
         help=(
             "DTM output channels: six, extent6, axis2(LR/UD), "
-            "axis2km(pass+known for LR/UD), four(legacy), or port12(side-to-side)."
+            "axis2km(pass+known for LR/UD), four(legacy), "
+            "port6(undirected side-to-side), or port12(side-to-side)."
         ),
     )
     p.add_argument(

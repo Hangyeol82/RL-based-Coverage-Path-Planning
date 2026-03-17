@@ -123,7 +123,7 @@ def _parse_args() -> argparse.Namespace:
         "--dtm-output-mode",
         type=str,
         default="axis2km",
-        choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
+        choices=["six", "extent6", "axis2", "axis2km", "four", "port6", "port12"],
         help="DTM output channels forwarded to run_ppo_sb3.py.",
     )
     p.add_argument(

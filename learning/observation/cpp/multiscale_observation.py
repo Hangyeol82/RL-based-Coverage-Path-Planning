@@ -65,6 +65,8 @@ class MultiScaleCPPObservationConfig:
     # - axis2: LR, UD only
     # - axis2km: LR/UD split into passable(0/1) + known(0/1)
     # - four: legacy projection to LR, UD, NW-SE, NE-SW
+    # - port6: undirected side-to-side transitions
+    #   [U<->R, U<->D, U<->L, R<->D, R<->L, D<->L]
     # - port12: directed side-to-side transitions
     #   [U->R, U->D, U->L, R->U, R->D, R->L, D->U, D->R, D->L, L->U, L->R, L->D]
     dtm_output_mode: str = "six"
@@ -131,6 +133,14 @@ class MultiScaleCPPObservationBuilder:
         "dtm_l_r",
         "dtm_l_d",
     )
+    _DTM_CHANNELS_PORT6 = (
+        "dtm_u_r",
+        "dtm_u_d",
+        "dtm_u_l",
+        "dtm_r_d",
+        "dtm_r_l",
+        "dtm_d_l",
+    )
     _CELL_PHASE_CHANNELS = (
         "cell_row_sin",
         "cell_row_cos",
@@ -168,9 +178,9 @@ class MultiScaleCPPObservationBuilder:
             raise ValueError("dtm_coarse_mode must be one of {'bfs', 'aggregate', 'aggregate_transfer'}")
         if self.config.unknown_policy not in {"keep", "as_free", "as_obstacle"}:
             raise ValueError("unknown_policy must be one of {'keep', 'as_free', 'as_obstacle'}")
-        if self.config.dtm_output_mode not in {"six", "extent6", "axis2", "axis2km", "four", "port12"}:
+        if self.config.dtm_output_mode not in {"six", "extent6", "axis2", "axis2km", "four", "port6", "port12"}:
             raise ValueError(
-                "dtm_output_mode must be one of {'six', 'extent6', 'axis2', 'axis2km', 'four', 'port12'}"
+                "dtm_output_mode must be one of {'six', 'extent6', 'axis2', 'axis2km', 'four', 'port6', 'port12'}"
             )
         if (
             self.config.dtm_output_mode == "extent6"
@@ -216,11 +226,13 @@ class MultiScaleCPPObservationBuilder:
         # side-to-side connectivity, not only LR/UD summaries.
         if self.config.dtm_output_mode in {"axis2", "axis2km", "port12"}:
             return "port12"
+        if self.config.dtm_output_mode == "port6":
+            return "port6"
         if self.config.dtm_output_mode in {"six", "four"}:
             return "six"
         if self.config.dtm_output_mode == "extent6":
             return "extent6"
-        return "port12"
+        return "port6"
 
     def _native_dtm_channels(self) -> int:
         mode = self._native_dtm_mode()
@@ -243,6 +255,8 @@ class MultiScaleCPPObservationBuilder:
                 dtm_names = self._DTM_CHANNELS_4_AXIS2KM
             elif self.config.dtm_output_mode == "four":
                 dtm_names = self._DTM_CHANNELS_4
+            elif self.config.dtm_output_mode == "port6":
+                dtm_names = self._DTM_CHANNELS_PORT6
             else:
                 dtm_names = self._DTM_CHANNELS_12
             names = self._BASELINE_CHANNELS + dtm_names
@@ -585,6 +599,8 @@ class MultiScaleCPPObservationBuilder:
             )
         if self.config.dtm_output_mode == "port12":
             return dtm_map
+        if self.config.dtm_output_mode == "port6":
+            return dtm_map
         if self.config.dtm_output_mode == "extent6":
             return dtm_map
         if self.config.dtm_output_mode == "six":
@@ -596,10 +612,14 @@ class MultiScaleCPPObservationBuilder:
                 out[1] = np.maximum(dtm_map[1], dtm_map[6])   # U->D or D->U
                 return out
             if dtm_map.shape[0] != 6:
-                raise ValueError("axis2 projection expects six- or port12-channel source DTM")
+                raise ValueError("axis2 projection expects six-, port6-, or port12-channel source DTM")
             out = np.empty((2, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
-            out[0] = dtm_map[0]  # LR
-            out[1] = dtm_map[1]  # UD
+            if native_mode == "port6":
+                out[0] = dtm_map[4]  # R<->L
+                out[1] = dtm_map[1]  # U<->D
+            else:
+                out[0] = dtm_map[0]  # LR
+                out[1] = dtm_map[1]  # UD
             return out
         if self.config.dtm_output_mode == "axis2km":
             if dtm_map.shape[0] == 12:
@@ -618,9 +638,13 @@ class MultiScaleCPPObservationBuilder:
                 out[3] = ud_known
                 return out
             if dtm_map.shape[0] != 6:
-                raise ValueError("axis2km projection expects six- or port12-channel source DTM")
-            lr = dtm_map[0]
-            ud = dtm_map[1]
+                raise ValueError("axis2km projection expects six-, port6-, or port12-channel source DTM")
+            if native_mode == "port6":
+                lr = dtm_map[4]
+                ud = dtm_map[1]
+            else:
+                lr = dtm_map[0]
+                ud = dtm_map[1]
             out = np.empty((4, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
             out[0] = (lr > 0.0).astype(np.float32)   # lr_pass
             out[1] = (ud > 0.0).astype(np.float32)   # ud_pass
@@ -659,7 +683,7 @@ class MultiScaleCPPObservationBuilder:
         *,
         dtm_mode: str,
     ) -> np.ndarray:
-        expected_ch = 6 if dtm_mode == "six" else 12
+        expected_ch = 12 if dtm_mode == "port12" else 6
         if dtm_block.ndim != 3 or dtm_block.shape[0] != expected_ch:
             raise ValueError(f"dtm_block must be [{expected_ch}, H, W]")
         if state_block.shape != dtm_block.shape[1:]:
@@ -682,6 +706,13 @@ class MultiScaleCPPObservationBuilder:
                 1: (0, 2, 3, 4, 5),  # right
                 2: (1, 2, 3, 4, 5),  # down
                 3: (0, 2, 3, 4, 5),  # left
+            }
+        elif dtm_mode == "port6":
+            side_related = {
+                0: (0, 1, 2),  # up
+                1: (0, 3, 4),  # right
+                2: (1, 3, 5),  # down
+                3: (2, 4, 5),  # left
             }
         else:
             side_related = {
@@ -736,6 +767,28 @@ class MultiScaleCPPObservationBuilder:
                     if float(ch[5]) > 0.5:
                         add_edge(w, n)
                         add_edge(s, e)
+                elif dtm_mode == "port6":
+                    # port6 channel order:
+                    # 0 U<->R, 1 U<->D, 2 U<->L,
+                    # 3 R<->D, 4 R<->L, 5 D<->L
+                    if float(ch[0]) > 0.5:
+                        add_edge(n, e)
+                        add_edge(e, n)
+                    if float(ch[1]) > 0.5:
+                        add_edge(n, s)
+                        add_edge(s, n)
+                    if float(ch[2]) > 0.5:
+                        add_edge(n, w)
+                        add_edge(w, n)
+                    if float(ch[3]) > 0.5:
+                        add_edge(e, s)
+                        add_edge(s, e)
+                    if float(ch[4]) > 0.5:
+                        add_edge(e, w)
+                        add_edge(w, e)
+                    if float(ch[5]) > 0.5:
+                        add_edge(s, w)
+                        add_edge(w, s)
                 else:
                     # port12 channel order:
                     # 0 U->R, 1 U->D, 2 U->L,
@@ -838,6 +891,20 @@ class MultiScaleCPPObservationBuilder:
             flags[5] = 1.0 if reachable(sw_nodes, ne_nodes) else 0.0
             return flags
 
+        if dtm_mode == "port6":
+            pairs = (
+                ("up", "right"),
+                ("up", "down"),
+                ("up", "left"),
+                ("right", "down"),
+                ("right", "left"),
+                ("down", "left"),
+            )
+            flags = np.zeros(6, dtype=np.float32)
+            for k, (a, b) in enumerate(pairs):
+                flags[k] = 1.0 if reachable(side_nodes[a], side_nodes[b]) else 0.0
+            return flags
+
         pairs = (
             ("up", "right"),
             ("up", "down"),
@@ -866,7 +933,7 @@ class MultiScaleCPPObservationBuilder:
         block: int,
     ) -> np.ndarray:
         dtm_mode = self._native_dtm_mode()
-        expected_ch = 6 if dtm_mode == "six" else 12
+        expected_ch = 12 if dtm_mode == "port12" else 6
         if dtm_fine.ndim != 3 or dtm_fine.shape[0] != expected_ch:
             raise ValueError(f"dtm_fine must be [{expected_ch}, H, W]")
         h, w = state_fine.shape
@@ -917,7 +984,7 @@ class MultiScaleCPPObservationBuilder:
         - uncertainty is carried by the child-side known/open flags themselves
         """
         dtm_mode = self._native_dtm_mode()
-        expected_ch = 6 if dtm_mode == "six" else 12
+        expected_ch = 12 if dtm_mode == "port12" else 6
         if dtm_child.ndim != 3 or dtm_child.shape[0] != expected_ch:
             raise ValueError(f"dtm_child must be [{expected_ch}, H, W]")
         if state_child.shape != dtm_child.shape[1:]:

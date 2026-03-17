@@ -275,6 +275,37 @@ def _direction_flags_from_mask12(
     return tuple(vals)
 
 
+def _direction_flags_from_mask_port6(
+    passable_mask: np.ndarray,
+    *,
+    connectivity: int,
+) -> Tuple[bool, ...]:
+    h, w = passable_mask.shape
+    if h <= 0 or w <= 0:
+        return (False,) * 6
+
+    labels = _component_labels(passable_mask, connectivity=connectivity)
+    side_ids = {
+        "up": _component_ids_from_cells(labels, cells=_side_cells(h, w, "up")),
+        "right": _component_ids_from_cells(labels, cells=_side_cells(h, w, "right")),
+        "down": _component_ids_from_cells(labels, cells=_side_cells(h, w, "down")),
+        "left": _component_ids_from_cells(labels, cells=_side_cells(h, w, "left")),
+    }
+
+    pairs = (
+        ("up", "right"),
+        ("up", "down"),
+        ("up", "left"),
+        ("right", "down"),
+        ("right", "left"),
+        ("down", "left"),
+    )
+    vals = []
+    for side_a, side_b in pairs:
+        vals.append(_components_connected(side_ids[side_a], side_ids[side_b]))
+    return tuple(vals)
+
+
 def _normalize_patch_size(patch_size: int, limit: int) -> int:
     if patch_size <= 0:
         raise ValueError("patch_size must be positive")
@@ -317,6 +348,10 @@ def compute_directional_traversability(
     - extent6:
       shape (6, H, W), same channel order as six.
       Values are continuous traversability extents in [0, 1].
+    - port6:
+      shape (6, H, W), channel order:
+      0) up<->right, 1) up<->down, 2) up<->left,
+      3) right<->down, 4) right<->left, 5) down<->left
     - port12:
       shape (12, H, W), channel order:
       0) up->right, 1) up->down, 2) up->left,
@@ -338,8 +373,8 @@ def compute_directional_traversability(
     if not (0.0 <= min_patch_known_ratio <= 1.0):
         raise ValueError("min_patch_known_ratio must be in [0, 1]")
     mode = str(output_mode).strip().lower()
-    if mode not in {"six", "extent6", "port12"}:
-        raise ValueError("output_mode must be one of {'six', 'extent6', 'port12'}")
+    if mode not in {"six", "extent6", "port6", "port12"}:
+        raise ValueError("output_mode must be one of {'six', 'extent6', 'port6', 'port12'}")
 
     h, w = state_grid.shape
     p = _normalize_patch_size(patch_size, limit=max(h, w))
@@ -413,6 +448,11 @@ def compute_directional_traversability(
                     free_mask,
                     connectivity=connectivity,
                 )
+            elif mode == "port6":
+                flags = _direction_flags_from_mask_port6(
+                    free_mask,
+                    connectivity=connectivity,
+                )
             else:
                 flags = _direction_flags_from_mask12(
                     free_mask,
@@ -452,6 +492,15 @@ def compute_directional_traversability(
                 connectivity=connectivity,
             )
             opt_flags = _direction_extent_from_mask6(
+                opt_mask,
+                connectivity=connectivity,
+            )
+        elif mode == "port6":
+            pess_flags = _direction_flags_from_mask_port6(
+                pess_mask,
+                connectivity=connectivity,
+            )
+            opt_flags = _direction_flags_from_mask_port6(
                 opt_mask,
                 connectivity=connectivity,
             )
