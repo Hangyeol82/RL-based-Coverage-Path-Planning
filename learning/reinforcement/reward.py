@@ -32,8 +32,7 @@ class CPPRewardConfig:
     constant_reward: float = -0.1
     constant_reward_always: bool = True
     # Discrete-grid shaping terms (applied in env step logic).
-    # - turn_change_penalty: applied when executed direction changes from previous step,
-    #   unless continuing previous direction is physically blocked.
+    # - turn_change_penalty: applied whenever executed direction changes from previous step.
     # - revisit_penalty: applied when stepping onto an already explored free cell.
     turn_change_penalty: float = -0.05
     revisit_penalty: float = -0.2

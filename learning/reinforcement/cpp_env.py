@@ -143,6 +143,9 @@ class CPPDiscreteEnv:
         self.recent_new_coverage: Deque[float] = deque(
             maxlen=max(1, int(self.config.robot_state.stagnation_window)),
         )
+        self.recent_actions: Deque[int] = deque(
+            maxlen=max(1, int(self.config.robot_state.action_history_len)),
+        )
 
         self.reset()
 
@@ -314,6 +317,7 @@ class CPPDiscreteEnv:
             explored=self.explored,
             robot_pos=self.current_pos,
             prev_pos=self.prev_pos,
+            recent_actions=list(self.recent_actions),
             recent_new_coverage=list(self.recent_new_coverage),
             extra_features=boundary_exit_features,
         )
@@ -550,6 +554,7 @@ class CPPDiscreteEnv:
         self.last_collision = False
         self.path = [self.current_pos]
         self.recent_new_coverage.clear()
+        self.recent_actions.clear()
         self._milestone_hit_90 = False
         self._milestone_hit_99 = False
 
@@ -636,11 +641,7 @@ class CPPDiscreteEnv:
         )
         base_reward = compute_cpp_reward(rew_in, self.config.reward)
         reward_turn = 0.0
-        if (
-            prev_action is not None
-            and executed_action != int(prev_action)
-            and not forced_turn
-        ):
+        if prev_action is not None and executed_action != int(prev_action):
             reward_turn = float(self.config.reward.turn_change_penalty)
 
         reward_overlap = 0.0
@@ -667,6 +668,7 @@ class CPPDiscreteEnv:
         self.steps += 1
         self.path.append(self.current_pos)
         self.prev_action = int(executed_action)
+        self.recent_actions.append(int(executed_action))
 
         done_reason = ""
         truncated = False

@@ -11,6 +11,8 @@ GridPos = Tuple[int, int]
 class RobotStateObservationConfig:
     # Number of recent steps used to measure stagnation.
     stagnation_window: int = 20
+    # Number of recent executed actions to encode in robot_state.
+    action_history_len: int = 5
 
 
 class RobotStateObservationBuilder:
@@ -25,23 +27,35 @@ class RobotStateObservationBuilder:
     """
 
     _DIR_INDEX = {"stay": 0, "up": 1, "right": 2, "down": 3, "left": 4}
+    _ACTION_INDEX = {0: 1, 1: 2, 2: 3, 3: 4}
 
     def __init__(self, config: Optional[RobotStateObservationConfig] = None):
         self.config = config or RobotStateObservationConfig()
 
-    @staticmethod
-    def feature_names() -> Tuple[str, ...]:
-        return (
+    def feature_names(self) -> Tuple[str, ...]:
+        names = [
             "pos_row_norm",
             "pos_col_norm",
-            "dir_stay",
-            "dir_up",
-            "dir_right",
-            "dir_down",
-            "dir_left",
-            "coverage_progress",
-            "stagnation_index",
+        ]
+        hist_len = max(1, int(self.config.action_history_len))
+        for t in range(hist_len):
+            suffix = f"action_hist_{t}"
+            names.extend(
+                [
+                    f"{suffix}_stay",
+                    f"{suffix}_up",
+                    f"{suffix}_right",
+                    f"{suffix}_down",
+                    f"{suffix}_left",
+                ]
+            )
+        names.extend(
+            [
+                "coverage_progress",
+                "stagnation_index",
+            ]
         )
+        return tuple(names)
 
     def _normalize_position(self, robot_pos: GridPos, shape: Tuple[int, int]) -> np.ndarray:
         h, w = shape
@@ -74,6 +88,36 @@ class RobotStateObservationBuilder:
         vec[self._DIR_INDEX[direction]] = 1.0
         return vec
 
+    def _action_history_one_hot(
+        self,
+        recent_actions: Optional[Sequence[int]],
+        *,
+        prev_pos: Optional[GridPos],
+        robot_pos: GridPos,
+    ) -> np.ndarray:
+        hist_len = max(1, int(self.config.action_history_len))
+        hist = []
+        if recent_actions is not None:
+            hist = [int(a) for a in recent_actions][-hist_len:]
+
+        if len(hist) == 0:
+            fallback = self._direction_one_hot(prev_pos, robot_pos)
+            out = [np.zeros(5, dtype=np.float32) for _ in range(hist_len)]
+            out[-1] = fallback
+            return np.concatenate(out, axis=0).astype(np.float32)
+
+        out = []
+        for act in hist:
+            vec = np.zeros(5, dtype=np.float32)
+            idx = self._ACTION_INDEX.get(int(act), 0)
+            vec[idx] = 1.0
+            out.append(vec)
+        while len(out) < hist_len:
+            vec = np.zeros(5, dtype=np.float32)
+            vec[self._DIR_INDEX["stay"]] = 1.0
+            out.insert(0, vec)
+        return np.concatenate(out, axis=0).astype(np.float32)
+
     def _coverage_progress(self, occupancy: np.ndarray, explored: np.ndarray) -> float:
         # Online setting: unknown (-1) must not be treated as free.
         known_free = occupancy == 0
@@ -101,6 +145,7 @@ class RobotStateObservationBuilder:
         explored: np.ndarray,
         robot_pos: GridPos,
         prev_pos: Optional[GridPos] = None,
+        recent_actions: Optional[Sequence[int]] = None,
         recent_new_coverage: Optional[Sequence[float]] = None,
         extra_features: Optional[Sequence[float]] = None,
     ) -> np.ndarray:
@@ -119,10 +164,14 @@ class RobotStateObservationBuilder:
                 raise ValueError(f"prev_pos {prev_pos} is out of bounds {(h, w)}")
 
         pos = self._normalize_position(robot_pos, (h, w))
-        direction = self._direction_one_hot(prev_pos, robot_pos)
+        action_hist = self._action_history_one_hot(
+            recent_actions,
+            prev_pos=prev_pos,
+            robot_pos=robot_pos,
+        )
         progress = np.array([self._coverage_progress(occupancy, explored)], dtype=np.float32)
         stagnation = np.array([self._stagnation_index(recent_new_coverage)], dtype=np.float32)
-        base = np.concatenate([pos, direction, progress, stagnation], axis=0).astype(np.float32)
+        base = np.concatenate([pos, action_hist, progress, stagnation], axis=0).astype(np.float32)
         if extra_features is None:
             return base
         extra = np.asarray(list(extra_features), dtype=np.float32).reshape(-1)
