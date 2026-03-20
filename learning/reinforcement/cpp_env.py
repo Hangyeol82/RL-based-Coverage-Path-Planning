@@ -130,6 +130,7 @@ class CPPDiscreteEnv:
         self.steps = 0
         self.done = False
         self.last_collision = False
+        self.overlap_streak = 0
         self.last_reward = CPPRewardBreakdown(
             area=0.0,
             tv_local=0.0,
@@ -552,6 +553,7 @@ class CPPDiscreteEnv:
         self.steps = 0
         self.done = False
         self.last_collision = False
+        self.overlap_streak = 0
         self.path = [self.current_pos]
         self.recent_new_coverage.clear()
         self.recent_actions.clear()
@@ -644,9 +646,26 @@ class CPPDiscreteEnv:
         if prev_action is not None and executed_action != int(prev_action):
             reward_turn = float(self.config.reward.turn_change_penalty)
 
+        overlap_event = (not collided) and was_explored
+        if overlap_event:
+            self.overlap_streak += 1
+        else:
+            self.overlap_streak = 0
+
         reward_overlap = 0.0
-        if (not collided) and was_explored:
+        if overlap_event:
             reward_overlap = float(self.config.reward.revisit_penalty)
+            if bool(self.config.reward.overlap_streak_enabled):
+                grace = max(0, int(self.config.reward.overlap_streak_grace))
+                increment = max(0.0, float(self.config.reward.overlap_streak_increment))
+                base_abs = abs(float(self.config.reward.revisit_penalty))
+                max_abs = max(
+                    base_abs,
+                    max(0.0, float(self.config.reward.overlap_streak_max_abs)),
+                )
+                effective_streak = max(0, int(self.overlap_streak) - grace)
+                penalty_abs = min(base_abs + increment * float(effective_streak), max_abs)
+                reward_overlap = -float(penalty_abs)
 
         reward_milestone, milestone_hit_90_now, milestone_hit_99_now = self._compute_milestone_reward(
             prev_coverage_ratio=prev_coverage_ratio,
@@ -700,6 +719,7 @@ class CPPDiscreteEnv:
             "action_mask_valid_count": int(np.count_nonzero(action_mask)),
             "action_mask": [int(v) for v in action_mask.astype(np.int8)],
             "revisited_cell": bool((not collided) and was_explored),
+            "overlap_streak": int(self.overlap_streak),
             "reward_turn": float(reward_turn),
             "reward_overlap": float(reward_overlap),
             "reward_milestone": float(reward_milestone),

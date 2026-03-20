@@ -117,6 +117,27 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--milestone-threshold-99", type=float, default=0.99)
     p.add_argument("--milestone-lambda-90", type=float, default=0.2)
     p.add_argument("--milestone-lambda-99", type=float, default=4.0)
+    overlap_group = p.add_mutually_exclusive_group()
+    overlap_group.add_argument(
+        "--overlap-streak-penalty",
+        dest="overlap_streak_penalty",
+        action="store_true",
+        help="Increase overlap penalty when overlap repeats for many consecutive steps.",
+    )
+    overlap_group.add_argument(
+        "--no-overlap-streak-penalty",
+        dest="overlap_streak_penalty",
+        action="store_false",
+        help="Disable overlap-streak penalty acceleration.",
+    )
+    p.add_argument("--overlap-streak-grace", type=int, default=2)
+    p.add_argument("--overlap-streak-increment", type=float, default=0.05)
+    p.add_argument(
+        "--overlap-streak-max-abs",
+        type=float,
+        default=0.4,
+        help="Maximum absolute overlap penalty after streak acceleration.",
+    )
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument(
         "--obs-unknown-policy",
@@ -205,7 +226,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Require exact BC->PPO encoder key/shape match. Default loads shape-compatible subset.",
     )
-    p.set_defaults(action_mask=True, milestone_reward=False, boundary_exit_features=False)
+    p.set_defaults(
+        action_mask=True,
+        milestone_reward=False,
+        overlap_streak_penalty=False,
+        boundary_exit_features=False,
+    )
     return p.parse_args()
 
 
@@ -479,6 +505,10 @@ def main():
         collision_reward=-10.0,
         constant_reward=-0.1,
         constant_reward_always=True,
+        overlap_streak_enabled=bool(args.overlap_streak_penalty),
+        overlap_streak_grace=int(args.overlap_streak_grace),
+        overlap_streak_increment=float(args.overlap_streak_increment),
+        overlap_streak_max_abs=float(args.overlap_streak_max_abs),
         milestone_reward_enabled=bool(args.milestone_reward),
         milestone_threshold_90=float(args.milestone_threshold_90),
         milestone_threshold_99=float(args.milestone_threshold_99),

@@ -103,6 +103,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--milestone-threshold-99", type=float, default=0.99)
     p.add_argument("--milestone-lambda-90", type=float, default=0.2)
     p.add_argument("--milestone-lambda-99", type=float, default=4.0)
+    overlap_group = p.add_mutually_exclusive_group()
+    overlap_group.add_argument("--overlap-streak-penalty", dest="overlap_streak_penalty", action="store_true")
+    overlap_group.add_argument("--no-overlap-streak-penalty", dest="overlap_streak_penalty", action="store_false")
+    p.add_argument("--overlap-streak-grace", type=int, default=2)
+    p.add_argument("--overlap-streak-increment", type=float, default=0.05)
+    p.add_argument("--overlap-streak-max-abs", type=float, default=0.4)
 
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
     p.add_argument(
@@ -176,7 +182,12 @@ def _parse_args() -> argparse.Namespace:
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument("--action-mask", dest="action_mask", action="store_true")
     mask_group.add_argument("--no-action-mask", dest="action_mask", action="store_false")
-    p.set_defaults(action_mask=True, milestone_reward=False, boundary_exit_features=False)
+    p.set_defaults(
+        action_mask=True,
+        milestone_reward=False,
+        overlap_streak_penalty=False,
+        boundary_exit_features=False,
+    )
 
     p.add_argument(
         "--init-from-bc",
@@ -344,6 +355,12 @@ def _build_run_cmd(
         str(float(args.milestone_lambda_90)),
         "--milestone-lambda-99",
         str(float(args.milestone_lambda_99)),
+        "--overlap-streak-grace",
+        str(int(args.overlap_streak_grace)),
+        "--overlap-streak-increment",
+        str(float(args.overlap_streak_increment)),
+        "--overlap-streak-max-abs",
+        str(float(args.overlap_streak_max_abs)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
         "--model-size",
@@ -383,6 +400,10 @@ def _build_run_cmd(
         cmd.append("--milestone-reward")
     else:
         cmd.append("--no-milestone-reward")
+    if args.overlap_streak_penalty:
+        cmd.append("--overlap-streak-penalty")
+    else:
+        cmd.append("--no-overlap-streak-penalty")
     if init_from_bc:
         cmd += ["--init-from-bc", init_from_bc]
         if args.init_from_bc_strict:

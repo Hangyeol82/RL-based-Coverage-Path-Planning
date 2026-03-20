@@ -36,6 +36,14 @@ class CPPRewardConfig:
     # - revisit_penalty: applied when stepping onto an already explored free cell.
     turn_change_penalty: float = -0.05
     revisit_penalty: float = -0.2
+    # Optional overlap-streak shaping:
+    # total overlap penalty magnitude grows from abs(revisit_penalty) by
+    # overlap_streak_increment after overlap_streak_grace repeated overlap steps,
+    # capped at overlap_streak_max_abs.
+    overlap_streak_enabled: bool = False
+    overlap_streak_grace: int = 2
+    overlap_streak_increment: float = 0.05
+    overlap_streak_max_abs: float = 0.4
     # Coverage milestone shaping (applied in env step logic, once per episode).
     # Bonus_i = milestone_lambda_i * (1 - milestone_threshold_i) * free_total * newly_visited_reward_scale
     milestone_reward_enabled: bool = False
