@@ -81,6 +81,19 @@ def _parse_args() -> argparse.Namespace:
         help="Optional comma list overriding MAPS local block sizes, e.g. 1,2,4,8",
     )
     p.add_argument("--max-episode-steps", type=int, default=1500)
+    collision_group = p.add_mutually_exclusive_group()
+    collision_group.add_argument(
+        "--collision-ends-episode",
+        dest="collision_ends_episode",
+        action="store_true",
+        help="End the episode immediately on collision.",
+    )
+    collision_group.add_argument(
+        "--no-collision-ends-episode",
+        dest="collision_ends_episode",
+        action="store_false",
+        help="Keep the episode running after collision.",
+    )
     boundary_group = p.add_mutually_exclusive_group()
     boundary_group.add_argument(
         "--boundary-exit-features",
@@ -145,6 +158,25 @@ def _parse_args() -> argparse.Namespace:
         default="keep",
         choices=["keep", "as_free", "as_obstacle"],
         help="How to handle unknown cells in map-observation channels.",
+    )
+    visit_group = p.add_mutually_exclusive_group()
+    visit_group.add_argument(
+        "--include-log-visit-channel",
+        dest="include_log_visit_channel",
+        action="store_true",
+        help="Append a log-scaled visit-count channel to every MAPS level.",
+    )
+    visit_group.add_argument(
+        "--no-log-visit-channel",
+        dest="include_log_visit_channel",
+        action="store_false",
+        help="Disable the log-scaled visit-count channel.",
+    )
+    p.add_argument(
+        "--log-visit-cap",
+        type=float,
+        default=20.0,
+        help="Saturation cap for log visit encoding: log1p(count)/log1p(cap).",
     )
     p.add_argument(
         "--dtm-coarse-mode",
@@ -231,6 +263,8 @@ def _parse_args() -> argparse.Namespace:
         milestone_reward=False,
         overlap_streak_penalty=False,
         boundary_exit_features=False,
+        include_log_visit_channel=False,
+        collision_ends_episode=False,
     )
     return p.parse_args()
 
@@ -518,7 +552,7 @@ def main():
     env_cfg = CPPDiscreteEnvConfig(
         sensor_range=args.sensor_range,
         max_steps=args.max_episode_steps,
-        collision_ends_episode=False,
+        collision_ends_episode=bool(args.collision_ends_episode),
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
         use_boundary_exit_features=bool(args.boundary_exit_features),
@@ -529,6 +563,8 @@ def main():
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_connectivity=int(args.dtm_connectivity),
+            include_log_visit_channel=bool(args.include_log_visit_channel),
+            log_visit_cap=float(args.log_visit_cap),
         ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
@@ -647,6 +683,7 @@ def main():
         f" rollout_batch={args.n_steps * args.num_envs},"
         f" batch_size={args.batch_size}, n_epochs={args.n_epochs}"
     )
+    print(f"Collision ends episode: {bool(args.collision_ends_episode)}")
     print(
         "Milestone reward:"
         f" enabled={bool(args.milestone_reward)},"

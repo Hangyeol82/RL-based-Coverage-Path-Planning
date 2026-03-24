@@ -74,6 +74,10 @@ class MultiScaleCPPObservationConfig:
     # [sin(row_phase), cos(row_phase), sin(col_phase), cos(col_phase)].
     # This helps disambiguate where the robot is inside each coarse cell.
     include_cell_phase_channels: bool = True
+    # Optional revisit-memory channel:
+    # log1p(visit_count) / log1p(log_visit_cap), clipped to [0, 1].
+    include_log_visit_channel: bool = False
+    log_visit_cap: float = 20.0
 
 
 class MultiScaleCPPObservationBuilder:
@@ -147,6 +151,7 @@ class MultiScaleCPPObservationBuilder:
         "cell_col_sin",
         "cell_col_cos",
     )
+    _VISIT_CHANNELS = ("visit_log",)
 
     def __init__(
         self,
@@ -178,6 +183,8 @@ class MultiScaleCPPObservationBuilder:
             raise ValueError("dtm_coarse_mode must be one of {'bfs', 'aggregate', 'aggregate_transfer'}")
         if self.config.unknown_policy not in {"keep", "as_free", "as_obstacle"}:
             raise ValueError("unknown_policy must be one of {'keep', 'as_free', 'as_obstacle'}")
+        if float(self.config.log_visit_cap) <= 0.0:
+            raise ValueError("log_visit_cap must be positive")
         if self.config.dtm_output_mode not in {"six", "extent6", "axis2", "axis2km", "four", "port6", "port12"}:
             raise ValueError(
                 "dtm_output_mode must be one of {'six', 'extent6', 'axis2', 'axis2km', 'four', 'port6', 'port12'}"
@@ -262,6 +269,8 @@ class MultiScaleCPPObservationBuilder:
             names = self._BASELINE_CHANNELS + dtm_names
         else:
             names = self._BASELINE_CHANNELS
+        if self.config.include_log_visit_channel:
+            names = names + self._VISIT_CHANNELS
         if self.config.include_cell_phase_channels:
             names = names + self._CELL_PHASE_CHANNELS
         return names
@@ -1076,6 +1085,7 @@ class MultiScaleCPPObservationBuilder:
         state_map: Optional[np.ndarray],
         known_ratio_map: Optional[np.ndarray],
         dtm_map: Optional[np.ndarray] = None,
+        visit_map: Optional[np.ndarray] = None,
         *,
         center: Optional[GridPos],
         out_size: int,
@@ -1124,6 +1134,14 @@ class MultiScaleCPPObservationBuilder:
                     )
             else:
                 channels.extend([dtm[k] for k in range(int(dtm.shape[0]))])
+
+        if self.config.include_log_visit_channel:
+            if visit_map is None:
+                raise RuntimeError("visit_map is required when include_log_visit_channel=True")
+            if center is not None:
+                channels.append(center_crop_with_pad(visit_map, center, out_size, out_size, pad_value=0.0))
+            else:
+                channels.append(visit_map.astype(np.float32))
 
         if self.config.include_cell_phase_channels:
             if cell_phase is None:
@@ -1341,12 +1359,18 @@ class MultiScaleCPPObservationBuilder:
         *,
         robot_pos: GridPos,
         explored: np.ndarray,
+        visit_map: Optional[np.ndarray] = None,
     ) -> Dict[int, np.ndarray]:
         t_total = perf_counter() if self._profile_enabled else 0.0
         if occupancy.ndim != 2:
             raise ValueError("occupancy must be 2D")
         if explored.shape != occupancy.shape:
             raise ValueError("explored shape must match occupancy shape")
+        if self.config.include_log_visit_channel:
+            if visit_map is None:
+                raise ValueError("visit_map is required when include_log_visit_channel=True")
+            if visit_map.shape != occupancy.shape:
+                raise ValueError("visit_map shape must match occupancy shape")
 
         h, w = occupancy.shape
         rr, cc = robot_pos
@@ -1386,6 +1410,7 @@ class MultiScaleCPPObservationBuilder:
         covered_f = covered.astype(np.float32)
         obstacle_f = known_obstacle.astype(np.float32)
         frontier_f = frontier.astype(np.float32)
+        visit_f = visit_map.astype(np.float32, copy=False) if visit_map is not None else None
         changed_f = occupancy_changed if self.include_dtm else None
         dtm_fine = None
         state_fine = None
@@ -1431,6 +1456,9 @@ class MultiScaleCPPObservationBuilder:
             if self._profile_enabled:
                 self._profile_add("local_reduce", perf_counter() - t0)
             dtm_coarse = None
+            visit_coarse = None
+            if self.config.include_log_visit_channel:
+                visit_coarse = block_reduce_mean(visit_f, block)
             if self.include_dtm:
                 t1 = perf_counter() if self._profile_enabled else 0.0
                 if self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
@@ -1504,6 +1532,7 @@ class MultiScaleCPPObservationBuilder:
                 state_coarse,
                 known_ratio_coarse,
                 dtm_coarse,
+                visit_coarse,
                 center=center_coarse,
                 out_size=self.config.local_window_size,
                 cell_phase=cell_phase_local,
@@ -1533,6 +1562,9 @@ class MultiScaleCPPObservationBuilder:
         if self._profile_enabled:
             self._profile_add("global_reduce", perf_counter() - t0)
         dtm_global = None
+        visit_global = None
+        if self.config.include_log_visit_channel:
+            visit_global = global_reduce_mean(visit_f, gsize, gsize)
         if self.include_dtm:
             t1 = perf_counter() if self._profile_enabled else 0.0
             if self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
@@ -1594,6 +1626,7 @@ class MultiScaleCPPObservationBuilder:
             state_global,
             known_ratio_global,
             dtm_global,
+            visit_global,
             center=None,
             out_size=gsize,
             cell_phase=cell_phase_global,

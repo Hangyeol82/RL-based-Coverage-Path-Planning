@@ -123,6 +123,7 @@ class CPPDiscreteEnv:
         self._default_start = self._resolve_start(start_pos)
         self.known_map = np.full_like(self.true_map, fill_value=-1, dtype=np.int32)
         self.explored = np.zeros_like(self.true_map, dtype=bool)
+        self.visit_counts = np.zeros_like(self.true_map, dtype=np.int32)
         self.current_pos: GridPos = self._default_start
         self.prev_pos: Optional[GridPos] = None
         self.prev_action: Optional[int] = None
@@ -190,6 +191,16 @@ class CPPDiscreteEnv:
     def _coverage_ratio(self) -> float:
         covered = int(np.count_nonzero(self.explored & self.free_mask))
         return float(covered) / float(max(1, self.free_total))
+
+    def _increment_visit_count(self, pos: GridPos):
+        rr, cc = pos
+        if self.true_map[rr, cc] == 0:
+            self.visit_counts[rr, cc] += 1
+
+    def _visit_log_map_float(self) -> np.ndarray:
+        cap = max(1.0, float(self.config.observation.log_visit_cap))
+        visit = np.log1p(self.visit_counts.astype(np.float32)) / np.log1p(cap)
+        return np.clip(visit, 0.0, 1.0).astype(np.float32)
 
     def _compute_milestone_reward(
         self,
@@ -282,11 +293,15 @@ class CPPDiscreteEnv:
 
     def _build_observation(self) -> Dict[str, object]:
         t_total = perf_counter() if self._profile_observation else 0.0
+        visit_map = None
+        if self.config.observation.include_log_visit_channel:
+            visit_map = self._visit_log_map_float()
         t0 = perf_counter() if self._profile_observation else 0.0
         levels = self.maps_builder.build_levels(
             self.known_map,
             robot_pos=self.current_pos,
             explored=self.explored,
+            visit_map=visit_map,
         )
         if self._profile_observation:
             self._profile_add("env_build_levels", perf_counter() - t0)
@@ -303,6 +318,7 @@ class CPPDiscreteEnv:
                     self.known_map,
                     robot_pos=self.current_pos,
                     explored=self.explored,
+                    visit_map=visit_map,
                 )
                 if self._profile_observation:
                     self._merge_builder_profile(
@@ -562,11 +578,13 @@ class CPPDiscreteEnv:
 
         self.known_map.fill(-1)
         self.explored.fill(False)
+        self.visit_counts.fill(0)
         self.maps_builder.reset_incremental_state()
         if self._boundary_maps_builder is not None:
             self._boundary_maps_builder.reset_incremental_state()
         self._sense_at(self.current_pos)
         self._mark_explored(self.current_pos)
+        self._increment_visit_count(self.current_pos)
 
         self.last_reward = CPPRewardBreakdown(
             area=0.0,
@@ -620,6 +638,8 @@ class CPPDiscreteEnv:
         self.last_collision = collided
         self.prev_pos = prev
         self._sense_at(self.current_pos)
+        if not collided:
+            self._increment_visit_count(self.current_pos)
 
         was_explored = bool(self.explored[self.current_pos]) if not collided else False
         prev_coverage_cells = int(np.count_nonzero(self.explored & self.free_mask))

@@ -90,6 +90,9 @@ def _parse_args() -> argparse.Namespace:
         help="Optional comma list forwarded to run_ppo_sb3.py, e.g. 1,2,4,8",
     )
     p.add_argument("--max-episode-steps", type=int, default=2000)
+    collision_group = p.add_mutually_exclusive_group()
+    collision_group.add_argument("--collision-ends-episode", dest="collision_ends_episode", action="store_true")
+    collision_group.add_argument("--no-collision-ends-episode", dest="collision_ends_episode", action="store_false")
 
     boundary_group = p.add_mutually_exclusive_group()
     boundary_group.add_argument("--boundary-exit-features", dest="boundary_exit_features", action="store_true")
@@ -146,6 +149,25 @@ def _parse_args() -> argparse.Namespace:
         choices=["keep", "as_free", "as_obstacle"],
         help="Unknown-cell handling forwarded to run_ppo_sb3.py map-observation builder.",
     )
+    visit_group = p.add_mutually_exclusive_group()
+    visit_group.add_argument(
+        "--include-log-visit-channel",
+        dest="include_log_visit_channel",
+        action="store_true",
+        help="Forward a log-scaled visit-count channel to run_ppo_sb3.py.",
+    )
+    visit_group.add_argument(
+        "--no-log-visit-channel",
+        dest="include_log_visit_channel",
+        action="store_false",
+        help="Disable the log-scaled visit-count channel forwarding.",
+    )
+    p.add_argument(
+        "--log-visit-cap",
+        type=float,
+        default=20.0,
+        help="Saturation cap forwarded to run_ppo_sb3.py for log visit encoding.",
+    )
     p.add_argument("--include-dtm", action="store_true")
 
     p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"])
@@ -187,6 +209,7 @@ def _parse_args() -> argparse.Namespace:
         milestone_reward=False,
         overlap_streak_penalty=False,
         boundary_exit_features=False,
+        collision_ends_episode=False,
     )
 
     p.add_argument(
@@ -345,6 +368,7 @@ def _build_run_cmd(
         str(args.local_blocks),
         "--max-episode-steps",
         str(int(args.max_episode_steps)),
+        "--collision-ends-episode" if args.collision_ends_episode else "--no-collision-ends-episode",
         "--boundary-exit-threshold",
         str(float(args.boundary_exit_threshold)),
         "--milestone-threshold-90",
@@ -373,6 +397,8 @@ def _build_run_cmd(
         str(int(args.dtm_connectivity)),
         "--obs-unknown-policy",
         str(args.obs_unknown_policy),
+        "--log-visit-cap",
+        str(float(args.log_visit_cap)),
         "--map-source",
         "file",
         "--map-file",
@@ -388,6 +414,8 @@ def _build_run_cmd(
     ]
     if args.include_dtm:
         cmd.append("--include-dtm")
+    if bool(args.include_log_visit_channel):
+        cmd.append("--include-log-visit-channel")
     if args.action_mask:
         cmd.append("--action-mask")
     else:

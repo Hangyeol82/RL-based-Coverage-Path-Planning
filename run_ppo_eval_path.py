@@ -52,6 +52,19 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
+    collision_group = p.add_mutually_exclusive_group()
+    collision_group.add_argument(
+        "--collision-ends-episode",
+        dest="collision_ends_episode",
+        action="store_true",
+        help="End the episode immediately on collision during eval.",
+    )
+    collision_group.add_argument(
+        "--no-collision-ends-episode",
+        dest="collision_ends_episode",
+        action="store_false",
+        help="Keep the episode running after collision during eval.",
+    )
     boundary_group = p.add_mutually_exclusive_group()
     boundary_group.add_argument(
         "--boundary-exit-features",
@@ -73,6 +86,25 @@ def _parse_args() -> argparse.Namespace:
         default="keep",
         choices=["keep", "as_free", "as_obstacle"],
         help="How to handle unknown cells in map-observation channels.",
+    )
+    visit_group = p.add_mutually_exclusive_group()
+    visit_group.add_argument(
+        "--include-log-visit-channel",
+        dest="include_log_visit_channel",
+        action="store_true",
+        help="Append a log-scaled visit-count channel to every MAPS level.",
+    )
+    visit_group.add_argument(
+        "--no-log-visit-channel",
+        dest="include_log_visit_channel",
+        action="store_false",
+        help="Disable the log-scaled visit-count channel.",
+    )
+    p.add_argument(
+        "--log-visit-cap",
+        type=float,
+        default=20.0,
+        help="Saturation cap for log visit encoding: log1p(count)/log1p(cap).",
     )
     p.add_argument(
         "--dtm-output-mode",
@@ -117,7 +149,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Sample actions from policy distribution.",
     )
-    p.set_defaults(action_mask=True, boundary_exit_features=False)
+    p.set_defaults(
+        action_mask=True,
+        boundary_exit_features=False,
+        include_log_visit_channel=False,
+        collision_ends_episode=False,
+    )
     p.set_defaults(deterministic=True)
 
     p.add_argument("--save-path-json", type=str, default="")
@@ -304,15 +341,18 @@ def main():
     env_cfg = CPPDiscreteEnvConfig(
         sensor_range=args.sensor_range,
         max_steps=args.max_episode_steps,
-        collision_ends_episode=False,
+        collision_ends_episode=bool(args.collision_ends_episode),
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
         use_boundary_exit_features=bool(args.boundary_exit_features),
         boundary_exit_threshold=float(args.boundary_exit_threshold),
         observation=MultiScaleCPPObservationConfig(
+            local_blocks=args.local_blocks or MultiScaleCPPObservationConfig().local_blocks,
             unknown_policy=str(args.obs_unknown_policy),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
+            include_log_visit_channel=bool(args.include_log_visit_channel),
+            log_visit_cap=float(args.log_visit_cap),
         ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
