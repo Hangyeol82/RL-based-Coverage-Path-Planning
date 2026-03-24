@@ -72,6 +72,21 @@ def _parse_args() -> argparse.Namespace:
         choices=[0, 1, 2],
         help="SB3 PPO verbosity level.",
     )
+    recurrent_group = p.add_mutually_exclusive_group()
+    recurrent_group.add_argument(
+        "--use-lstm",
+        dest="use_lstm",
+        action="store_true",
+        help="Use RecurrentPPO with MultiInputLstmPolicy after the fused MAPS encoder.",
+    )
+    recurrent_group.add_argument(
+        "--no-lstm",
+        dest="use_lstm",
+        action="store_false",
+        help="Use the default feedforward PPO policy.",
+    )
+    p.add_argument("--lstm-hidden-size", type=int, default=256)
+    p.add_argument("--lstm-layers", type=int, default=1)
 
     p.add_argument("--sensor-range", type=int, default=2, help="2 -> 5x5 sensing window")
     p.add_argument(
@@ -231,6 +246,7 @@ def _parse_args() -> argparse.Namespace:
         milestone_reward=False,
         overlap_streak_penalty=False,
         boundary_exit_features=False,
+        use_lstm=False,
     )
     return p.parse_args()
 
@@ -477,7 +493,24 @@ def main():
 
     AlgoClass = SB3PPO
     algo_name = "PPO"
-    if args.action_mask:
+    policy_name = "MultiInputPolicy"
+    if args.use_lstm:
+        try:
+            from sb3_contrib import RecurrentPPO  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "RecurrentPPO is required when --use-lstm is enabled."
+            ) from exc
+        AlgoClass = RecurrentPPO
+        algo_name = "RecurrentPPO"
+        policy_name = "MultiInputLstmPolicy"
+        if args.action_mask:
+            print(
+                "[WARN] RecurrentPPO does not provide maskable recurrent policy here; "
+                "continuing with env-side action masking only.",
+                flush=True,
+            )
+    elif args.action_mask:
         try:
             from sb3_contrib import MaskablePPO  # type: ignore
         except Exception:
@@ -586,6 +619,13 @@ def main():
         features_extractor_kwargs=dict(encoder_config=encoder_cfg),
         net_arch=dict(pi=[128, 128], vf=[128, 128]),
     )
+    if args.use_lstm:
+        policy_kwargs.update(
+            lstm_hidden_size=int(args.lstm_hidden_size),
+            n_lstm_layers=int(args.lstm_layers),
+            shared_lstm=False,
+            enable_critic_lstm=True,
+        )
 
     if args.load_model:
         try:
@@ -605,7 +645,7 @@ def main():
         model.set_random_seed(args.seed)
     else:
         model = AlgoClass(
-            policy="MultiInputPolicy",
+            policy=policy_name,
             env=vec_env,
             learning_rate=args.lr,
             n_steps=args.n_steps,

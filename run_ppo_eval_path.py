@@ -42,6 +42,19 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model", type=str, required=True, help="SB3 model .zip path or extracted model directory.")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    recurrent_group = p.add_mutually_exclusive_group()
+    recurrent_group.add_argument(
+        "--use-lstm",
+        dest="use_lstm",
+        action="store_true",
+        help="Load the model with RecurrentPPO/MultiInputLstmPolicy semantics.",
+    )
+    recurrent_group.add_argument(
+        "--no-lstm",
+        dest="use_lstm",
+        action="store_false",
+        help="Load the model as a feedforward PPO/MaskablePPO policy.",
+    )
 
     p.add_argument("--map-source", type=str, default="file", choices=["file", "random", "custom"])
     p.add_argument("--map-file", type=str, default="map/indoor_seed101.txt")
@@ -117,7 +130,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Sample actions from policy distribution.",
     )
-    p.set_defaults(action_mask=True, boundary_exit_features=False)
+    p.set_defaults(action_mask=True, boundary_exit_features=False, use_lstm=False)
     p.set_defaults(deterministic=True)
 
     p.add_argument("--save-path-json", type=str, default="")
@@ -272,7 +285,24 @@ def main():
     AlgoLoader = SB3PPO
     algo_name = "PPO"
     use_maskable_predict = False
-    if args.action_mask:
+    use_recurrent_predict = False
+    if args.use_lstm:
+        try:
+            from sb3_contrib import RecurrentPPO  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "RecurrentPPO is required when --use-lstm is enabled for eval."
+            ) from exc
+        AlgoLoader = RecurrentPPO
+        algo_name = "RecurrentPPO"
+        use_recurrent_predict = True
+        if args.action_mask:
+            print(
+                "[WARN] RecurrentPPO eval does not use maskable recurrent predict here; "
+                "continuing with env-side action masking only.",
+                flush=True,
+            )
+    elif args.action_mask:
         try:
             from sb3_contrib import MaskablePPO  # type: ignore
         except Exception:
@@ -336,6 +366,8 @@ def main():
             else:
                 raise
         obs, _ = env.reset()
+        lstm_states = None
+        episode_starts = np.ones((1,), dtype=bool)
 
         path: list[GridPos] = [start]
         total_reward = 0.0
@@ -344,7 +376,14 @@ def main():
         final_info: Dict = {}
 
         for _ in range(int(args.max_episode_steps)):
-            if use_maskable_predict:
+            if use_recurrent_predict:
+                action, lstm_states = model.predict(
+                    obs,
+                    state=lstm_states,
+                    episode_start=episode_starts,
+                    deterministic=bool(args.deterministic),
+                )
+            elif use_maskable_predict:
                 action, _ = model.predict(
                     obs,
                     action_masks=env.action_masks(),
@@ -361,6 +400,7 @@ def main():
             pos = info.get("position", path[-1])
             path.append((int(pos[0]), int(pos[1])))
             final_info = info
+            episode_starts[...] = bool(terminated or truncated)
             if terminated or truncated:
                 break
 

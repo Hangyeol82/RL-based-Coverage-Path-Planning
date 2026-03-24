@@ -118,6 +118,11 @@ def _parse_args() -> argparse.Namespace:
         choices=["small", "large", "xlarge"],
         help="Forwarded to run_ppo_sb3.py encoder size preset.",
     )
+    recurrent_group = p.add_mutually_exclusive_group()
+    recurrent_group.add_argument("--use-lstm", dest="use_lstm", action="store_true")
+    recurrent_group.add_argument("--no-lstm", dest="use_lstm", action="store_false")
+    p.add_argument("--lstm-hidden-size", type=int, default=256)
+    p.add_argument("--lstm-layers", type=int, default=1)
     p.add_argument(
         "--dtm-coarse-mode",
         type=str,
@@ -187,6 +192,7 @@ def _parse_args() -> argparse.Namespace:
         milestone_reward=False,
         overlap_streak_penalty=False,
         boundary_exit_features=False,
+        use_lstm=False,
     )
 
     p.add_argument(
@@ -365,6 +371,10 @@ def _build_run_cmd(
         args.maps_encoder_mode,
         "--model-size",
         args.model_size,
+        "--lstm-hidden-size",
+        str(int(args.lstm_hidden_size)),
+        "--lstm-layers",
+        str(int(args.lstm_layers)),
         "--dtm-coarse-mode",
         str(args.dtm_coarse_mode),
         "--dtm-output-mode",
@@ -388,6 +398,10 @@ def _build_run_cmd(
     ]
     if args.include_dtm:
         cmd.append("--include-dtm")
+    if args.use_lstm:
+        cmd.append("--use-lstm")
+    else:
+        cmd.append("--no-lstm")
     if args.action_mask:
         cmd.append("--action-mask")
     else:
