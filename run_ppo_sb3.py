@@ -96,6 +96,19 @@ def _parse_args() -> argparse.Namespace:
         help="Optional comma list overriding MAPS local block sizes, e.g. 1,2,4,8",
     )
     p.add_argument("--max-episode-steps", type=int, default=1500)
+    collision_group = p.add_mutually_exclusive_group()
+    collision_group.add_argument(
+        "--collision-ends-episode",
+        dest="collision_ends_episode",
+        action="store_true",
+        help="End the episode immediately on collision.",
+    )
+    collision_group.add_argument(
+        "--no-collision-ends-episode",
+        dest="collision_ends_episode",
+        action="store_false",
+        help="Keep the episode running after collision.",
+    )
     boundary_group = p.add_mutually_exclusive_group()
     boundary_group.add_argument(
         "--boundary-exit-features",
@@ -247,6 +260,7 @@ def _parse_args() -> argparse.Namespace:
         overlap_streak_penalty=False,
         boundary_exit_features=False,
         use_lstm=False,
+        collision_ends_episode=False,
     )
     return p.parse_args()
 
@@ -551,7 +565,7 @@ def main():
     env_cfg = CPPDiscreteEnvConfig(
         sensor_range=args.sensor_range,
         max_steps=args.max_episode_steps,
-        collision_ends_episode=False,
+        collision_ends_episode=bool(args.collision_ends_episode),
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
         use_boundary_exit_features=bool(args.boundary_exit_features),
@@ -687,6 +701,7 @@ def main():
         f" rollout_batch={args.n_steps * args.num_envs},"
         f" batch_size={args.batch_size}, n_epochs={args.n_epochs}"
     )
+    print(f"Collision ends episode: {bool(args.collision_ends_episode)}")
     print(
         "Milestone reward:"
         f" enabled={bool(args.milestone_reward)},"

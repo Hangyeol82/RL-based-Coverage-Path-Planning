@@ -65,6 +65,19 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--sensor-range", type=int, default=2)
     p.add_argument("--max-episode-steps", type=int, default=2000)
+    collision_group = p.add_mutually_exclusive_group()
+    collision_group.add_argument(
+        "--collision-ends-episode",
+        dest="collision_ends_episode",
+        action="store_true",
+        help="End the episode immediately on collision during eval.",
+    )
+    collision_group.add_argument(
+        "--no-collision-ends-episode",
+        dest="collision_ends_episode",
+        action="store_false",
+        help="Keep the episode running after collision during eval.",
+    )
     boundary_group = p.add_mutually_exclusive_group()
     boundary_group.add_argument(
         "--boundary-exit-features",
@@ -130,7 +143,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Sample actions from policy distribution.",
     )
-    p.set_defaults(action_mask=True, boundary_exit_features=False, use_lstm=False)
+    p.set_defaults(
+        action_mask=True,
+        boundary_exit_features=False,
+        use_lstm=False,
+        collision_ends_episode=False,
+    )
     p.set_defaults(deterministic=True)
 
     p.add_argument("--save-path-json", type=str, default="")
@@ -334,7 +352,7 @@ def main():
     env_cfg = CPPDiscreteEnvConfig(
         sensor_range=args.sensor_range,
         max_steps=args.max_episode_steps,
-        collision_ends_episode=False,
+        collision_ends_episode=bool(args.collision_ends_episode),
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
         use_boundary_exit_features=bool(args.boundary_exit_features),

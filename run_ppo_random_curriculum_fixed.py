@@ -90,6 +90,9 @@ def _parse_args() -> argparse.Namespace:
         help="Optional comma list forwarded to run_ppo_sb3.py, e.g. 1,2,4,8",
     )
     p.add_argument("--max-episode-steps", type=int, default=2000)
+    collision_group = p.add_mutually_exclusive_group()
+    collision_group.add_argument("--collision-ends-episode", dest="collision_ends_episode", action="store_true")
+    collision_group.add_argument("--no-collision-ends-episode", dest="collision_ends_episode", action="store_false")
 
     boundary_group = p.add_mutually_exclusive_group()
     boundary_group.add_argument("--boundary-exit-features", dest="boundary_exit_features", action="store_true")
@@ -193,6 +196,7 @@ def _parse_args() -> argparse.Namespace:
         overlap_streak_penalty=False,
         boundary_exit_features=False,
         use_lstm=False,
+        collision_ends_episode=False,
     )
 
     p.add_argument(
@@ -351,6 +355,7 @@ def _build_run_cmd(
         str(args.local_blocks),
         "--max-episode-steps",
         str(int(args.max_episode_steps)),
+        "--collision-ends-episode" if args.collision_ends_episode else "--no-collision-ends-episode",
         "--boundary-exit-threshold",
         str(float(args.boundary_exit_threshold)),
         "--milestone-threshold-90",
