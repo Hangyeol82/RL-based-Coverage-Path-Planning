@@ -488,6 +488,13 @@ def _warm_start_encoder_from_bc(
 
 def main():
     args = _parse_args()
+    if bool(args.collision_ends_episode):
+        print(
+            "[WARN] collision-ends-episode is disabled in this branch; "
+            "collisions keep the robot in place and only apply reward penalty.",
+            flush=True,
+        )
+        args.collision_ends_episode = False
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
     if args.load_model and args.init_from_bc:
@@ -565,7 +572,7 @@ def main():
     env_cfg = CPPDiscreteEnvConfig(
         sensor_range=args.sensor_range,
         max_steps=args.max_episode_steps,
-        collision_ends_episode=bool(args.collision_ends_episode),
+        collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
         use_boundary_exit_features=bool(args.boundary_exit_features),
@@ -701,7 +708,7 @@ def main():
         f" rollout_batch={args.n_steps * args.num_envs},"
         f" batch_size={args.batch_size}, n_epochs={args.n_epochs}"
     )
-    print(f"Collision ends episode: {bool(args.collision_ends_episode)}")
+    print("Collision ends episode: False")
     print(
         "Milestone reward:"
         f" enabled={bool(args.milestone_reward)},"
