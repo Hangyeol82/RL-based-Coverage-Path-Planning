@@ -368,7 +368,7 @@ def _build_run_cmd(
         str(args.local_blocks),
         "--max-episode-steps",
         str(int(args.max_episode_steps)),
-        "--collision-ends-episode" if args.collision_ends_episode else "--no-collision-ends-episode",
+        "--no-collision-ends-episode",
         "--boundary-exit-threshold",
         str(float(args.boundary_exit_threshold)),
         "--milestone-threshold-90",
@@ -443,6 +443,13 @@ def _build_run_cmd(
 
 def main() -> None:
     args = _parse_args()
+    if bool(args.collision_ends_episode):
+        print(
+            "[WARN] collision-ends-episode is ignored in this branch; "
+            "training always uses stay-in-place collision handling.",
+            flush=True,
+        )
+        args.collision_ends_episode = False
     if args.total_timesteps <= 0:
         raise ValueError("--total-timesteps must be positive")
     if args.chunk_timesteps <= 0:
