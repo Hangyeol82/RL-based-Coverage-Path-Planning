@@ -53,6 +53,11 @@ class CPPDiscreteEnvConfig:
     use_boundary_exit_features: bool = False
     boundary_exit_threshold: float = 0.0
     boundary_exit_include_valid: bool = True
+    heuristic_loop_window: int = 20
+    heuristic_no_progress_k: int = 20
+    heuristic_force_loop_k: int = 30
+    heuristic_unique_threshold: int = 4
+    heuristic_override: bool = False
     profile_observation: bool = False
     profile_interval_steps: int = 200
     profile_name: str = ""
@@ -147,6 +152,11 @@ class CPPDiscreteEnv:
         self.recent_actions: Deque[int] = deque(
             maxlen=max(1, int(self.config.robot_state.action_history_len)),
         )
+        self.recent_positions: Deque[GridPos] = deque(
+            maxlen=max(4, int(self.config.heuristic_loop_window)),
+        )
+        self.visit_counts = np.zeros_like(self.true_map, dtype=np.int32)
+        self.no_progress_streak = 0
 
         self.reset()
 
@@ -312,6 +322,11 @@ class CPPDiscreteEnv:
             boundary_exit_features = self._build_boundary_exit_features(boundary_levels)
             if self._profile_observation:
                 self._profile_add("boundary_exit_features", perf_counter() - t0)
+        extra_features: List[float] = []
+        if boundary_exit_features is not None:
+            extra_features.extend(boundary_exit_features.astype(np.float32).tolist())
+        if bool(self.config.robot_state.include_heuristic_signals):
+            extra_features.extend(self._heuristic_signal_vector().tolist())
         t0 = perf_counter() if self._profile_observation else 0.0
         robot_state = self.robot_state_builder.build(
             occupancy=self.known_map,
@@ -320,7 +335,7 @@ class CPPDiscreteEnv:
             prev_pos=self.prev_pos,
             recent_actions=list(self.recent_actions),
             recent_new_coverage=list(self.recent_new_coverage),
-            extra_features=boundary_exit_features,
+            extra_features=extra_features,
         )
         if self._profile_observation:
             self._profile_add("robot_state", perf_counter() - t0)
@@ -546,6 +561,147 @@ class CPPDiscreteEnv:
                 best_action = action
         return best_action
 
+    def _recent_unique_positions(self) -> int:
+        if len(self.recent_positions) == 0:
+            return 0
+        return int(len(set(self.recent_positions)))
+
+    def _cycle2_detected(self) -> bool:
+        if len(self.recent_positions) < 4:
+            return False
+        p = list(self.recent_positions)
+        return bool(p[-1] == p[-3] and p[-2] == p[-4])
+
+    def _loop_status(self) -> Dict[str, float]:
+        window = max(4, int(self.config.heuristic_loop_window))
+        trigger = max(1, int(self.config.heuristic_no_progress_k))
+        force_trigger = max(trigger, int(self.config.heuristic_force_loop_k))
+        unique_threshold = max(1, int(self.config.heuristic_unique_threshold))
+        unique_recent = self._recent_unique_positions()
+        cycle2 = self._cycle2_detected()
+        low_support = unique_recent <= unique_threshold
+        force_loop = self.no_progress_streak >= force_trigger
+        loop_detected = bool(force_loop or cycle2 or (self.no_progress_streak >= trigger and low_support))
+        no_progress_norm = float(
+            np.clip(float(self.no_progress_streak) / float(max(1, trigger)), 0.0, 1.0)
+        )
+        recent_unique_fraction = float(
+            np.clip(float(unique_recent) / float(max(1, min(window, len(self.recent_positions)))), 0.0, 1.0)
+        )
+        return {
+            "no_progress_streak": float(self.no_progress_streak),
+            "recent_unique_positions": float(unique_recent),
+            "cycle2_detected": float(cycle2),
+            "force_loop_detected": float(force_loop),
+            "loop_detected": float(loop_detected),
+            "no_progress_norm": no_progress_norm,
+            "recent_unique_fraction": recent_unique_fraction,
+        }
+
+    def _heuristic_signal_vector(self) -> np.ndarray:
+        stats = self._loop_status()
+        return np.asarray(
+            [
+                float(stats["no_progress_norm"]),
+                float(stats["recent_unique_fraction"]),
+                float(stats["cycle2_detected"]),
+                float(stats["loop_detected"]),
+            ],
+            dtype=np.float32,
+        )
+
+    def _heuristic_action_from_mask(self, mask: np.ndarray) -> Optional[int]:
+        valid = np.flatnonzero(mask)
+        if valid.size == 0:
+            return None
+
+        cr, cc = self.current_pos
+        unknown = self.known_map == -1
+        known_free = self.known_map == 0
+
+        # If we already stand on a frontier-approach cell, prefer stepping into
+        # an adjacent unknown cell directly.
+        direct_unknown: List[int] = []
+        for a in valid:
+            action = int(a)
+            dr, dc = ACTION_TO_DELTA[action]
+            nr, nc = cr + dr, cc + dc
+            if 0 <= nr < self.rows and 0 <= nc < self.cols and unknown[nr, nc]:
+                direct_unknown.append(action)
+        if direct_unknown:
+            return int(direct_unknown[0])
+
+        # Reachable frontier targets are known-free cells adjacent to unknown.
+        frontier_targets = np.zeros_like(known_free, dtype=bool)
+        for rr in range(self.rows):
+            for cc2 in range(self.cols):
+                if not known_free[rr, cc2]:
+                    continue
+                for dr, dc in ACTION_TO_DELTA.values():
+                    nr, nc = rr + dr, cc2 + dc
+                    if 0 <= nr < self.rows and 0 <= nc < self.cols and unknown[nr, nc]:
+                        frontier_targets[rr, cc2] = True
+                        break
+
+        q: Deque[GridPos] = deque([self.current_pos])
+        parents: Dict[GridPos, Tuple[GridPos, int]] = {}
+        seen = {self.current_pos}
+        target: Optional[GridPos] = None
+
+        while q:
+            pos = q.popleft()
+            if pos != self.current_pos and frontier_targets[pos]:
+                target = pos
+                break
+            pr, pc = pos
+            for action, (dr, dc) in ACTION_TO_DELTA.items():
+                nr, nc = pr + dr, pc + dc
+                nxt = (nr, nc)
+                if nxt in seen:
+                    continue
+                if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                    continue
+                if not known_free[nr, nc]:
+                    continue
+                seen.add(nxt)
+                parents[nxt] = (pos, int(action))
+                q.append(nxt)
+
+        if target is not None:
+            cur = target
+            first_action = None
+            while cur in parents:
+                prev_pos, action = parents[cur]
+                first_action = int(action)
+                if prev_pos == self.current_pos:
+                    break
+                cur = prev_pos
+            if first_action is not None:
+                return int(first_action)
+
+        cr, cc = self.current_pos
+        best_key = None
+        best_action = int(valid[0])
+        prev_cell = self.prev_pos
+        for a in valid:
+            action = int(a)
+            dr, dc = ACTION_TO_DELTA[action]
+            nr, nc = cr + dr, cc + dc
+            cell = int(self.known_map[nr, nc])
+            visit_count = int(self.visit_counts[nr, nc])
+            backtrack = 1 if (prev_cell is not None and (nr, nc) == prev_cell) else 0
+            if cell == 0 and (not self.explored[nr, nc]):
+                tier = 0
+            elif cell == -1:
+                tier = 1
+            else:
+                tier = 2
+            key = (tier, visit_count, backtrack, action)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_action = action
+        return best_action
+
     def reset(self, *, start_pos: Optional[GridPos] = None) -> Dict[str, object]:
         self.current_pos = self._resolve_start(start_pos) if start_pos is not None else self._default_start
         self.prev_pos = None
@@ -557,6 +713,9 @@ class CPPDiscreteEnv:
         self.path = [self.current_pos]
         self.recent_new_coverage.clear()
         self.recent_actions.clear()
+        self.recent_positions.clear()
+        self.visit_counts.fill(0)
+        self.no_progress_streak = 0
         self._milestone_hit_90 = False
         self._milestone_hit_99 = False
 
@@ -567,6 +726,9 @@ class CPPDiscreteEnv:
             self._boundary_maps_builder.reset_incremental_state()
         self._sense_at(self.current_pos)
         self._mark_explored(self.current_pos)
+        rr, cc = self.current_pos
+        self.visit_counts[rr, cc] = 1
+        self.recent_positions.append(self.current_pos)
 
         self.last_reward = CPPRewardBreakdown(
             area=0.0,
@@ -593,6 +755,13 @@ class CPPDiscreteEnv:
             if fallback is not None:
                 executed_action = int(fallback)
                 action_overridden = True
+        loop_status_before = self._loop_status()
+        heuristic_action_used = False
+        if bool(self.config.heuristic_override) and bool(loop_status_before["loop_detected"]):
+            fallback = self._heuristic_action_from_mask(action_mask)
+            if fallback is not None and int(fallback) != int(executed_action):
+                executed_action = int(fallback)
+                heuristic_action_used = True
 
         cr, cc = self.current_pos
         prev_action = self.prev_action
@@ -683,11 +852,19 @@ class CPPDiscreteEnv:
             total=total_reward,
         )
         self.recent_new_coverage.append(float(newly_visited))
+        if newly_visited > 0.0:
+            self.no_progress_streak = 0
+        else:
+            self.no_progress_streak += 1
 
         self.steps += 1
         self.path.append(self.current_pos)
         self.prev_action = int(executed_action)
         self.recent_actions.append(int(executed_action))
+        self.recent_positions.append(self.current_pos)
+        rr, cc = self.current_pos
+        self.visit_counts[rr, cc] += 1
+        loop_status_after = self._loop_status()
 
         done_reason = ""
         truncated = False
@@ -715,11 +892,17 @@ class CPPDiscreteEnv:
             "action_requested": int(requested_action),
             "action_executed": int(executed_action),
             "action_overridden": bool(action_overridden),
+            "heuristic_action_used": bool(heuristic_action_used),
             "forced_turn": bool(forced_turn),
             "action_mask_valid_count": int(np.count_nonzero(action_mask)),
             "action_mask": [int(v) for v in action_mask.astype(np.int8)],
             "revisited_cell": bool((not collided) and was_explored),
             "overlap_streak": int(self.overlap_streak),
+            "no_progress_streak": int(loop_status_after["no_progress_streak"]),
+            "recent_unique_positions": int(loop_status_after["recent_unique_positions"]),
+            "cycle2_detected": bool(loop_status_after["cycle2_detected"]),
+            "force_loop_detected": bool(loop_status_after["force_loop_detected"]),
+            "loop_detected": bool(loop_status_after["loop_detected"]),
             "reward_turn": float(reward_turn),
             "reward_overlap": float(reward_overlap),
             "reward_milestone": float(reward_milestone),

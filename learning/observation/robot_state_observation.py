@@ -13,6 +13,8 @@ class RobotStateObservationConfig:
     stagnation_window: int = 20
     # Number of recent executed actions to encode in robot_state.
     action_history_len: int = 5
+    # Optional loop/stagnation signals appended to robot_state.
+    include_heuristic_signals: bool = False
 
 
 class RobotStateObservationBuilder:
@@ -21,9 +23,11 @@ class RobotStateObservationBuilder:
 
     Feature groups:
     1) normalized position: [row_norm, col_norm]
-    2) previous move direction (one-hot): [stay, up, right, down, left]
+    2) previous move direction history (one-hot): [stay, up, right, down, left] * K
     3) coverage progress ratio over free cells: [progress]
     4) stagnation index over recent window: [stagnation]
+    5) optional heuristic loop signals:
+       [no_progress_norm, recent_unique_fraction, cycle2_flag, loop_detected_flag]
     """
 
     _DIR_INDEX = {"stay": 0, "up": 1, "right": 2, "down": 3, "left": 4}
@@ -55,6 +59,15 @@ class RobotStateObservationBuilder:
                 "stagnation_index",
             ]
         )
+        if bool(self.config.include_heuristic_signals):
+            names.extend(
+                [
+                    "heuristic_no_progress_norm",
+                    "heuristic_recent_unique_fraction",
+                    "heuristic_cycle2_flag",
+                    "heuristic_loop_detected_flag",
+                ]
+            )
         return tuple(names)
 
     def _normalize_position(self, robot_pos: GridPos, shape: Tuple[int, int]) -> np.ndarray:

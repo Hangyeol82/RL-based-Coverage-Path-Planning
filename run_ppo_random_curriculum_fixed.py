@@ -95,6 +95,24 @@ def _parse_args() -> argparse.Namespace:
     boundary_group.add_argument("--boundary-exit-features", dest="boundary_exit_features", action="store_true")
     boundary_group.add_argument("--no-boundary-exit-features", dest="boundary_exit_features", action="store_false")
     p.add_argument("--boundary-exit-threshold", type=float, default=0.0)
+    heur_sig_group = p.add_mutually_exclusive_group()
+    heur_sig_group.add_argument("--heuristic-signals", dest="heuristic_signals", action="store_true")
+    heur_sig_group.add_argument("--no-heuristic-signals", dest="heuristic_signals", action="store_false")
+    heur_override_group = p.add_mutually_exclusive_group()
+    heur_override_group.add_argument("--heuristic-override", dest="heuristic_override", action="store_true")
+    heur_override_group.add_argument("--no-heuristic-override", dest="heuristic_override", action="store_false")
+    heur_actor_group = p.add_mutually_exclusive_group()
+    heur_actor_group.add_argument("--heuristic-actor-exclude", dest="heuristic_actor_exclude", action="store_true")
+    heur_actor_group.add_argument(
+        "--no-heuristic-actor-exclude",
+        dest="heuristic_actor_exclude",
+        action="store_false",
+    )
+    p.add_argument("--heuristic-bc-coef", type=float, default=0.0)
+    p.add_argument("--heuristic-loop-window", type=int, default=20)
+    p.add_argument("--heuristic-no-progress-k", type=int, default=20)
+    p.add_argument("--heuristic-force-loop-k", type=int, default=30)
+    p.add_argument("--heuristic-unique-threshold", type=int, default=4)
 
     milestone_group = p.add_mutually_exclusive_group()
     milestone_group.add_argument("--milestone-reward", dest="milestone_reward", action="store_true")
@@ -184,6 +202,9 @@ def _parse_args() -> argparse.Namespace:
     mask_group.add_argument("--no-action-mask", dest="action_mask", action="store_false")
     p.set_defaults(
         action_mask=True,
+        heuristic_signals=False,
+        heuristic_override=False,
+        heuristic_actor_exclude=False,
         milestone_reward=False,
         overlap_streak_penalty=False,
         boundary_exit_features=False,
@@ -347,6 +368,16 @@ def _build_run_cmd(
         str(int(args.max_episode_steps)),
         "--boundary-exit-threshold",
         str(float(args.boundary_exit_threshold)),
+        "--heuristic-loop-window",
+        str(int(args.heuristic_loop_window)),
+        "--heuristic-no-progress-k",
+        str(int(args.heuristic_no_progress_k)),
+        "--heuristic-force-loop-k",
+        str(int(args.heuristic_force_loop_k)),
+        "--heuristic-unique-threshold",
+        str(int(args.heuristic_unique_threshold)),
+        "--heuristic-bc-coef",
+        str(float(args.heuristic_bc_coef)),
         "--milestone-threshold-90",
         str(float(args.milestone_threshold_90)),
         "--milestone-threshold-99",
@@ -396,6 +427,18 @@ def _build_run_cmd(
         cmd.append("--boundary-exit-features")
     else:
         cmd.append("--no-boundary-exit-features")
+    if args.heuristic_signals:
+        cmd.append("--heuristic-signals")
+    else:
+        cmd.append("--no-heuristic-signals")
+    if args.heuristic_override:
+        cmd.append("--heuristic-override")
+    else:
+        cmd.append("--no-heuristic-override")
+    if args.heuristic_actor_exclude:
+        cmd.append("--heuristic-actor-exclude")
+    else:
+        cmd.append("--no-heuristic-actor-exclude")
     if args.milestone_reward:
         cmd.append("--milestone-reward")
     else:
@@ -429,6 +472,16 @@ def main() -> None:
         raise ValueError("--ent-coef-boost must be >= 0")
     if int(args.ent_coef_boost_chunks) < 0:
         raise ValueError("--ent-coef-boost-chunks must be >= 0")
+    if int(args.heuristic_loop_window) < 4:
+        raise ValueError("--heuristic-loop-window must be >= 4")
+    if int(args.heuristic_no_progress_k) < 1:
+        raise ValueError("--heuristic-no-progress-k must be >= 1")
+    if int(args.heuristic_force_loop_k) < int(args.heuristic_no_progress_k):
+        raise ValueError("--heuristic-force-loop-k must be >= --heuristic-no-progress-k")
+    if int(args.heuristic_unique_threshold) < 1:
+        raise ValueError("--heuristic-unique-threshold must be >= 1")
+    if float(args.heuristic_bc_coef) < 0.0:
+        raise ValueError("--heuristic-bc-coef must be >= 0")
 
     phase_levels = _parse_int_list(args.phase_levels, name="phase-levels")
     allowed_levels = set(default_stages_for_profile(args.curriculum_profile))

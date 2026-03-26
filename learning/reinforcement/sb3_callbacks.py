@@ -36,6 +36,11 @@ class RewardBreakdownCallback(BaseCallback):
         "reward_total",
         "coverage_ratio",
         "collision",
+        "no_progress_streak",
+        "recent_unique_positions",
+        "force_loop_detected",
+        "loop_detected",
+        "heuristic_action_used",
     )
 
     def __init__(self, verbose: int = 0):

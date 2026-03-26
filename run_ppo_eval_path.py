@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from learning.observation import MultiScaleCPPObservationConfig
+from learning.observation.robot_state_observation import RobotStateObservationConfig
 from learning.reinforcement.cpp_env import CPPDiscreteEnvConfig
 from learning.reinforcement.reward import CPPRewardConfig
 from learning.reinforcement.sb3_env import CPPDiscreteGymEnv
@@ -66,6 +67,36 @@ def _parse_args() -> argparse.Namespace:
         help="Disable DTM boundary-exit features in robot_state.",
     )
     p.add_argument("--boundary-exit-threshold", type=float, default=0.0)
+    heur_sig_group = p.add_mutually_exclusive_group()
+    heur_sig_group.add_argument(
+        "--heuristic-signals",
+        dest="heuristic_signals",
+        action="store_true",
+        help="Append loop/stagnation heuristic signals to robot_state.",
+    )
+    heur_sig_group.add_argument(
+        "--no-heuristic-signals",
+        dest="heuristic_signals",
+        action="store_false",
+        help="Disable heuristic loop/stagnation signals.",
+    )
+    heur_override_group = p.add_mutually_exclusive_group()
+    heur_override_group.add_argument(
+        "--heuristic-override",
+        dest="heuristic_override",
+        action="store_true",
+        help="Use heuristic escape actions when loop detection triggers.",
+    )
+    heur_override_group.add_argument(
+        "--no-heuristic-override",
+        dest="heuristic_override",
+        action="store_false",
+        help="Disable heuristic action replacement in eval.",
+    )
+    p.add_argument("--heuristic-loop-window", type=int, default=20)
+    p.add_argument("--heuristic-no-progress-k", type=int, default=20)
+    p.add_argument("--heuristic-force-loop-k", type=int, default=30)
+    p.add_argument("--heuristic-unique-threshold", type=int, default=4)
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument(
         "--obs-unknown-policy",
@@ -117,7 +148,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Sample actions from policy distribution.",
     )
-    p.set_defaults(action_mask=True, boundary_exit_features=False)
+    p.set_defaults(
+        action_mask=True,
+        boundary_exit_features=False,
+        heuristic_signals=False,
+        heuristic_override=False,
+    )
     p.set_defaults(deterministic=True)
 
     p.add_argument("--save-path-json", type=str, default="")
@@ -309,10 +345,18 @@ def main():
         include_dtm=args.include_dtm,
         use_boundary_exit_features=bool(args.boundary_exit_features),
         boundary_exit_threshold=float(args.boundary_exit_threshold),
+        heuristic_loop_window=int(args.heuristic_loop_window),
+        heuristic_no_progress_k=int(args.heuristic_no_progress_k),
+        heuristic_force_loop_k=int(args.heuristic_force_loop_k),
+        heuristic_unique_threshold=int(args.heuristic_unique_threshold),
+        heuristic_override=bool(args.heuristic_override),
         observation=MultiScaleCPPObservationConfig(
             unknown_policy=str(args.obs_unknown_policy),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
+        ),
+        robot_state=RobotStateObservationConfig(
+            include_heuristic_signals=bool(args.heuristic_signals),
         ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
@@ -341,6 +385,7 @@ def main():
         total_reward = 0.0
         collision_count = 0
         action_overridden_count = 0
+        heuristic_action_used_count = 0
         final_info: Dict = {}
 
         for _ in range(int(args.max_episode_steps)):
@@ -358,6 +403,8 @@ def main():
                 collision_count += 1
             if bool(info.get("action_overridden", False)):
                 action_overridden_count += 1
+            if bool(info.get("heuristic_action_used", False)):
+                heuristic_action_used_count += 1
             pos = info.get("position", path[-1])
             path.append((int(pos[0]), int(pos[1])))
             final_info = info
@@ -371,6 +418,7 @@ def main():
         done_reason = str(final_info.get("done_reason", ""))
         collision_rate = float(collision_count) / float(max(1, steps))
         action_override_rate = float(action_overridden_count) / float(max(1, steps))
+        heuristic_action_used_rate = float(heuristic_action_used_count) / float(max(1, steps))
         unique_positions = int(len({(int(r), int(c)) for r, c in path}))
 
         print("[EVAL RESULT]")
@@ -381,6 +429,10 @@ def main():
         print(f"  coverage_ratio: {coverage_ratio:.6f}")
         print(f"  collision_rate: {collision_rate:.6f} ({collision_count}/{steps})")
         print(f"  action_override_rate: {action_override_rate:.6f} ({action_overridden_count}/{steps})")
+        print(
+            "  heuristic_action_used_rate: "
+            f"{heuristic_action_used_rate:.6f} ({heuristic_action_used_count}/{steps})"
+        )
         print(f"  collision(last): {collision_last:.6f}")
         print(f"  unique_positions: {unique_positions}")
         print(f"  total_reward(sum): {total_reward:.6f}")
@@ -402,6 +454,8 @@ def main():
                 "collision_rate": collision_rate,
                 "action_overridden_count": int(action_overridden_count),
                 "action_override_rate": action_override_rate,
+                "heuristic_action_used_count": int(heuristic_action_used_count),
+                "heuristic_action_used_rate": heuristic_action_used_rate,
                 "unique_positions": unique_positions,
                 "total_reward_sum": total_reward,
                 "done_reason": done_reason,

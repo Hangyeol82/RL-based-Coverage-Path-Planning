@@ -18,7 +18,9 @@ from learning.common import (
     RobotStateEncoderConfig,
 )
 from learning.observation import MultiScaleCPPObservationConfig
+from learning.observation.robot_state_observation import RobotStateObservationConfig
 from learning.reinforcement.cpp_env import CPPDiscreteEnv, CPPDiscreteEnvConfig
+from learning.reinforcement.heuristic_ppo import HeuristicAwarePPO, HeuristicMaskablePPO
 from learning.reinforcement.reward import CPPRewardConfig
 from learning.reinforcement.sb3_callbacks import RewardBreakdownCallback
 from learning.reinforcement.sb3_env import CPPDiscreteGymEnv
@@ -100,6 +102,61 @@ def _parse_args() -> argparse.Namespace:
         default=0.0,
         help="Threshold in [0,1] to binarize per-level exit scores.",
     )
+    heur_sig_group = p.add_mutually_exclusive_group()
+    heur_sig_group.add_argument(
+        "--heuristic-signals",
+        dest="heuristic_signals",
+        action="store_true",
+        help="Append loop/stagnation heuristic signals to robot_state.",
+    )
+    heur_sig_group.add_argument(
+        "--no-heuristic-signals",
+        dest="heuristic_signals",
+        action="store_false",
+        help="Disable heuristic signals in robot_state.",
+    )
+    heur_override_group = p.add_mutually_exclusive_group()
+    heur_override_group.add_argument(
+        "--heuristic-override",
+        dest="heuristic_override",
+        action="store_true",
+        help="Use a heuristic escape action when loop detection triggers.",
+    )
+    heur_override_group.add_argument(
+        "--no-heuristic-override",
+        dest="heuristic_override",
+        action="store_false",
+        help="Disable heuristic action replacement.",
+    )
+    heur_actor_group = p.add_mutually_exclusive_group()
+    heur_actor_group.add_argument(
+        "--heuristic-actor-exclude",
+        dest="heuristic_actor_exclude",
+        action="store_true",
+        help=(
+            "When heuristic override executes an action, exclude that step from PPO "
+            "actor/entropy loss while still training the critic on the resulting transition."
+        ),
+    )
+    heur_actor_group.add_argument(
+        "--no-heuristic-actor-exclude",
+        dest="heuristic_actor_exclude",
+        action="store_false",
+        help="Do not exclude heuristic-overridden steps from PPO actor updates.",
+    )
+    p.add_argument(
+        "--heuristic-bc-coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Auxiliary BC loss coefficient on heuristic-overridden steps. "
+            "Requires heuristic override and actor exclusion."
+        ),
+    )
+    p.add_argument("--heuristic-loop-window", type=int, default=20)
+    p.add_argument("--heuristic-no-progress-k", type=int, default=20)
+    p.add_argument("--heuristic-force-loop-k", type=int, default=30)
+    p.add_argument("--heuristic-unique-threshold", type=int, default=4)
     milestone_group = p.add_mutually_exclusive_group()
     milestone_group.add_argument(
         "--milestone-reward",
@@ -228,6 +285,9 @@ def _parse_args() -> argparse.Namespace:
     )
     p.set_defaults(
         action_mask=True,
+        heuristic_signals=False,
+        heuristic_override=False,
+        heuristic_actor_exclude=False,
         milestone_reward=False,
         overlap_streak_penalty=False,
         boundary_exit_features=False,
@@ -477,7 +537,20 @@ def main():
 
     AlgoClass = SB3PPO
     algo_name = "PPO"
+    algo_kwargs: Dict[str, object] = {}
+    heuristic_actor_exclude = bool(args.heuristic_actor_exclude)
+    heuristic_bc_coef = float(args.heuristic_bc_coef)
+    if heuristic_bc_coef < 0.0:
+        raise ValueError("--heuristic-bc-coef must be >= 0")
+    if heuristic_bc_coef > 0.0 and not heuristic_actor_exclude:
+        raise ValueError("--heuristic-bc-coef requires --heuristic-actor-exclude")
+
     if args.action_mask:
+        if heuristic_actor_exclude or heuristic_bc_coef > 0.0:
+            AlgoClass = HeuristicMaskablePPO
+            algo_name = "HeuristicMaskablePPO"
+            algo_kwargs["exclude_heuristic_actor_steps"] = heuristic_actor_exclude
+            algo_kwargs["heuristic_bc_coef"] = heuristic_bc_coef
         try:
             from sb3_contrib import MaskablePPO  # type: ignore
         except Exception:
@@ -486,12 +559,25 @@ def main():
                 flush=True,
             )
         else:
-            AlgoClass = MaskablePPO
-            algo_name = "MaskablePPO"
+            if not (heuristic_actor_exclude or heuristic_bc_coef > 0.0):
+                AlgoClass = MaskablePPO
+                algo_name = "MaskablePPO"
+    elif heuristic_actor_exclude:
+        AlgoClass = HeuristicAwarePPO
+        algo_name = "HeuristicAwarePPO"
+        algo_kwargs["exclude_heuristic_actor_steps"] = True
 
     grid = _build_map(args)
     start = _pick_start(grid)
     local_blocks = _parse_local_blocks(args.local_blocks)
+    if int(args.heuristic_loop_window) < 4:
+        raise ValueError("--heuristic-loop-window must be >= 4")
+    if int(args.heuristic_no_progress_k) < 1:
+        raise ValueError("--heuristic-no-progress-k must be >= 1")
+    if int(args.heuristic_force_loop_k) < int(args.heuristic_no_progress_k):
+        raise ValueError("--heuristic-force-loop-k must be >= --heuristic-no-progress-k")
+    if int(args.heuristic_unique_threshold) < 1:
+        raise ValueError("--heuristic-unique-threshold must be >= 1")
 
     reward_cfg = CPPRewardConfig(
         newly_visited_reward_scale=0.7,
@@ -523,12 +609,20 @@ def main():
         include_dtm=args.include_dtm,
         use_boundary_exit_features=bool(args.boundary_exit_features),
         boundary_exit_threshold=float(args.boundary_exit_threshold),
+        heuristic_loop_window=int(args.heuristic_loop_window),
+        heuristic_no_progress_k=int(args.heuristic_no_progress_k),
+        heuristic_force_loop_k=int(args.heuristic_force_loop_k),
+        heuristic_unique_threshold=int(args.heuristic_unique_threshold),
+        heuristic_override=bool(args.heuristic_override),
         observation=MultiScaleCPPObservationConfig(
             local_blocks=local_blocks or MultiScaleCPPObservationConfig().local_blocks,
             unknown_policy=str(args.obs_unknown_policy),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_connectivity=int(args.dtm_connectivity),
+        ),
+        robot_state=RobotStateObservationConfig(
+            include_heuristic_signals=bool(args.heuristic_signals),
         ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
@@ -589,7 +683,7 @@ def main():
 
     if args.load_model:
         try:
-            model = AlgoClass.load(args.load_model, env=vec_env, device=device)
+            model = AlgoClass.load(args.load_model, env=vec_env, device=device, **algo_kwargs)
         except Exception as load_err:
             # Old checkpoints may have been saved with plain PPO; recover gracefully.
             if algo_name == "MaskablePPO":
@@ -620,6 +714,7 @@ def main():
             seed=args.seed,
             device=device,
             verbose=int(args.verbose),
+            **algo_kwargs,
         )
 
     bc_warm_start_stats = None
@@ -660,6 +755,17 @@ def main():
         f" enabled={bool(args.boundary_exit_features)},"
         f" threshold={float(args.boundary_exit_threshold):.3f},"
         f" robot_state_dim={robot_state_dim}"
+    )
+    print(
+        "Heuristic mode:"
+        f" signals={bool(args.heuristic_signals)},"
+        f" override={bool(args.heuristic_override)},"
+        f" actor_exclude={bool(args.heuristic_actor_exclude)},"
+        f" bc_coef={float(args.heuristic_bc_coef):.3f},"
+        f" window={int(args.heuristic_loop_window)},"
+        f" no_progress_k={int(args.heuristic_no_progress_k)},"
+        f" force_loop_k={int(args.heuristic_force_loop_k)},"
+        f" unique_threshold={int(args.heuristic_unique_threshold)}"
     )
     print(
         f"Model size: {args.model_size} | conv={model_cfg['conv_channels']} | "
