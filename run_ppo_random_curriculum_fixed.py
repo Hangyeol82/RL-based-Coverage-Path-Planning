@@ -98,6 +98,9 @@ def _parse_args() -> argparse.Namespace:
     heur_sig_group = p.add_mutually_exclusive_group()
     heur_sig_group.add_argument("--heuristic-signals", dest="heuristic_signals", action="store_true")
     heur_sig_group.add_argument("--no-heuristic-signals", dest="heuristic_signals", action="store_false")
+    hole_sig_group = p.add_mutually_exclusive_group()
+    hole_sig_group.add_argument("--hole-signals", dest="hole_signals", action="store_true")
+    hole_sig_group.add_argument("--no-hole-signals", dest="hole_signals", action="store_false")
     heur_override_group = p.add_mutually_exclusive_group()
     heur_override_group.add_argument("--heuristic-override", dest="heuristic_override", action="store_true")
     heur_override_group.add_argument("--no-heuristic-override", dest="heuristic_override", action="store_false")
@@ -127,6 +130,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--overlap-streak-grace", type=int, default=2)
     p.add_argument("--overlap-streak-increment", type=float, default=0.05)
     p.add_argument("--overlap-streak-max-abs", type=float, default=0.4)
+    p.add_argument("--coverage-hole-penalty-scale", type=float, default=0.0)
 
     p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
     p.add_argument(
@@ -203,6 +207,7 @@ def _parse_args() -> argparse.Namespace:
     p.set_defaults(
         action_mask=True,
         heuristic_signals=False,
+        hole_signals=False,
         heuristic_override=False,
         heuristic_actor_exclude=False,
         milestone_reward=False,
@@ -392,6 +397,8 @@ def _build_run_cmd(
         str(float(args.overlap_streak_increment)),
         "--overlap-streak-max-abs",
         str(float(args.overlap_streak_max_abs)),
+        "--coverage-hole-penalty-scale",
+        str(float(args.coverage_hole_penalty_scale)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
         "--model-size",
@@ -431,6 +438,10 @@ def _build_run_cmd(
         cmd.append("--heuristic-signals")
     else:
         cmd.append("--no-heuristic-signals")
+    if args.hole_signals:
+        cmd.append("--hole-signals")
+    else:
+        cmd.append("--no-hole-signals")
     if args.heuristic_override:
         cmd.append("--heuristic-override")
     else:

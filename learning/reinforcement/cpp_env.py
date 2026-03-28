@@ -142,6 +142,7 @@ class CPPDiscreteEnv:
             tv_global=0.0,
             collision=0.0,
             constant=0.0,
+            hole=0.0,
             total=0.0,
         )
         self._milestone_hit_90 = False
@@ -327,6 +328,8 @@ class CPPDiscreteEnv:
             extra_features.extend(boundary_exit_features.astype(np.float32).tolist())
         if bool(self.config.robot_state.include_heuristic_signals):
             extra_features.extend(self._heuristic_signal_vector().tolist())
+        if bool(self.config.robot_state.include_hole_signals):
+            extra_features.extend(self._hole_signal_vector().tolist())
         t0 = perf_counter() if self._profile_observation else 0.0
         robot_state = self.robot_state_builder.build(
             occupancy=self.known_map,
@@ -598,6 +601,83 @@ class CPPDiscreteEnv:
             "recent_unique_fraction": recent_unique_fraction,
         }
 
+    def _coverage_hole_stats(self, robot_pos: Optional[GridPos] = None) -> Dict[str, float]:
+        """
+        Detect sealed coverage holes from the online known map only.
+
+        blocker := covered free cells U known obstacles U boundary
+        open    := unknown cells U known-free uncovered cells U {robot current cell}
+
+        Any open connected component that is not connected to the robot cell and
+        contains at least one known-free uncovered cell is treated as a
+        confirmed coverage hole candidate.
+        """
+        rp = self.current_pos if robot_pos is None else robot_pos
+        rr, cc = rp
+
+        known_free = self.known_map == 0
+        uncovered_known = known_free & (~self.explored)
+        unknown = self.known_map == -1
+
+        open_mask = np.logical_or(unknown, uncovered_known)
+        if 0 <= rr < self.rows and 0 <= cc < self.cols:
+            open_mask[rr, cc] = True
+
+        visited = np.zeros_like(open_mask, dtype=bool)
+        q: Deque[GridPos] = deque()
+        if open_mask[rr, cc]:
+            visited[rr, cc] = True
+            q.append((rr, cc))
+
+        while q:
+            cr, cc2 = q.popleft()
+            for dr, dc in ACTION_TO_DELTA.values():
+                nr, nc = cr + dr, cc2 + dc
+                if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                    continue
+                if visited[nr, nc] or (not open_mask[nr, nc]):
+                    continue
+                visited[nr, nc] = True
+                q.append((nr, nc))
+
+        hole_count = 0
+        hole_known_mass = 0
+        hole_open_mass = 0
+
+        rem = np.argwhere(open_mask & (~visited))
+        for sr, sc in rem:
+            sr_i = int(sr)
+            sc_i = int(sc)
+            if visited[sr_i, sc_i]:
+                continue
+            comp_known = 0
+            comp_open = 0
+            visited[sr_i, sc_i] = True
+            q.append((sr_i, sc_i))
+            while q:
+                cr, cc2 = q.popleft()
+                comp_open += 1
+                if uncovered_known[cr, cc2]:
+                    comp_known += 1
+                for dr, dc in ACTION_TO_DELTA.values():
+                    nr, nc = cr + dr, cc2 + dc
+                    if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                        continue
+                    if visited[nr, nc] or (not open_mask[nr, nc]):
+                        continue
+                    visited[nr, nc] = True
+                    q.append((nr, nc))
+            if comp_known > 0:
+                hole_count += 1
+                hole_known_mass += comp_known
+                hole_open_mass += comp_open
+
+        return {
+            "coverage_hole_count": float(hole_count),
+            "coverage_hole_known_mass": float(hole_known_mass),
+            "coverage_hole_open_mass": float(hole_open_mass),
+        }
+
     def _heuristic_signal_vector(self) -> np.ndarray:
         stats = self._loop_status()
         return np.asarray(
@@ -606,6 +686,22 @@ class CPPDiscreteEnv:
                 float(stats["recent_unique_fraction"]),
                 float(stats["cycle2_detected"]),
                 float(stats["loop_detected"]),
+            ],
+            dtype=np.float32,
+        )
+
+    def _hole_signal_vector(self) -> np.ndarray:
+        stats = self._coverage_hole_stats(self.current_pos)
+        count = float(stats["coverage_hole_count"])
+        known_mass = float(stats["coverage_hole_known_mass"])
+        open_mass = float(stats["coverage_hole_open_mass"])
+        free_total = float(max(1, self.free_total))
+        return np.asarray(
+            [
+                1.0 if count > 0.0 else 0.0,
+                float(np.clip(count / 4.0, 0.0, 1.0)),
+                float(np.clip(known_mass / free_total, 0.0, 1.0)),
+                float(np.clip(open_mass / free_total, 0.0, 1.0)),
             ],
             dtype=np.float32,
         )
@@ -736,6 +832,7 @@ class CPPDiscreteEnv:
             tv_global=0.0,
             collision=0.0,
             constant=0.0,
+            hole=0.0,
             total=0.0,
         )
         return self._build_observation()
@@ -747,6 +844,7 @@ class CPPDiscreteEnv:
         if requested_action not in ACTION_TO_DELTA:
             raise ValueError(f"Invalid action {action}. Expected one of {sorted(ACTION_TO_DELTA)}")
 
+        hole_stats_before = self._coverage_hole_stats(self.current_pos)
         action_mask = self.get_action_mask()
         executed_action = requested_action
         action_overridden = False
@@ -842,13 +940,29 @@ class CPPDiscreteEnv:
             collided=collided,
         )
 
-        total_reward = float(base_reward.total + reward_turn + reward_overlap + reward_milestone)
+        hole_stats_after = self._coverage_hole_stats(self.current_pos)
+        hole_count_delta = max(
+            0.0,
+            float(hole_stats_after["coverage_hole_count"])
+            - float(hole_stats_before["coverage_hole_count"]),
+        )
+        hole_known_delta = max(
+            0.0,
+            float(hole_stats_after["coverage_hole_known_mass"])
+            - float(hole_stats_before["coverage_hole_known_mass"]),
+        )
+        reward_hole = -float(self.config.reward.coverage_hole_penalty_scale) * float(hole_count_delta)
+
+        total_reward = float(
+            base_reward.total + reward_turn + reward_overlap + reward_milestone + reward_hole
+        )
         self.last_reward = CPPRewardBreakdown(
             area=float(base_reward.area),
             tv_local=float(base_reward.tv_local),
             tv_global=float(base_reward.tv_global),
             collision=float(base_reward.collision),
             constant=float(base_reward.constant),
+            hole=float(reward_hole),
             total=total_reward,
         )
         self.recent_new_coverage.append(float(newly_visited))
@@ -903,9 +1017,15 @@ class CPPDiscreteEnv:
             "cycle2_detected": bool(loop_status_after["cycle2_detected"]),
             "force_loop_detected": bool(loop_status_after["force_loop_detected"]),
             "loop_detected": bool(loop_status_after["loop_detected"]),
+            "coverage_hole_count": float(hole_stats_after["coverage_hole_count"]),
+            "coverage_hole_known_mass": float(hole_stats_after["coverage_hole_known_mass"]),
+            "coverage_hole_open_mass": float(hole_stats_after["coverage_hole_open_mass"]),
+            "coverage_hole_count_delta": float(hole_count_delta),
+            "coverage_hole_known_mass_delta": float(hole_known_delta),
             "reward_turn": float(reward_turn),
             "reward_overlap": float(reward_overlap),
             "reward_milestone": float(reward_milestone),
+            "reward_hole": float(reward_hole),
             "milestone_hit_90_now": bool(milestone_hit_90_now),
             "milestone_hit_99_now": bool(milestone_hit_99_now),
             "milestone_hit_90": bool(self._milestone_hit_90),

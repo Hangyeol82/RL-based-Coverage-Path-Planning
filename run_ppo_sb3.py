@@ -115,6 +115,19 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable heuristic signals in robot_state.",
     )
+    hole_sig_group = p.add_mutually_exclusive_group()
+    hole_sig_group.add_argument(
+        "--hole-signals",
+        dest="hole_signals",
+        action="store_true",
+        help="Append current sealed-hole summary signals to robot_state.",
+    )
+    hole_sig_group.add_argument(
+        "--no-hole-signals",
+        dest="hole_signals",
+        action="store_false",
+        help="Disable sealed-hole summary signals in robot_state.",
+    )
     heur_override_group = p.add_mutually_exclusive_group()
     heur_override_group.add_argument(
         "--heuristic-override",
@@ -194,6 +207,15 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.4,
         help="Maximum absolute overlap penalty after streak acceleration.",
+    )
+    p.add_argument(
+        "--coverage-hole-penalty-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Penalty scale on positive growth of sealed coverage-hole count "
+            "computed from the online known map."
+        ),
     )
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument(
@@ -286,6 +308,7 @@ def _parse_args() -> argparse.Namespace:
     p.set_defaults(
         action_mask=True,
         heuristic_signals=False,
+        hole_signals=False,
         heuristic_override=False,
         heuristic_actor_exclude=False,
         milestone_reward=False,
@@ -595,6 +618,7 @@ def main():
         overlap_streak_grace=int(args.overlap_streak_grace),
         overlap_streak_increment=float(args.overlap_streak_increment),
         overlap_streak_max_abs=float(args.overlap_streak_max_abs),
+        coverage_hole_penalty_scale=float(args.coverage_hole_penalty_scale),
         milestone_reward_enabled=bool(args.milestone_reward),
         milestone_threshold_90=float(args.milestone_threshold_90),
         milestone_threshold_99=float(args.milestone_threshold_99),
@@ -623,6 +647,7 @@ def main():
         ),
         robot_state=RobotStateObservationConfig(
             include_heuristic_signals=bool(args.heuristic_signals),
+            include_hole_signals=bool(args.hole_signals),
         ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
@@ -759,13 +784,15 @@ def main():
     print(
         "Heuristic mode:"
         f" signals={bool(args.heuristic_signals)},"
+        f" hole_signals={bool(args.hole_signals)},"
         f" override={bool(args.heuristic_override)},"
         f" actor_exclude={bool(args.heuristic_actor_exclude)},"
         f" bc_coef={float(args.heuristic_bc_coef):.3f},"
         f" window={int(args.heuristic_loop_window)},"
         f" no_progress_k={int(args.heuristic_no_progress_k)},"
         f" force_loop_k={int(args.heuristic_force_loop_k)},"
-        f" unique_threshold={int(args.heuristic_unique_threshold)}"
+        f" unique_threshold={int(args.heuristic_unique_threshold)},"
+        f" hole_penalty_scale={float(args.coverage_hole_penalty_scale):.3f}"
     )
     print(
         f"Model size: {args.model_size} | conv={model_cfg['conv_channels']} | "

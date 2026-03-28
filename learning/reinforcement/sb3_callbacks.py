@@ -33,6 +33,7 @@ class RewardBreakdownCallback(BaseCallback):
         "reward_turn",
         "reward_overlap",
         "reward_milestone",
+        "reward_hole",
         "reward_total",
         "coverage_ratio",
         "collision",
@@ -41,6 +42,11 @@ class RewardBreakdownCallback(BaseCallback):
         "force_loop_detected",
         "loop_detected",
         "heuristic_action_used",
+        "coverage_hole_count",
+        "coverage_hole_known_mass",
+        "coverage_hole_open_mass",
+        "coverage_hole_count_delta",
+        "coverage_hole_known_mass_delta",
     )
 
     def __init__(self, verbose: int = 0):

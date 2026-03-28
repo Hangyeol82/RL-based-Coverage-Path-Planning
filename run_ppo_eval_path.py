@@ -37,6 +37,22 @@ from run_cstar_custom_map import CUSTOM_MAP_TEXT, parse_custom_map
 GridPos = Tuple[int, int]
 
 
+def _parse_local_blocks(text: str) -> Optional[Tuple[int, ...]]:
+    raw = str(text).strip()
+    if not raw:
+        return None
+    vals = tuple(int(tok.strip()) for tok in raw.split(",") if tok.strip())
+    if not vals:
+        return None
+    if any(v <= 0 for v in vals):
+        raise ValueError("--local-blocks values must be positive")
+    if tuple(sorted(vals)) != vals:
+        raise ValueError("--local-blocks must be in increasing order")
+    if len(set(vals)) != len(vals):
+        raise ValueError("--local-blocks must not contain duplicates")
+    return vals
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Evaluate a trained SB3 PPO model and visualize trajectory on a map.",
@@ -52,6 +68,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=101)
 
     p.add_argument("--sensor-range", type=int, default=2)
+    p.add_argument(
+        "--local-blocks",
+        type=str,
+        default="1,2,4,8,16",
+        help="Comma-separated local block sizes for multiscale observation.",
+    )
     p.add_argument("--max-episode-steps", type=int, default=2000)
     boundary_group = p.add_mutually_exclusive_group()
     boundary_group.add_argument(
@@ -79,6 +101,19 @@ def _parse_args() -> argparse.Namespace:
         dest="heuristic_signals",
         action="store_false",
         help="Disable heuristic loop/stagnation signals.",
+    )
+    hole_sig_group = p.add_mutually_exclusive_group()
+    hole_sig_group.add_argument(
+        "--hole-signals",
+        dest="hole_signals",
+        action="store_true",
+        help="Append current sealed-hole summary signals to robot_state.",
+    )
+    hole_sig_group.add_argument(
+        "--no-hole-signals",
+        dest="hole_signals",
+        action="store_false",
+        help="Disable sealed-hole summary signals.",
     )
     heur_override_group = p.add_mutually_exclusive_group()
     heur_override_group.add_argument(
@@ -152,6 +187,7 @@ def _parse_args() -> argparse.Namespace:
         action_mask=True,
         boundary_exit_features=False,
         heuristic_signals=False,
+        hole_signals=False,
         heuristic_override=False,
     )
     p.set_defaults(deterministic=True)
@@ -160,7 +196,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-plot", type=str, default="")
     p.add_argument("--show-plot", action="store_true")
     p.add_argument("--title", type=str, default="PPO Coverage Trajectory")
-    return p.parse_args()
+    args = p.parse_args()
+    args.local_blocks = _parse_local_blocks(args.local_blocks)
+    return args
 
 
 def _select_device(device_arg: str) -> str:
@@ -310,6 +348,14 @@ def main():
     use_maskable_predict = False
     if args.action_mask:
         try:
+            from learning.reinforcement.heuristic_ppo import HeuristicMaskablePPO
+        except Exception:
+            HeuristicMaskablePPO = None  # type: ignore[assignment]
+        else:
+            AlgoLoader = HeuristicMaskablePPO
+            algo_name = "HeuristicMaskablePPO"
+            use_maskable_predict = True
+        try:
             from sb3_contrib import MaskablePPO  # type: ignore
         except Exception:
             print(
@@ -317,9 +363,10 @@ def main():
                 flush=True,
             )
         else:
-            AlgoLoader = MaskablePPO
-            algo_name = "MaskablePPO"
-            use_maskable_predict = True
+            if HeuristicMaskablePPO is None:
+                AlgoLoader = MaskablePPO
+                algo_name = "MaskablePPO"
+                use_maskable_predict = True
 
     grid = _build_map(args)
     start = _pick_start(grid)
@@ -351,12 +398,14 @@ def main():
         heuristic_unique_threshold=int(args.heuristic_unique_threshold),
         heuristic_override=bool(args.heuristic_override),
         observation=MultiScaleCPPObservationConfig(
+            local_blocks=args.local_blocks or MultiScaleCPPObservationConfig().local_blocks,
             unknown_policy=str(args.obs_unknown_policy),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
         ),
         robot_state=RobotStateObservationConfig(
             include_heuristic_signals=bool(args.heuristic_signals),
+            include_hole_signals=bool(args.hole_signals),
         ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,

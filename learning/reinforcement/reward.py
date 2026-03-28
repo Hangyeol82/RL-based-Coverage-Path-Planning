@@ -51,6 +51,10 @@ class CPPRewardConfig:
     milestone_threshold_99: float = 0.99
     milestone_lambda_90: float = 0.2
     milestone_lambda_99: float = 4.0
+    # Optional shaping on newly created coverage holes computed from the
+    # online known map. Applied in env step logic using positive growth in the
+    # sealed-hole count only.
+    coverage_hole_penalty_scale: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,7 @@ class CPPRewardBreakdown:
     tv_global: float
     collision: float
     constant: float
+    hole: float
     total: float
 
     def as_dict(self) -> Dict[str, float]:
@@ -92,6 +97,7 @@ class CPPRewardBreakdown:
             "reward_tv_g": float(self.tv_global),
             "reward_coll": float(self.collision),
             "reward_const": float(self.constant),
+            "reward_hole": float(self.hole),
             "reward_total": float(self.total),
         }
 
@@ -155,6 +161,7 @@ def compute_cpp_reward(inp: CPPRewardInput, cfg: CPPRewardConfig) -> CPPRewardBr
         tv_global=float(reward_tv_g),
         collision=float(reward_coll),
         constant=float(reward_const),
+        hole=0.0,
         total=float(total),
     )
 
