@@ -120,13 +120,13 @@ def _parse_args() -> argparse.Namespace:
         "--hole-signals",
         dest="hole_signals",
         action="store_true",
-        help="Append current sealed-hole summary signals to robot_state.",
+        help="Append action-wise hole seal-risk signals to robot_state.",
     )
     hole_sig_group.add_argument(
         "--no-hole-signals",
         dest="hole_signals",
         action="store_false",
-        help="Disable sealed-hole summary signals in robot_state.",
+        help="Disable action-wise hole seal-risk signals in robot_state.",
     )
     heur_override_group = p.add_mutually_exclusive_group()
     heur_override_group.add_argument(
@@ -170,6 +170,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--heuristic-no-progress-k", type=int, default=20)
     p.add_argument("--heuristic-force-loop-k", type=int, default=30)
     p.add_argument("--heuristic-unique-threshold", type=int, default=4)
+    heur_force_only_group = p.add_mutually_exclusive_group()
+    heur_force_only_group.add_argument(
+        "--heuristic-force-only",
+        dest="heuristic_force_only",
+        action="store_true",
+        help="Trigger heuristic override only from the force no-progress threshold.",
+    )
+    heur_force_only_group.add_argument(
+        "--no-heuristic-force-only",
+        dest="heuristic_force_only",
+        action="store_false",
+        help="Use the full heuristic trigger logic (cycle2 + low-support + force trigger).",
+    )
     milestone_group = p.add_mutually_exclusive_group()
     milestone_group.add_argument(
         "--milestone-reward",
@@ -310,6 +323,7 @@ def _parse_args() -> argparse.Namespace:
         heuristic_signals=False,
         hole_signals=False,
         heuristic_override=False,
+        heuristic_force_only=False,
         heuristic_actor_exclude=False,
         milestone_reward=False,
         overlap_streak_penalty=False,
@@ -637,6 +651,7 @@ def main():
         heuristic_no_progress_k=int(args.heuristic_no_progress_k),
         heuristic_force_loop_k=int(args.heuristic_force_loop_k),
         heuristic_unique_threshold=int(args.heuristic_unique_threshold),
+        heuristic_force_only=bool(args.heuristic_force_only),
         heuristic_override=bool(args.heuristic_override),
         observation=MultiScaleCPPObservationConfig(
             local_blocks=local_blocks or MultiScaleCPPObservationConfig().local_blocks,
@@ -786,6 +801,7 @@ def main():
         f" signals={bool(args.heuristic_signals)},"
         f" hole_signals={bool(args.hole_signals)},"
         f" override={bool(args.heuristic_override)},"
+        f" force_only={bool(args.heuristic_force_only)},"
         f" actor_exclude={bool(args.heuristic_actor_exclude)},"
         f" bc_coef={float(args.heuristic_bc_coef):.3f},"
         f" window={int(args.heuristic_loop_window)},"

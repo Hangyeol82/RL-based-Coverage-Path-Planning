@@ -107,13 +107,13 @@ def _parse_args() -> argparse.Namespace:
         "--hole-signals",
         dest="hole_signals",
         action="store_true",
-        help="Append current sealed-hole summary signals to robot_state.",
+        help="Append action-wise hole seal-risk signals to robot_state.",
     )
     hole_sig_group.add_argument(
         "--no-hole-signals",
         dest="hole_signals",
         action="store_false",
-        help="Disable sealed-hole summary signals.",
+        help="Disable action-wise hole seal-risk signals.",
     )
     heur_override_group = p.add_mutually_exclusive_group()
     heur_override_group.add_argument(
@@ -132,6 +132,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--heuristic-no-progress-k", type=int, default=20)
     p.add_argument("--heuristic-force-loop-k", type=int, default=30)
     p.add_argument("--heuristic-unique-threshold", type=int, default=4)
+    force_only_group = p.add_mutually_exclusive_group()
+    force_only_group.add_argument(
+        "--heuristic-force-only",
+        dest="heuristic_force_only",
+        action="store_true",
+        help="Use only the force no-progress trigger for heuristic rescue in eval.",
+    )
+    force_only_group.add_argument(
+        "--no-heuristic-force-only",
+        dest="heuristic_force_only",
+        action="store_false",
+        help="Use the full heuristic trigger logic in eval.",
+    )
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument(
         "--obs-unknown-policy",
@@ -188,6 +201,7 @@ def _parse_args() -> argparse.Namespace:
         boundary_exit_features=False,
         heuristic_signals=False,
         hole_signals=False,
+        heuristic_force_only=False,
         heuristic_override=False,
     )
     p.set_defaults(deterministic=True)
@@ -396,6 +410,7 @@ def main():
         heuristic_no_progress_k=int(args.heuristic_no_progress_k),
         heuristic_force_loop_k=int(args.heuristic_force_loop_k),
         heuristic_unique_threshold=int(args.heuristic_unique_threshold),
+        heuristic_force_only=bool(args.heuristic_force_only),
         heuristic_override=bool(args.heuristic_override),
         observation=MultiScaleCPPObservationConfig(
             local_blocks=args.local_blocks or MultiScaleCPPObservationConfig().local_blocks,

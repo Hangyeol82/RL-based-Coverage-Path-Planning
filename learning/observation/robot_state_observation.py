@@ -15,7 +15,7 @@ class RobotStateObservationConfig:
     action_history_len: int = 5
     # Optional loop/stagnation signals appended to robot_state.
     include_heuristic_signals: bool = False
-    # Optional current sealed-hole summary signals appended to robot_state.
+    # Optional action-wise hole seal-risk signals appended to robot_state.
     include_hole_signals: bool = False
 
 
@@ -30,8 +30,8 @@ class RobotStateObservationBuilder:
     4) stagnation index over recent window: [stagnation]
     5) optional heuristic loop signals:
        [no_progress_norm, recent_unique_fraction, cycle2_flag, loop_detected_flag]
-    6) optional sealed-hole summary signals:
-       [hole_present_flag, hole_count_norm, hole_known_mass_norm, hole_open_mass_norm]
+    6) optional action-wise hole seal-risk signals:
+       [hole_seal_risk_up, hole_seal_risk_right, hole_seal_risk_down, hole_seal_risk_left]
     """
 
     _DIR_INDEX = {"stay": 0, "up": 1, "right": 2, "down": 3, "left": 4}
@@ -75,10 +75,10 @@ class RobotStateObservationBuilder:
         if bool(self.config.include_hole_signals):
             names.extend(
                 [
-                    "hole_present_flag",
-                    "hole_count_norm",
-                    "hole_known_mass_norm",
-                    "hole_open_mass_norm",
+                    "hole_seal_risk_up",
+                    "hole_seal_risk_right",
+                    "hole_seal_risk_down",
+                    "hole_seal_risk_left",
                 ]
             )
         return tuple(names)
