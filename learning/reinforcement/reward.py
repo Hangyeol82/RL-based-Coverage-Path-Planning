@@ -51,9 +51,9 @@ class CPPRewardConfig:
     milestone_threshold_99: float = 0.99
     milestone_lambda_90: float = 0.2
     milestone_lambda_99: float = 4.0
-    # Optional shaping on newly created coverage holes computed from the
-    # online known map. Applied in env step logic using positive growth in the
-    # sealed-hole count only.
+    # Optional shaping on actions that are predicted to seal a coverage hole
+    # from the current online known map. Applied in env step logic using the
+    # pre-action hole seal-risk signal for the executed action.
     coverage_hole_penalty_scale: float = 0.0
 
 

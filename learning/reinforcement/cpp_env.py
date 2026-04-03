@@ -909,6 +909,7 @@ class CPPDiscreteEnv:
             raise ValueError(f"Invalid action {action}. Expected one of {sorted(ACTION_TO_DELTA)}")
 
         hole_stats_before = self._current_hole_stats()
+        hole_risk_before = self._hole_signal_vector()
         action_mask = self.get_action_mask()
         executed_action = requested_action
         action_overridden = False
@@ -1004,6 +1005,10 @@ class CPPDiscreteEnv:
             collided=collided,
         )
 
+        executed_hole_risk = 0.0
+        if 0 <= int(executed_action) < int(hole_risk_before.shape[0]):
+            executed_hole_risk = float(hole_risk_before[int(executed_action)])
+
         hole_stats_after = self._refresh_hole_cache(self.current_pos)
         hole_count_delta = max(
             0.0,
@@ -1015,7 +1020,11 @@ class CPPDiscreteEnv:
             float(hole_stats_after["coverage_hole_known_mass"])
             - float(hole_stats_before["coverage_hole_known_mass"]),
         )
-        reward_hole = -float(self.config.reward.coverage_hole_penalty_scale) * float(hole_count_delta)
+        reward_hole = 0.0
+        if (not collided) and executed_hole_risk > 0.0:
+            reward_hole = -float(self.config.reward.coverage_hole_penalty_scale) * float(
+                executed_hole_risk
+            )
 
         total_reward = float(
             base_reward.total + reward_turn + reward_overlap + reward_milestone + reward_hole
@@ -1086,6 +1095,8 @@ class CPPDiscreteEnv:
             "coverage_hole_open_mass": float(hole_stats_after["coverage_hole_open_mass"]),
             "coverage_hole_count_delta": float(hole_count_delta),
             "coverage_hole_known_mass_delta": float(hole_known_delta),
+            "hole_risk_vector": [float(v) for v in hole_risk_before.tolist()],
+            "hole_executed_action_risk": float(executed_hole_risk),
             "reward_turn": float(reward_turn),
             "reward_overlap": float(reward_overlap),
             "reward_milestone": float(reward_milestone),
