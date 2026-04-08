@@ -101,6 +101,18 @@ def _parse_args() -> argparse.Namespace:
     hole_sig_group = p.add_mutually_exclusive_group()
     hole_sig_group.add_argument("--hole-signals", dest="hole_signals", action="store_true")
     hole_sig_group.add_argument("--no-hole-signals", dest="hole_signals", action="store_false")
+    hole_metric_group = p.add_mutually_exclusive_group()
+    hole_metric_group.add_argument("--track-hole-metrics", dest="track_hole_metrics", action="store_true")
+    hole_metric_group.add_argument("--no-track-hole-metrics", dest="track_hole_metrics", action="store_false")
+    pos_group = p.add_mutually_exclusive_group()
+    pos_group.add_argument("--robot-state-position", dest="robot_state_position", action="store_true")
+    pos_group.add_argument("--no-robot-state-position", dest="robot_state_position", action="store_false")
+    progress_group = p.add_mutually_exclusive_group()
+    progress_group.add_argument("--robot-state-progress", dest="robot_state_progress", action="store_true")
+    progress_group.add_argument("--no-robot-state-progress", dest="robot_state_progress", action="store_false")
+    stagnation_group = p.add_mutually_exclusive_group()
+    stagnation_group.add_argument("--robot-state-stagnation", dest="robot_state_stagnation", action="store_true")
+    stagnation_group.add_argument("--no-robot-state-stagnation", dest="robot_state_stagnation", action="store_false")
     heur_override_group = p.add_mutually_exclusive_group()
     heur_override_group.add_argument("--heuristic-override", dest="heuristic_override", action="store_true")
     heur_override_group.add_argument("--no-heuristic-override", dest="heuristic_override", action="store_false")
@@ -208,6 +220,7 @@ def _parse_args() -> argparse.Namespace:
         action_mask=True,
         heuristic_signals=False,
         hole_signals=False,
+        track_hole_metrics=False,
         heuristic_override=False,
         heuristic_actor_exclude=False,
         milestone_reward=False,
@@ -442,6 +455,22 @@ def _build_run_cmd(
         cmd.append("--hole-signals")
     else:
         cmd.append("--no-hole-signals")
+    if args.track_hole_metrics:
+        cmd.append("--track-hole-metrics")
+    else:
+        cmd.append("--no-track-hole-metrics")
+    if args.robot_state_position:
+        cmd.append("--robot-state-position")
+    else:
+        cmd.append("--no-robot-state-position")
+    if args.robot_state_progress:
+        cmd.append("--robot-state-progress")
+    else:
+        cmd.append("--no-robot-state-progress")
+    if args.robot_state_stagnation:
+        cmd.append("--robot-state-stagnation")
+    else:
+        cmd.append("--no-robot-state-stagnation")
     if args.heuristic_override:
         cmd.append("--heuristic-override")
     else:

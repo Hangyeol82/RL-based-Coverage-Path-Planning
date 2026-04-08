@@ -7,6 +7,11 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from scipy import ndimage as scipy_ndimage
+except Exception:
+    scipy_ndimage = None
+
 from learning.observation import (
     MultiScaleCPPObservationBuilder,
     MultiScaleCPPObservationConfig,
@@ -32,6 +37,11 @@ ACTION_TO_DELTA: Dict[int, GridPos] = {
     2: (1, 0),
     3: (0, -1),
 }
+
+_HOLE_LABEL_STRUCTURE = np.asarray(
+    [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
+    dtype=np.uint8,
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,7 @@ class CPPDiscreteEnvConfig:
     heuristic_unique_threshold: int = 4
     heuristic_force_only: bool = False
     heuristic_override: bool = False
+    track_hole_metrics: bool = False
     profile_observation: bool = False
     profile_interval_steps: int = 200
     profile_name: str = ""
@@ -102,6 +113,7 @@ class CPPDiscreteEnv:
         self.rows, self.cols = grid.shape
         self.free_mask = self.true_map == 0
         self.free_total = int(np.count_nonzero(self.free_mask))
+        self.covered_free_count = 0
         if self.free_total <= 0:
             raise ValueError("grid_map must have at least one free cell")
 
@@ -200,11 +212,11 @@ class CPPDiscreteEnv:
         if self.explored[rr, cc]:
             return 0.0
         self.explored[rr, cc] = True
+        self.covered_free_count += 1
         return 1.0
 
     def _coverage_ratio(self) -> float:
-        covered = int(np.count_nonzero(self.explored & self.free_mask))
-        return float(covered) / float(max(1, self.free_total))
+        return float(self.covered_free_count) / float(max(1, self.free_total))
 
     def _compute_milestone_reward(
         self,
@@ -265,11 +277,18 @@ class CPPDiscreteEnv:
         return arr[r0:r1, c0:c1]
 
     def _compute_local_tv(self, center: GridPos) -> float:
+        if float(self.config.reward.local_tv_reward_scale) == 0.0:
+            return 0.0
         radius = max(0, int(self.config.local_tv_patch_radius))
-        cov = self._coverage_map_float()
-        obs = self._known_obstacle_map_float()
-        cov_local = self._local_patch(cov, center, radius)
-        obs_local = self._local_patch(obs, center, radius)
+        rr, cc = center
+        r0 = max(0, rr - radius)
+        r1 = min(self.rows, rr + radius + 1)
+        c0 = max(0, cc - radius)
+        c1 = min(self.cols, cc + radius + 1)
+        known_local = self.known_map[r0:r1, c0:c1]
+        explored_local = self.explored[r0:r1, c0:c1]
+        cov_local = ((known_local == 0) & explored_local).astype(np.float32, copy=False)
+        obs_local = (known_local == 1).astype(np.float32, copy=False)
         return float(
             total_variation(
                 cov_local,
@@ -282,8 +301,11 @@ class CPPDiscreteEnv:
         )
 
     def _compute_global_tv(self) -> float:
-        cov = self._coverage_map_float()
-        obs = self._known_obstacle_map_float()
+        if float(self.config.reward.global_tv_reward_scale) == 0.0:
+            return 0.0
+        known_free = self.known_map == 0
+        cov = (self.explored & known_free).astype(np.float32, copy=False)
+        obs = (self.known_map == 1).astype(np.float32, copy=False)
         return float(
             total_variation(
                 cov,
@@ -608,6 +630,32 @@ class CPPDiscreteEnv:
             "recent_unique_fraction": recent_unique_fraction,
         }
 
+    def _zero_hole_stats(self) -> Dict[str, float]:
+        return {
+            "coverage_hole_count": 0.0,
+            "coverage_hole_known_mass": 0.0,
+            "coverage_hole_open_mass": 0.0,
+        }
+
+    def _hole_metrics_enabled(self) -> bool:
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            return True
+        return bool(
+            bool(cfg.robot_state.include_hole_signals)
+            or float(cfg.reward.coverage_hole_penalty_scale) > 0.0
+            or bool(getattr(cfg, "track_hole_metrics", False))
+        )
+
+    def _hole_risk_enabled(self) -> bool:
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            return True
+        return bool(
+            bool(cfg.robot_state.include_hole_signals)
+            or float(cfg.reward.coverage_hole_penalty_scale) > 0.0
+        )
+
     def _coverage_hole_component_data(self) -> Dict[str, np.ndarray]:
         """
         Build connected-component metadata for the current known-map open space.
@@ -619,6 +667,34 @@ class CPPDiscreteEnv:
         uncovered_known = known_free & (~self.explored)
         unknown = self.known_map == -1
         open_base = np.logical_or(unknown, uncovered_known)
+
+        if scipy_ndimage is not None:
+            labels, num_labels = scipy_ndimage.label(open_base, structure=_HOLE_LABEL_STRUCTURE)
+            if num_labels <= 0:
+                comp_id = np.full((self.rows, self.cols), -1, dtype=np.int32)
+                return {
+                    "open_base": open_base,
+                    "comp_id": comp_id,
+                    "comp_known_mass": np.zeros((0,), dtype=np.int32),
+                    "comp_open_mass": np.zeros((0,), dtype=np.int32),
+                    "comp_touches_boundary": np.zeros((0,), dtype=bool),
+                }
+            labels = labels.astype(np.int32, copy=False)
+            comp_id = np.where(labels > 0, labels - 1, -1).astype(np.int32, copy=False)
+            open_counts = np.bincount(labels.ravel(), minlength=num_labels + 1)
+            known_counts = np.bincount(labels[uncovered_known], minlength=num_labels + 1)
+            boundary_labels = np.unique(
+                np.concatenate((labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]))
+            )
+            touches_boundary = np.zeros((num_labels + 1,), dtype=bool)
+            touches_boundary[boundary_labels] = True
+            return {
+                "open_base": open_base,
+                "comp_id": comp_id,
+                "comp_known_mass": known_counts[1:].astype(np.int32, copy=False),
+                "comp_open_mass": open_counts[1:].astype(np.int32, copy=False),
+                "comp_touches_boundary": touches_boundary[1:].astype(bool, copy=False),
+            }
 
         comp_id = np.full((self.rows, self.cols), -1, dtype=np.int32)
         comp_known_mass: List[int] = []
@@ -669,6 +745,12 @@ class CPPDiscreteEnv:
 
     def _refresh_hole_cache(self, robot_pos: Optional[GridPos] = None) -> Dict[str, float]:
         rp = self.current_pos if robot_pos is None else robot_pos
+        if not self._hole_metrics_enabled():
+            stats = self._zero_hole_stats()
+            self._hole_component_data = None
+            self._hole_stats_cache = stats
+            self._hole_stats_pos = rp
+            return stats
         data = self._coverage_hole_component_data()
         stats = self._coverage_hole_stats(rp, data)
         self._hole_component_data = data
@@ -677,6 +759,8 @@ class CPPDiscreteEnv:
         return stats
 
     def _current_hole_stats(self) -> Dict[str, float]:
+        if not self._hole_metrics_enabled():
+            return self._zero_hole_stats()
         if self._hole_stats_cache is None or self._hole_stats_pos != self.current_pos:
             return self._refresh_hole_cache(self.current_pos)
         return self._hole_stats_cache
@@ -750,10 +834,14 @@ class CPPDiscreteEnv:
         )
 
     def _hole_signal_vector(self) -> np.ndarray:
+        if not self._hole_risk_enabled():
+            return np.zeros(4, dtype=np.float32)
         component_data = self._hole_component_data
         if component_data is None:
             self._refresh_hole_cache(self.current_pos)
             component_data = self._hole_component_data
+        if component_data is None:
+            return np.zeros(4, dtype=np.float32)
         current_count = float(self._current_hole_stats()["coverage_hole_count"])
         risk = np.zeros(4, dtype=np.float32)
         for action in range(4):
@@ -880,6 +968,7 @@ class CPPDiscreteEnv:
 
         self.known_map.fill(-1)
         self.explored.fill(False)
+        self.covered_free_count = 0
         self.maps_builder.reset_incremental_state()
         if self._boundary_maps_builder is not None:
             self._boundary_maps_builder.reset_incremental_state()
@@ -888,7 +977,12 @@ class CPPDiscreteEnv:
         rr, cc = self.current_pos
         self.visit_counts[rr, cc] = 1
         self.recent_positions.append(self.current_pos)
-        self._refresh_hole_cache(self.current_pos)
+        if self._hole_metrics_enabled():
+            self._refresh_hole_cache(self.current_pos)
+        else:
+            self._hole_component_data = None
+            self._hole_stats_cache = self._zero_hole_stats()
+            self._hole_stats_pos = self.current_pos
 
         self.last_reward = CPPRewardBreakdown(
             area=0.0,
@@ -908,8 +1002,10 @@ class CPPDiscreteEnv:
         if requested_action not in ACTION_TO_DELTA:
             raise ValueError(f"Invalid action {action}. Expected one of {sorted(ACTION_TO_DELTA)}")
 
-        hole_stats_before = self._current_hole_stats()
-        hole_risk_before = self._hole_signal_vector()
+        hole_metrics_enabled = self._hole_metrics_enabled()
+        hole_risk_enabled = self._hole_risk_enabled()
+        hole_stats_before = self._current_hole_stats() if hole_metrics_enabled else self._zero_hole_stats()
+        hole_risk_before = self._hole_signal_vector() if hole_risk_enabled else np.zeros(4, dtype=np.float32)
         action_mask = self.get_action_mask()
         executed_action = requested_action
         action_overridden = False
@@ -954,12 +1050,12 @@ class CPPDiscreteEnv:
         self._sense_at(self.current_pos)
 
         was_explored = bool(self.explored[self.current_pos]) if not collided else False
-        prev_coverage_cells = int(np.count_nonzero(self.explored & self.free_mask))
+        prev_coverage_cells = int(self.covered_free_count)
         local_tv_old = self._compute_local_tv(self.current_pos)
         newly_visited = self._mark_explored(self.current_pos)
         local_tv_new = self._compute_local_tv(self.current_pos)
         global_tv = self._compute_global_tv()
-        coverage_cells = int(np.count_nonzero(self.explored & self.free_mask))
+        coverage_cells = int(self.covered_free_count)
         prev_coverage_ratio = float(prev_coverage_cells) / float(max(1, self.free_total))
         curr_coverage_ratio = float(coverage_cells) / float(max(1, self.free_total))
 
@@ -1009,17 +1105,22 @@ class CPPDiscreteEnv:
         if 0 <= int(executed_action) < int(hole_risk_before.shape[0]):
             executed_hole_risk = float(hole_risk_before[int(executed_action)])
 
-        hole_stats_after = self._refresh_hole_cache(self.current_pos)
-        hole_count_delta = max(
-            0.0,
-            float(hole_stats_after["coverage_hole_count"])
-            - float(hole_stats_before["coverage_hole_count"]),
-        )
-        hole_known_delta = max(
-            0.0,
-            float(hole_stats_after["coverage_hole_known_mass"])
-            - float(hole_stats_before["coverage_hole_known_mass"]),
-        )
+        if hole_metrics_enabled:
+            hole_stats_after = self._refresh_hole_cache(self.current_pos)
+            hole_count_delta = max(
+                0.0,
+                float(hole_stats_after["coverage_hole_count"])
+                - float(hole_stats_before["coverage_hole_count"]),
+            )
+            hole_known_delta = max(
+                0.0,
+                float(hole_stats_after["coverage_hole_known_mass"])
+                - float(hole_stats_before["coverage_hole_known_mass"]),
+            )
+        else:
+            hole_stats_after = self._zero_hole_stats()
+            hole_count_delta = 0.0
+            hole_known_delta = 0.0
         reward_hole = 0.0
         if (not collided) and executed_hole_risk > 0.0:
             reward_hole = -float(self.config.reward.coverage_hole_penalty_scale) * float(
@@ -1081,7 +1182,7 @@ class CPPDiscreteEnv:
             "action_overridden": bool(action_overridden),
             "heuristic_action_used": bool(heuristic_action_used),
             "forced_turn": bool(forced_turn),
-            "action_mask_valid_count": int(np.count_nonzero(action_mask)),
+            "action_mask_valid_count": int(action_mask.sum()),
             "action_mask": [int(v) for v in action_mask.astype(np.int8)],
             "revisited_cell": bool((not collided) and was_explored),
             "overlap_streak": int(self.overlap_streak),
@@ -1107,7 +1208,7 @@ class CPPDiscreteEnv:
             "milestone_hit_99": bool(self._milestone_hit_99),
             "coverage_cells": int(coverage_cells),
             "free_cells": int(self.free_total),
-            "coverage_ratio": float(self._coverage_ratio()),
+            "coverage_ratio": float(curr_coverage_ratio),
             "steps": int(self.steps),
             "done_reason": done_reason,
             "truncated": bool(truncated),

@@ -128,6 +128,58 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable action-wise hole seal-risk signals in robot_state.",
     )
+    hole_metric_group = p.add_mutually_exclusive_group()
+    hole_metric_group.add_argument(
+        "--track-hole-metrics",
+        dest="track_hole_metrics",
+        action="store_true",
+        help="Compute and log hole metrics even when hole signals/reward are disabled.",
+    )
+    hole_metric_group.add_argument(
+        "--no-track-hole-metrics",
+        dest="track_hole_metrics",
+        action="store_false",
+        help="Disable extra hole-metric tracking unless hole signals/reward require it.",
+    )
+    pos_group = p.add_mutually_exclusive_group()
+    pos_group.add_argument(
+        "--robot-state-position",
+        dest="robot_state_position",
+        action="store_true",
+        help="Include normalized absolute robot position in robot_state.",
+    )
+    pos_group.add_argument(
+        "--no-robot-state-position",
+        dest="robot_state_position",
+        action="store_false",
+        help="Remove normalized absolute robot position from robot_state.",
+    )
+    progress_group = p.add_mutually_exclusive_group()
+    progress_group.add_argument(
+        "--robot-state-progress",
+        dest="robot_state_progress",
+        action="store_true",
+        help="Include known-map coverage progress in robot_state.",
+    )
+    progress_group.add_argument(
+        "--no-robot-state-progress",
+        dest="robot_state_progress",
+        action="store_false",
+        help="Remove coverage progress from robot_state.",
+    )
+    stagnation_group = p.add_mutually_exclusive_group()
+    stagnation_group.add_argument(
+        "--robot-state-stagnation",
+        dest="robot_state_stagnation",
+        action="store_true",
+        help="Include stagnation summary in robot_state.",
+    )
+    stagnation_group.add_argument(
+        "--no-robot-state-stagnation",
+        dest="robot_state_stagnation",
+        action="store_false",
+        help="Remove stagnation summary from robot_state.",
+    )
     heur_override_group = p.add_mutually_exclusive_group()
     heur_override_group.add_argument(
         "--heuristic-override",
@@ -170,19 +222,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--heuristic-no-progress-k", type=int, default=20)
     p.add_argument("--heuristic-force-loop-k", type=int, default=30)
     p.add_argument("--heuristic-unique-threshold", type=int, default=4)
-    heur_force_only_group = p.add_mutually_exclusive_group()
-    heur_force_only_group.add_argument(
-        "--heuristic-force-only",
-        dest="heuristic_force_only",
-        action="store_true",
-        help="Trigger heuristic override only from the force no-progress threshold.",
-    )
-    heur_force_only_group.add_argument(
-        "--no-heuristic-force-only",
-        dest="heuristic_force_only",
-        action="store_false",
-        help="Use the full heuristic trigger logic (cycle2 + low-support + force trigger).",
-    )
     milestone_group = p.add_mutually_exclusive_group()
     milestone_group.add_argument(
         "--milestone-reward",
@@ -322,8 +361,11 @@ def _parse_args() -> argparse.Namespace:
         action_mask=True,
         heuristic_signals=False,
         hole_signals=False,
+        track_hole_metrics=False,
+        robot_state_position=True,
+        robot_state_progress=True,
+        robot_state_stagnation=True,
         heuristic_override=False,
-        heuristic_force_only=False,
         heuristic_actor_exclude=False,
         milestone_reward=False,
         overlap_streak_penalty=False,
@@ -651,8 +693,9 @@ def main():
         heuristic_no_progress_k=int(args.heuristic_no_progress_k),
         heuristic_force_loop_k=int(args.heuristic_force_loop_k),
         heuristic_unique_threshold=int(args.heuristic_unique_threshold),
-        heuristic_force_only=bool(args.heuristic_force_only),
+        heuristic_force_only=False,
         heuristic_override=bool(args.heuristic_override),
+        track_hole_metrics=bool(args.track_hole_metrics),
         observation=MultiScaleCPPObservationConfig(
             local_blocks=local_blocks or MultiScaleCPPObservationConfig().local_blocks,
             unknown_policy=str(args.obs_unknown_policy),
@@ -661,6 +704,9 @@ def main():
             dtm_connectivity=int(args.dtm_connectivity),
         ),
         robot_state=RobotStateObservationConfig(
+            include_position=bool(args.robot_state_position),
+            include_coverage_progress=bool(args.robot_state_progress),
+            include_stagnation_index=bool(args.robot_state_stagnation),
             include_heuristic_signals=bool(args.heuristic_signals),
             include_hole_signals=bool(args.hole_signals),
         ),
@@ -801,14 +847,14 @@ def main():
         f" signals={bool(args.heuristic_signals)},"
         f" hole_signals={bool(args.hole_signals)},"
         f" override={bool(args.heuristic_override)},"
-        f" force_only={bool(args.heuristic_force_only)},"
         f" actor_exclude={bool(args.heuristic_actor_exclude)},"
         f" bc_coef={float(args.heuristic_bc_coef):.3f},"
         f" window={int(args.heuristic_loop_window)},"
         f" no_progress_k={int(args.heuristic_no_progress_k)},"
         f" force_loop_k={int(args.heuristic_force_loop_k)},"
         f" unique_threshold={int(args.heuristic_unique_threshold)},"
-        f" hole_penalty_scale={float(args.coverage_hole_penalty_scale):.3f}"
+        f" hole_penalty_scale={float(args.coverage_hole_penalty_scale):.3f},"
+        f" track_hole_metrics={bool(args.track_hole_metrics)}"
     )
     print(
         f"Model size: {args.model_size} | conv={model_cfg['conv_channels']} | "

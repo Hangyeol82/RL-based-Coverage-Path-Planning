@@ -13,6 +13,12 @@ class RobotStateObservationConfig:
     stagnation_window: int = 20
     # Number of recent executed actions to encode in robot_state.
     action_history_len: int = 5
+    # Include normalized absolute robot position.
+    include_position: bool = True
+    # Include current coverage progress over known free cells.
+    include_coverage_progress: bool = True
+    # Include recent stagnation summary.
+    include_stagnation_index: bool = True
     # Optional loop/stagnation signals appended to robot_state.
     include_heuristic_signals: bool = False
     # Optional action-wise hole seal-risk signals appended to robot_state.
@@ -24,10 +30,10 @@ class RobotStateObservationBuilder:
     Builds a robot-state observation vector for imitation/RL.
 
     Feature groups:
-    1) normalized position: [row_norm, col_norm]
+    1) optional normalized position: [row_norm, col_norm]
     2) previous move direction history (one-hot): [stay, up, right, down, left] * K
-    3) coverage progress ratio over free cells: [progress]
-    4) stagnation index over recent window: [stagnation]
+    3) optional coverage progress ratio over known free cells: [progress]
+    4) optional stagnation index over recent window: [stagnation]
     5) optional heuristic loop signals:
        [no_progress_norm, recent_unique_fraction, cycle2_flag, loop_detected_flag]
     6) optional action-wise hole seal-risk signals:
@@ -41,10 +47,14 @@ class RobotStateObservationBuilder:
         self.config = config or RobotStateObservationConfig()
 
     def feature_names(self) -> Tuple[str, ...]:
-        names = [
-            "pos_row_norm",
-            "pos_col_norm",
-        ]
+        names = []
+        if bool(self.config.include_position):
+            names.extend(
+                [
+                    "pos_row_norm",
+                    "pos_col_norm",
+                ]
+            )
         hist_len = max(1, int(self.config.action_history_len))
         for t in range(hist_len):
             suffix = f"action_hist_{t}"
@@ -57,12 +67,10 @@ class RobotStateObservationBuilder:
                     f"{suffix}_left",
                 ]
             )
-        names.extend(
-            [
-                "coverage_progress",
-                "stagnation_index",
-            ]
-        )
+        if bool(self.config.include_coverage_progress):
+            names.append("coverage_progress")
+        if bool(self.config.include_stagnation_index):
+            names.append("stagnation_index")
         if bool(self.config.include_heuristic_signals):
             names.extend(
                 [
@@ -189,15 +197,20 @@ class RobotStateObservationBuilder:
             if not (0 <= pr < h and 0 <= pc < w):
                 raise ValueError(f"prev_pos {prev_pos} is out of bounds {(h, w)}")
 
-        pos = self._normalize_position(robot_pos, (h, w))
+        parts = []
+        if bool(self.config.include_position):
+            parts.append(self._normalize_position(robot_pos, (h, w)))
         action_hist = self._action_history_one_hot(
             recent_actions,
             prev_pos=prev_pos,
             robot_pos=robot_pos,
         )
-        progress = np.array([self._coverage_progress(occupancy, explored)], dtype=np.float32)
-        stagnation = np.array([self._stagnation_index(recent_new_coverage)], dtype=np.float32)
-        base = np.concatenate([pos, action_hist, progress, stagnation], axis=0).astype(np.float32)
+        parts.append(action_hist)
+        if bool(self.config.include_coverage_progress):
+            parts.append(np.array([self._coverage_progress(occupancy, explored)], dtype=np.float32))
+        if bool(self.config.include_stagnation_index):
+            parts.append(np.array([self._stagnation_index(recent_new_coverage)], dtype=np.float32))
+        base = np.concatenate(parts, axis=0).astype(np.float32)
         if extra_features is None:
             return base
         extra = np.asarray(list(extra_features), dtype=np.float32).reshape(-1)

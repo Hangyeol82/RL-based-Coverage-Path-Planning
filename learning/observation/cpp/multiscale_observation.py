@@ -270,14 +270,17 @@ class MultiScaleCPPObservationBuilder:
     def channels_per_level(self) -> int:
         return len(self.channel_names)
 
+
     def _compute_changed_mask(self, occupancy: np.ndarray) -> np.ndarray:
-        # First frame (or map shape change): force full DTM refresh.
-        if self._prev_occupancy is None or self._prev_occupancy.shape != occupancy.shape:
+        # First frame (or map shape/dtype change): force full DTM refresh.
+        prev = self._prev_occupancy
+        if prev is None or prev.shape != occupancy.shape or prev.dtype != occupancy.dtype:
             self.reset_incremental_state()
-            changed = np.ones_like(occupancy, dtype=bool)
-        else:
-            changed = occupancy != self._prev_occupancy
-        self._prev_occupancy = occupancy.copy()
+            self._prev_occupancy = occupancy.copy()
+            return np.ones_like(occupancy, dtype=bool)
+
+        changed = occupancy != prev
+        np.copyto(prev, occupancy)
         return changed
 
     @staticmethod
@@ -286,9 +289,11 @@ class MultiScaleCPPObservationBuilder:
         previous: Optional[np.ndarray],
     ) -> Tuple[np.ndarray, np.ndarray]:
         curr = np.asarray(current)
-        if previous is None or previous.shape != curr.shape:
+        if previous is None or previous.shape != curr.shape or previous.dtype != curr.dtype:
             return np.ones_like(curr, dtype=bool), curr.copy()
-        return curr != previous, curr.copy()
+        changed = curr != previous
+        np.copyto(previous, curr)
+        return changed, previous
 
     @staticmethod
     def _dirty_blocks_from_changed(changed_mask: np.ndarray, block: int) -> np.ndarray:
@@ -313,6 +318,59 @@ class MultiScaleCPPObservationBuilder:
         cc = np.minimum(out_w - 1, (coords[:, 1] * out_w) // w)
         dirty[rr, cc] = True
         return dirty
+
+    @staticmethod
+    def _bbox_from_mask(mask: np.ndarray, *, margin: int = 0) -> Optional[Tuple[int, int, int, int]]:
+        coords = np.argwhere(mask)
+        if coords.size == 0:
+            return None
+        h, w = mask.shape
+        r0 = max(0, int(coords[:, 0].min()) - int(margin))
+        r1 = min(h, int(coords[:, 0].max()) + int(margin) + 1)
+        c0 = max(0, int(coords[:, 1].min()) - int(margin))
+        c1 = min(w, int(coords[:, 1].max()) + int(margin) + 1)
+        return r0, r1, c0, c1
+
+    def _compute_frontier_change(
+        self,
+        covered: np.ndarray,
+        known_obstacle: np.ndarray,
+        change_seed: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        prev = self._prev_frontier
+        if prev is None or prev.shape != covered.shape or prev.dtype != bool:
+            frontier = compute_frontier_map(covered, known_obstacle)
+            self._prev_frontier = frontier.copy()
+            return np.ones_like(frontier, dtype=bool), self._prev_frontier
+
+        seed = np.asarray(change_seed, dtype=bool)
+        if not np.any(seed):
+            return np.zeros_like(prev, dtype=bool), prev
+
+        target_bbox = self._bbox_from_mask(seed, margin=1)
+        if target_bbox is None:
+            return np.zeros_like(prev, dtype=bool), prev
+        tr0, tr1, tc0, tc1 = target_bbox
+        roi_bbox = self._bbox_from_mask(seed, margin=2)
+        if roi_bbox is None:
+            return np.zeros_like(prev, dtype=bool), prev
+        rr0, rr1, rc0, rc1 = roi_bbox
+
+        frontier_roi = compute_frontier_map(
+            covered[rr0:rr1, rc0:rc1],
+            known_obstacle[rr0:rr1, rc0:rc1],
+        )
+        inner_r0 = tr0 - rr0
+        inner_r1 = inner_r0 + (tr1 - tr0)
+        inner_c0 = tc0 - rc0
+        inner_c1 = inner_c0 + (tc1 - tc0)
+        new_local = frontier_roi[inner_r0:inner_r1, inner_c0:inner_c1]
+        prev_local = prev[tr0:tr1, tc0:tc1]
+        changed_local = new_local != prev_local
+        np.copyto(prev_local, new_local)
+        changed = np.zeros_like(prev, dtype=bool)
+        changed[tr0:tr1, tc0:tc1] = changed_local
+        return changed, prev
 
     @staticmethod
     def _global_edges(size: int, out_size: int) -> np.ndarray:
@@ -1370,18 +1428,21 @@ class MultiScaleCPPObservationBuilder:
             obstacle_value=self.config.obstacle_value,
         )
         covered = explored.astype(bool) & known_free
-        frontier = compute_frontier_map(covered, known_obstacle)
         known_f = (~unknown).astype(np.float32)
-        if self._profile_enabled:
-            self._profile_add("prep_masks_frontier", perf_counter() - t0)
 
         occupancy_changed = self._compute_changed_mask(occupancy_obs)
         covered_changed, self._prev_covered = self._compute_array_change(covered, self._prev_covered)
         obstacle_changed, self._prev_known_obstacle = self._compute_array_change(
             known_obstacle, self._prev_known_obstacle
         )
-        frontier_changed, self._prev_frontier = self._compute_array_change(frontier, self._prev_frontier)
+        frontier_changed, frontier = self._compute_frontier_change(
+            covered,
+            known_obstacle,
+            np.logical_or(covered_changed, obstacle_changed),
+        )
         _, self._prev_explored = self._compute_array_change(explored, self._prev_explored)
+        if self._profile_enabled:
+            self._profile_add("prep_masks_frontier", perf_counter() - t0)
 
         covered_f = covered.astype(np.float32)
         obstacle_f = known_obstacle.astype(np.float32)

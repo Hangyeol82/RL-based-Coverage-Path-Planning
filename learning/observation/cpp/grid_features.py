@@ -65,19 +65,27 @@ def center_crop_with_pad(
 
     h, w = arr.shape
     cr, cc = center
-    out = np.full((out_h, out_w), pad_value, dtype=np.float32)
     r0 = cr - out_h // 2
     c0 = cc - out_w // 2
+    r1 = r0 + out_h
+    c1 = c0 + out_w
 
-    for rr in range(out_h):
-        sr = r0 + rr
-        if sr < 0 or sr >= h:
-            continue
-        for cc_out in range(out_w):
-            sc = c0 + cc_out
-            if sc < 0 or sc >= w:
-                continue
-            out[rr, cc_out] = float(arr[sr, sc])
+    out = np.full((out_h, out_w), pad_value, dtype=np.float32)
+    src_r0 = max(0, r0)
+    src_c0 = max(0, c0)
+    src_r1 = min(h, r1)
+    src_c1 = min(w, c1)
+    if src_r0 >= src_r1 or src_c0 >= src_c1:
+        return out
+
+    dst_r0 = src_r0 - r0
+    dst_c0 = src_c0 - c0
+    dst_r1 = dst_r0 + (src_r1 - src_r0)
+    dst_c1 = dst_c0 + (src_c1 - src_c0)
+    out[dst_r0:dst_r1, dst_c0:dst_c1] = np.asarray(
+        arr[src_r0:src_r1, src_c0:src_c1],
+        dtype=np.float32,
+    )
     return out
 
 

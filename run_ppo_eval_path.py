@@ -115,6 +115,19 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable action-wise hole seal-risk signals.",
     )
+    hole_metric_group = p.add_mutually_exclusive_group()
+    hole_metric_group.add_argument(
+        "--track-hole-metrics",
+        dest="track_hole_metrics",
+        action="store_true",
+        help="Compute and expose hole metrics in eval info/logs.",
+    )
+    hole_metric_group.add_argument(
+        "--no-track-hole-metrics",
+        dest="track_hole_metrics",
+        action="store_false",
+        help="Disable extra hole-metric tracking unless hole signals require it.",
+    )
     heur_override_group = p.add_mutually_exclusive_group()
     heur_override_group.add_argument(
         "--heuristic-override",
@@ -201,6 +214,7 @@ def _parse_args() -> argparse.Namespace:
         boundary_exit_features=False,
         heuristic_signals=False,
         hole_signals=False,
+        track_hole_metrics=False,
         heuristic_force_only=False,
         heuristic_override=False,
     )
@@ -412,6 +426,7 @@ def main():
         heuristic_unique_threshold=int(args.heuristic_unique_threshold),
         heuristic_force_only=bool(args.heuristic_force_only),
         heuristic_override=bool(args.heuristic_override),
+        track_hole_metrics=bool(args.track_hole_metrics),
         observation=MultiScaleCPPObservationConfig(
             local_blocks=args.local_blocks or MultiScaleCPPObservationConfig().local_blocks,
             unknown_policy=str(args.obs_unknown_policy),
@@ -419,6 +434,9 @@ def main():
             dtm_coarse_mode=str(args.dtm_coarse_mode),
         ),
         robot_state=RobotStateObservationConfig(
+            include_position=bool(args.robot_state_position),
+            include_coverage_progress=bool(args.robot_state_progress),
+            include_stagnation_index=bool(args.robot_state_stagnation),
             include_heuristic_signals=bool(args.heuristic_signals),
             include_hole_signals=bool(args.hole_signals),
         ),
