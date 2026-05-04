@@ -1,7 +1,7 @@
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -23,6 +23,54 @@ from .grid_features import (
 
 
 GridPos = Tuple[int, int]
+
+
+@dataclass(frozen=True)
+class BoundarySegment:
+    side: str
+    start: int
+    end: int
+    component: int
+
+
+@dataclass(frozen=True)
+class BoundarySummary:
+    """Boundary-only connectivity summary for one hierarchical DTM cell.
+
+    top/right/bottom/left arrays store component ids along each boundary
+    position, or -1 when that boundary position is not certainly open.
+    """
+
+    height: int
+    width: int
+    top: np.ndarray
+    right: np.ndarray
+    bottom: np.ndarray
+    left: np.ndarray
+    segments: Tuple[Tuple[BoundarySegment, ...], ...]
+    flags12: np.ndarray
+
+
+class _DSU:
+    def __init__(self):
+        self.parent: List[int] = []
+
+    def make(self) -> int:
+        idx = len(self.parent)
+        self.parent.append(idx)
+        return idx
+
+    def find(self, x: int) -> int:
+        p = self.parent[x]
+        if p != x:
+            self.parent[x] = self.find(p)
+        return self.parent[x]
+
+    def union(self, a: int, b: int) -> None:
+        ra = self.find(a)
+        rb = self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
 
 
 @dataclass(frozen=True)
@@ -170,6 +218,8 @@ class MultiScaleCPPObservationBuilder:
         self._prev_known_obstacle: Optional[np.ndarray] = None
         self._prev_frontier: Optional[np.ndarray] = None
         self._dtm_cache: Dict[int, np.ndarray] = {}
+        self._boundary_summary_cache: Dict[int, np.ndarray] = {}
+        self._boundary_summary_shape: Optional[Tuple[int, int]] = None
         if not (0.0 < float(self.config.dtm_min_known_ratio) <= 1.0):
             raise ValueError("dtm_min_known_ratio must be in (0, 1]")
         if not (0.0 < float(self.config.dtm_patch_min_known_ratio) <= 1.0):
@@ -208,6 +258,8 @@ class MultiScaleCPPObservationBuilder:
         self._prev_known_obstacle = None
         self._prev_frontier = None
         self._dtm_cache.clear()
+        self._boundary_summary_cache.clear()
+        self._boundary_summary_shape = None
 
     def profile_snapshot(self, *, reset: bool = False) -> Dict[str, float]:
         snap: Dict[str, float] = {"calls": float(self._profile_calls)}
@@ -237,6 +289,18 @@ class MultiScaleCPPObservationBuilder:
     def _native_dtm_channels(self) -> int:
         mode = self._native_dtm_mode()
         return 12 if mode == "port12" else 6
+
+    @staticmethod
+    def _is_power_of_two(x: int) -> bool:
+        x = int(x)
+        return x > 0 and (x & (x - 1)) == 0
+
+    @classmethod
+    def _power_of_two_exp(cls, x: int) -> Optional[int]:
+        x = int(x)
+        if not cls._is_power_of_two(x):
+            return None
+        return int(x.bit_length() - 1)
 
     @property
     def num_levels(self) -> int:
@@ -517,6 +581,353 @@ class MultiScaleCPPObservationBuilder:
                 dtm[:, int(r), int(c)] = 1.0
             else:
                 dtm[:, int(r), int(c)] = 0.0
+        return dtm
+
+    @staticmethod
+    def _segments_from_boundary(side: str, values: np.ndarray) -> Tuple[BoundarySegment, ...]:
+        arr = np.asarray(values, dtype=np.int32)
+        segments: List[BoundarySegment] = []
+        i = 0
+        while i < int(arr.size):
+            comp = int(arr[i])
+            if comp < 0:
+                i += 1
+                continue
+            j = i + 1
+            while j < int(arr.size) and int(arr[j]) == comp:
+                j += 1
+            segments.append(BoundarySegment(side=str(side), start=int(i), end=int(j), component=comp))
+            i = j
+        return tuple(segments)
+
+    @classmethod
+    def _segments_for_summary(
+        cls,
+        *,
+        top: np.ndarray,
+        right: np.ndarray,
+        bottom: np.ndarray,
+        left: np.ndarray,
+    ) -> Tuple[Tuple[BoundarySegment, ...], ...]:
+        return (
+            cls._segments_from_boundary("top", top),
+            cls._segments_from_boundary("right", right),
+            cls._segments_from_boundary("bottom", bottom),
+            cls._segments_from_boundary("left", left),
+        )
+
+    @staticmethod
+    def _side_component_set(values: np.ndarray) -> set:
+        return {int(x) for x in np.asarray(values, dtype=np.int32).tolist() if int(x) >= 0}
+
+    @classmethod
+    def _flags12_from_boundaries(
+        cls,
+        *,
+        top: np.ndarray,
+        right: np.ndarray,
+        bottom: np.ndarray,
+        left: np.ndarray,
+    ) -> np.ndarray:
+        side_sets = {
+            "up": cls._side_component_set(top),
+            "right": cls._side_component_set(right),
+            "down": cls._side_component_set(bottom),
+            "left": cls._side_component_set(left),
+        }
+        pairs = (
+            ("up", "right"),
+            ("up", "down"),
+            ("up", "left"),
+            ("right", "up"),
+            ("right", "down"),
+            ("right", "left"),
+            ("down", "up"),
+            ("down", "right"),
+            ("down", "left"),
+            ("left", "up"),
+            ("left", "right"),
+            ("left", "down"),
+        )
+        flags = np.zeros(12, dtype=np.float32)
+        for k, (a, b) in enumerate(pairs):
+            flags[k] = 1.0 if bool(side_sets[a] & side_sets[b]) else 0.0
+        return flags
+
+    def _make_level0_boundary_summary(self, state: int) -> BoundarySummary:
+        if int(state) == int(FREE_STATE):
+            side = np.zeros((1,), dtype=np.int32)
+            flags = np.ones((12,), dtype=np.float32)
+        elif int(state) == int(UNKNOWN_STATE):
+            side = np.full((1,), -1, dtype=np.int32)
+            flags = np.full((12,), float(self.config.dtm_unknown_fill), dtype=np.float32)
+        else:
+            side = np.full((1,), -1, dtype=np.int32)
+            flags = np.zeros((12,), dtype=np.float32)
+        top = side.copy()
+        right = side.copy()
+        bottom = side.copy()
+        left = side.copy()
+        return BoundarySummary(
+            height=1,
+            width=1,
+            top=top,
+            right=right,
+            bottom=bottom,
+            left=left,
+            segments=self._segments_for_summary(top=top, right=right, bottom=bottom, left=left),
+            flags12=flags,
+        )
+
+    @staticmethod
+    def _summary_components(summary: BoundarySummary) -> List[int]:
+        comps = set()
+        for arr in (summary.top, summary.right, summary.bottom, summary.left):
+            comps.update(int(x) for x in np.asarray(arr, dtype=np.int32).tolist() if int(x) >= 0)
+        return sorted(comps)
+
+    @staticmethod
+    def _summary_side(summary: BoundarySummary, side: str) -> np.ndarray:
+        if side == "top":
+            return summary.top
+        if side == "right":
+            return summary.right
+        if side == "bottom":
+            return summary.bottom
+        if side == "left":
+            return summary.left
+        raise ValueError(f"unknown side: {side}")
+
+    def _compose_boundary_summary_2x2(self, children: Dict[Tuple[int, int], BoundarySummary]) -> BoundarySummary:
+        if not children:
+            return self._make_level0_boundary_summary(BLOCKED_STATE)
+
+        dsu = _DSU()
+        node_of: Dict[Tuple[Tuple[int, int], int], int] = {}
+        for pos, child in children.items():
+            for comp in self._summary_components(child):
+                node_of[(pos, int(comp))] = dsu.make()
+
+        def node(pos: Tuple[int, int], comp: int) -> Optional[int]:
+            if int(comp) < 0:
+                return None
+            return node_of.get((pos, int(comp)))
+
+        def union_sides(pos_a: Tuple[int, int], side_a: str, pos_b: Tuple[int, int], side_b: str) -> None:
+            a = children.get(pos_a)
+            b = children.get(pos_b)
+            if a is None or b is None:
+                return
+            arr_a = self._summary_side(a, side_a)
+            arr_b = self._summary_side(b, side_b)
+            n = min(int(arr_a.size), int(arr_b.size))
+            for i in range(n):
+                ca = int(arr_a[i])
+                cb = int(arr_b[i])
+                if ca < 0 or cb < 0:
+                    continue
+                na = node(pos_a, ca)
+                nb = node(pos_b, cb)
+                if na is not None and nb is not None:
+                    dsu.union(na, nb)
+
+        # Only shared seams are inspected. This is proportional to parent
+        # boundary length, not to the child block area.
+        union_sides((0, 0), "right", (0, 1), "left")
+        union_sides((1, 0), "right", (1, 1), "left")
+        union_sides((0, 0), "bottom", (1, 0), "top")
+        union_sides((0, 1), "bottom", (1, 1), "top")
+
+        root_to_parent: Dict[int, int] = {}
+
+        def parent_comp(pos: Tuple[int, int], comp: int) -> int:
+            n = node(pos, int(comp))
+            if n is None:
+                return -1
+            root = int(dsu.find(n))
+            if root not in root_to_parent:
+                root_to_parent[root] = len(root_to_parent)
+            return root_to_parent[root]
+
+        def mapped_side(pos: Tuple[int, int], side: str) -> np.ndarray:
+            child = children.get(pos)
+            if child is None:
+                return np.empty((0,), dtype=np.int32)
+            arr = self._summary_side(child, side)
+            out = np.full(arr.shape, -1, dtype=np.int32)
+            for i, comp in enumerate(np.asarray(arr, dtype=np.int32)):
+                if int(comp) >= 0:
+                    out[int(i)] = parent_comp(pos, int(comp))
+            return out
+
+        has_bottom = (1, 0) in children or (1, 1) in children
+        has_right = (0, 1) in children or (1, 1) in children
+        bottom_row = 1 if has_bottom else 0
+        right_col = 1 if has_right else 0
+
+        top = np.concatenate(
+            [mapped_side((0, 0), "top"), mapped_side((0, 1), "top")]
+        ).astype(np.int32, copy=False)
+        bottom = np.concatenate(
+            [mapped_side((bottom_row, 0), "bottom"), mapped_side((bottom_row, 1), "bottom")]
+        ).astype(np.int32, copy=False)
+        left = np.concatenate(
+            [mapped_side((0, 0), "left"), mapped_side((1, 0), "left")]
+        ).astype(np.int32, copy=False)
+        right = np.concatenate(
+            [mapped_side((0, right_col), "right"), mapped_side((1, right_col), "right")]
+        ).astype(np.int32, copy=False)
+
+        if top.size == 0 and bottom.size > 0:
+            top = np.full_like(bottom, -1)
+        if bottom.size == 0 and top.size > 0:
+            bottom = np.full_like(top, -1)
+        if left.size == 0 and right.size > 0:
+            left = np.full_like(right, -1)
+        if right.size == 0 and left.size > 0:
+            right = np.full_like(left, -1)
+
+        height = int(max(left.size, right.size, 1))
+        width = int(max(top.size, bottom.size, 1))
+        flags = self._flags12_from_boundaries(top=top, right=right, bottom=bottom, left=left)
+        return BoundarySummary(
+            height=height,
+            width=width,
+            top=top,
+            right=right,
+            bottom=bottom,
+            left=left,
+            segments=self._segments_for_summary(top=top, right=right, bottom=bottom, left=left),
+            flags12=flags,
+        )
+
+    def _boundary_summary_grid_shape(self, child_shape: Tuple[int, int]) -> Tuple[int, int]:
+        return ((int(child_shape[0]) + 1) // 2, (int(child_shape[1]) + 1) // 2)
+
+    def _compose_boundary_summary_parent_grid(
+        self,
+        child_grid: np.ndarray,
+        *,
+        out: Optional[np.ndarray] = None,
+        dirty_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        ph, pw = self._boundary_summary_grid_shape(child_grid.shape)
+        if out is None or out.shape != (ph, pw):
+            parent = np.empty((ph, pw), dtype=object)
+            targets = np.argwhere(np.ones((ph, pw), dtype=bool))
+        else:
+            parent = out
+            if dirty_mask is None:
+                targets = np.argwhere(np.ones((ph, pw), dtype=bool))
+            else:
+                if dirty_mask.shape != (ph, pw):
+                    raise ValueError("dirty_mask shape mismatch for boundary summary parent grid")
+                targets = np.argwhere(dirty_mask)
+                if targets.size == 0:
+                    return parent
+
+        ch, cw = child_grid.shape
+        for rr, cc in targets:
+            r = int(rr)
+            c = int(cc)
+            children: Dict[Tuple[int, int], BoundarySummary] = {}
+            for dr in (0, 1):
+                cr = 2 * r + dr
+                if cr >= ch:
+                    continue
+                for dc in (0, 1):
+                    cc_child = 2 * c + dc
+                    if cc_child >= cw:
+                        continue
+                    children[(dr, dc)] = child_grid[cr, cc_child]
+            parent[r, c] = self._compose_boundary_summary_2x2(children)
+        return parent
+
+    def _update_boundary_summary_pyramid(
+        self,
+        state_fine: np.ndarray,
+        *,
+        changed_mask: np.ndarray,
+        max_power: int,
+    ) -> Dict[int, np.ndarray]:
+        h, w = state_fine.shape
+        max_power = max(0, int(max_power))
+        full_refresh = (
+            self._boundary_summary_shape != (h, w)
+            or 0 not in self._boundary_summary_cache
+            or self._boundary_summary_cache[0].shape != (h, w)
+        )
+        dirty_by_power: Dict[int, np.ndarray] = {}
+
+        if full_refresh:
+            level0 = np.empty((h, w), dtype=object)
+            for r in range(h):
+                for c in range(w):
+                    level0[r, c] = self._make_level0_boundary_summary(int(state_fine[r, c]))
+            self._boundary_summary_cache = {0: level0}
+            self._boundary_summary_shape = (h, w)
+            dirty_by_power[0] = np.ones((h, w), dtype=bool)
+            prev_dirty = dirty_by_power[0]
+            for power in range(1, max_power + 1):
+                parent = self._compose_boundary_summary_parent_grid(self._boundary_summary_cache[power - 1])
+                self._boundary_summary_cache[power] = parent
+                dirty_by_power[power] = np.ones(parent.shape, dtype=bool)
+                prev_dirty = dirty_by_power[power]
+            return dirty_by_power
+
+        dirty0 = changed_mask.astype(bool, copy=False)
+        dirty_by_power[0] = dirty0
+        if np.any(dirty0):
+            level0 = self._boundary_summary_cache[0]
+            for r, c in np.argwhere(dirty0):
+                level0[int(r), int(c)] = self._make_level0_boundary_summary(int(state_fine[int(r), int(c)]))
+
+        prev_dirty = dirty0
+        for power in range(1, max_power + 1):
+            child = self._boundary_summary_cache[power - 1]
+            dirty_parent = self._dirty_blocks_from_changed(prev_dirty, 2)
+            existing = self._boundary_summary_cache.get(power)
+            if existing is None or existing.shape != self._boundary_summary_grid_shape(child.shape):
+                parent = self._compose_boundary_summary_parent_grid(child)
+                dirty_parent = np.ones(parent.shape, dtype=bool)
+            else:
+                parent = self._compose_boundary_summary_parent_grid(
+                    child,
+                    out=existing,
+                    dirty_mask=dirty_parent,
+                )
+            self._boundary_summary_cache[power] = parent
+            dirty_by_power[power] = dirty_parent
+            prev_dirty = dirty_parent
+        return dirty_by_power
+
+    def _dtm_from_boundary_summary_level(
+        self,
+        *,
+        level_id: int,
+        power: int,
+        dirty_mask: Optional[np.ndarray],
+    ) -> np.ndarray:
+        summaries = self._boundary_summary_cache[int(power)]
+        h, w = summaries.shape
+        cache = self._dtm_cache.get(level_id)
+        full_refresh = cache is None or cache.shape != (12, h, w)
+        if full_refresh:
+            dtm = np.full((12, h, w), float(self.config.dtm_unknown_fill), dtype=np.float32)
+            targets = np.argwhere(np.ones((h, w), dtype=bool))
+        else:
+            dtm = cache
+            if dirty_mask is None:
+                targets = np.argwhere(np.ones((h, w), dtype=bool))
+            else:
+                if dirty_mask.shape != (h, w):
+                    raise ValueError("dirty_mask shape mismatch for DTM summary cache")
+                targets = np.argwhere(dirty_mask)
+                if targets.size == 0:
+                    return dtm
+        for r, c in targets:
+            dtm[:, int(r), int(c)] = summaries[int(r), int(c)].flags12
+        self._dtm_cache[level_id] = dtm
         return dtm
 
     def _update_dtm_level(
@@ -1389,8 +1800,29 @@ class MultiScaleCPPObservationBuilder:
         changed_f = occupancy_changed if self.include_dtm else None
         dtm_fine = None
         state_fine = None
+        use_boundary_summary_dtm = (
+            self.include_dtm
+            and self.config.dtm_coarse_mode == "bfs"
+            and self._native_dtm_mode() == "port12"
+        )
+        boundary_dirty_by_power: Dict[int, np.ndarray] = {}
+        block_power: Dict[int, int] = {}
+        max_boundary_power = 0
+        if use_boundary_summary_dtm:
+            for block in self.config.local_blocks:
+                exp = self._power_of_two_exp(int(block))
+                if exp is not None:
+                    block_power[int(block)] = exp
+                    max_boundary_power = max(max_boundary_power, exp)
+            gsize_tmp = int(self.config.global_window_size)
+            if h == w and gsize_tmp > 0 and (h % gsize_tmp) == 0:
+                gblock = h // gsize_tmp
+                gexp = self._power_of_two_exp(gblock)
+                if gexp is not None:
+                    max_boundary_power = max(max_boundary_power, gexp)
         need_fine_dtm = self.include_dtm and (
-            self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}
+            use_boundary_summary_dtm
+            or self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}
             or len(self.config.local_blocks) > 1
         )
         if need_fine_dtm:
@@ -1398,12 +1830,24 @@ class MultiScaleCPPObservationBuilder:
             state_fine = np.full(occupancy.shape, BLOCKED_STATE, dtype=np.int8)
             state_fine[unknown] = UNKNOWN_STATE
             state_fine[known_free] = FREE_STATE
-            dtm_fine = self._update_dtm_level(
-                level_id=0,
-                state_map=state_fine,
-                known_ratio_map=known_f,
-                changed_mask=changed_f,
-            )
+            if use_boundary_summary_dtm:
+                boundary_dirty_by_power = self._update_boundary_summary_pyramid(
+                    state_fine,
+                    changed_mask=occupancy_changed,
+                    max_power=max_boundary_power,
+                )
+                dtm_fine = self._dtm_from_boundary_summary_level(
+                    level_id=0,
+                    power=0,
+                    dirty_mask=boundary_dirty_by_power.get(0),
+                )
+            else:
+                dtm_fine = self._update_dtm_level(
+                    level_id=0,
+                    state_map=state_fine,
+                    known_ratio_map=known_f,
+                    changed_mask=changed_f,
+                )
             if self._profile_enabled:
                 self._profile_add("dtm_fine", perf_counter() - t0)
 
@@ -1433,7 +1877,13 @@ class MultiScaleCPPObservationBuilder:
             dtm_coarse = None
             if self.include_dtm:
                 t1 = perf_counter() if self._profile_enabled else 0.0
-                if self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
+                if use_boundary_summary_dtm and int(block) in block_power:
+                    dtm_coarse = self._dtm_from_boundary_summary_level(
+                        level_id=lv,
+                        power=block_power[int(block)],
+                        dirty_mask=boundary_dirty_by_power.get(block_power[int(block)]),
+                    )
+                elif self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
                     if block == 1:
                         dtm_coarse = dtm_fine
                     elif self.config.dtm_coarse_mode == "aggregate_transfer":
@@ -1535,7 +1985,16 @@ class MultiScaleCPPObservationBuilder:
         dtm_global = None
         if self.include_dtm:
             t1 = perf_counter() if self._profile_enabled else 0.0
-            if self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
+            global_power = None
+            if use_boundary_summary_dtm and h == w and gsize > 0 and (h % gsize) == 0:
+                global_power = self._power_of_two_exp(h // gsize)
+            if use_boundary_summary_dtm and global_power is not None:
+                dtm_global = self._dtm_from_boundary_summary_level(
+                    level_id=level_id,
+                    power=global_power,
+                    dirty_mask=boundary_dirty_by_power.get(global_power),
+                )
+            elif self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
                 dtm_global = self._aggregate_dtm_global(dtm_fine, gsize, gsize)
             else:
                 if dtm_fine is not None and state_fine is not None:
