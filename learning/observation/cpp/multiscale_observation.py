@@ -34,11 +34,12 @@ class BoundarySegment:
 
 
 @dataclass(frozen=True)
-class BoundarySummary:
-    """Boundary-only connectivity summary for one hierarchical DTM cell.
+class BoundaryConnectivity:
+    """Boundary-only connectivity for one passability interpretation.
 
     top/right/bottom/left arrays store component ids along each boundary
-    position, or -1 when that boundary position is not certainly open.
+    position, or -1 when that boundary position is closed in this
+    interpretation.
     """
 
     height: int
@@ -49,6 +50,22 @@ class BoundarySummary:
     left: np.ndarray
     segments: Tuple[Tuple[BoundarySegment, ...], ...]
     flags12: np.ndarray
+    flags6: np.ndarray
+
+
+@dataclass(frozen=True)
+class BoundarySummary:
+    """Ternary DTM summary for one hierarchical cell.
+
+    certain treats unknown as blocked. possible treats unknown as free.
+    The final flags are 1 when certain connectivity exists, 0 when possible
+    connectivity does not exist, and uncertain_fill otherwise.
+    """
+
+    certain: BoundaryConnectivity
+    possible: BoundaryConnectivity
+    flags12: np.ndarray
+    flags6: np.ndarray
 
 
 class _DSU:
@@ -654,21 +671,93 @@ class MultiScaleCPPObservationBuilder:
             flags[k] = 1.0 if bool(side_sets[a] & side_sets[b]) else 0.0
         return flags
 
-    def _make_level0_boundary_summary(self, state: int) -> BoundarySummary:
-        if int(state) == int(FREE_STATE):
+    @staticmethod
+    def _first_open_component(*values: int) -> int:
+        for value in values:
+            comp = int(value)
+            if comp >= 0:
+                return comp
+        return -1
+
+    @classmethod
+    def _corner_component(
+        cls,
+        *,
+        top: np.ndarray,
+        right: np.ndarray,
+        bottom: np.ndarray,
+        left: np.ndarray,
+        corner: str,
+    ) -> int:
+        t = np.asarray(top, dtype=np.int32)
+        r = np.asarray(right, dtype=np.int32)
+        b = np.asarray(bottom, dtype=np.int32)
+        l = np.asarray(left, dtype=np.int32)
+        if corner == "nw":
+            return cls._first_open_component(t[0] if t.size else -1, l[0] if l.size else -1)
+        if corner == "ne":
+            return cls._first_open_component(t[-1] if t.size else -1, r[0] if r.size else -1)
+        if corner == "se":
+            return cls._first_open_component(b[-1] if b.size else -1, r[-1] if r.size else -1)
+        if corner == "sw":
+            return cls._first_open_component(b[0] if b.size else -1, l[-1] if l.size else -1)
+        raise ValueError(f"unknown corner: {corner}")
+
+    @classmethod
+    def _flags6_from_boundaries(
+        cls,
+        *,
+        top: np.ndarray,
+        right: np.ndarray,
+        bottom: np.ndarray,
+        left: np.ndarray,
+    ) -> np.ndarray:
+        side_sets = {
+            "up": cls._side_component_set(top),
+            "right": cls._side_component_set(right),
+            "down": cls._side_component_set(bottom),
+            "left": cls._side_component_set(left),
+        }
+        nw = cls._corner_component(top=top, right=right, bottom=bottom, left=left, corner="nw")
+        ne = cls._corner_component(top=top, right=right, bottom=bottom, left=left, corner="ne")
+        se = cls._corner_component(top=top, right=right, bottom=bottom, left=left, corner="se")
+        sw = cls._corner_component(top=top, right=right, bottom=bottom, left=left, corner="sw")
+        nw_se = nw >= 0 and nw == se
+        ne_sw = ne >= 0 and ne == sw
+        flags = np.zeros(6, dtype=np.float32)
+        flags[0] = 1.0 if bool(side_sets["left"] & side_sets["right"]) else 0.0
+        flags[1] = 1.0 if bool(side_sets["up"] & side_sets["down"]) else 0.0
+        flags[2] = 1.0 if nw_se else 0.0
+        flags[3] = 1.0 if nw_se else 0.0
+        flags[4] = 1.0 if ne_sw else 0.0
+        flags[5] = 1.0 if ne_sw else 0.0
+        return flags
+
+    def _ternary_flags(
+        self,
+        *,
+        certain_flags: np.ndarray,
+        possible_flags: np.ndarray,
+    ) -> np.ndarray:
+        certain = np.asarray(certain_flags, dtype=np.float32)
+        possible = np.asarray(possible_flags, dtype=np.float32)
+        flags = np.full(certain.shape, float(self.config.dtm_uncertain_fill), dtype=np.float32)
+        flags[certain > 0.0] = 1.0
+        flags[possible <= 0.0] = 0.0
+        return flags
+
+    def _make_boundary_connectivity(self, open_cell: bool) -> BoundaryConnectivity:
+        if bool(open_cell):
             side = np.zeros((1,), dtype=np.int32)
-            flags = np.ones((12,), dtype=np.float32)
-        elif int(state) == int(UNKNOWN_STATE):
-            side = np.full((1,), -1, dtype=np.int32)
-            flags = np.full((12,), float(self.config.dtm_unknown_fill), dtype=np.float32)
         else:
             side = np.full((1,), -1, dtype=np.int32)
-            flags = np.zeros((12,), dtype=np.float32)
         top = side.copy()
         right = side.copy()
         bottom = side.copy()
         left = side.copy()
-        return BoundarySummary(
+        flags12 = self._flags12_from_boundaries(top=top, right=right, bottom=bottom, left=left)
+        flags6 = self._flags6_from_boundaries(top=top, right=right, bottom=bottom, left=left)
+        return BoundaryConnectivity(
             height=1,
             width=1,
             top=top,
@@ -676,18 +765,38 @@ class MultiScaleCPPObservationBuilder:
             bottom=bottom,
             left=left,
             segments=self._segments_for_summary(top=top, right=right, bottom=bottom, left=left),
-            flags12=flags,
+            flags12=flags12,
+            flags6=flags6,
+        )
+
+    def _make_level0_boundary_summary(self, state: int) -> BoundarySummary:
+        st = int(state)
+        certain = self._make_boundary_connectivity(st == int(FREE_STATE))
+        possible = self._make_boundary_connectivity(st in {int(FREE_STATE), int(UNKNOWN_STATE)})
+        flags12 = self._ternary_flags(
+            certain_flags=certain.flags12,
+            possible_flags=possible.flags12,
+        )
+        flags6 = self._ternary_flags(
+            certain_flags=certain.flags6,
+            possible_flags=possible.flags6,
+        )
+        return BoundarySummary(
+            certain=certain,
+            possible=possible,
+            flags12=flags12,
+            flags6=flags6,
         )
 
     @staticmethod
-    def _summary_components(summary: BoundarySummary) -> List[int]:
+    def _summary_components(summary: BoundaryConnectivity) -> List[int]:
         comps = set()
         for arr in (summary.top, summary.right, summary.bottom, summary.left):
             comps.update(int(x) for x in np.asarray(arr, dtype=np.int32).tolist() if int(x) >= 0)
         return sorted(comps)
 
     @staticmethod
-    def _summary_side(summary: BoundarySummary, side: str) -> np.ndarray:
+    def _summary_side(summary: BoundaryConnectivity, side: str) -> np.ndarray:
         if side == "top":
             return summary.top
         if side == "right":
@@ -698,9 +807,12 @@ class MultiScaleCPPObservationBuilder:
             return summary.left
         raise ValueError(f"unknown side: {side}")
 
-    def _compose_boundary_summary_2x2(self, children: Dict[Tuple[int, int], BoundarySummary]) -> BoundarySummary:
+    def _compose_boundary_connectivity_2x2(
+        self,
+        children: Dict[Tuple[int, int], BoundaryConnectivity],
+    ) -> BoundaryConnectivity:
         if not children:
-            return self._make_level0_boundary_summary(BLOCKED_STATE)
+            return self._make_boundary_connectivity(False)
 
         dsu = _DSU()
         node_of: Dict[Tuple[Tuple[int, int], int], int] = {}
@@ -789,8 +901,9 @@ class MultiScaleCPPObservationBuilder:
 
         height = int(max(left.size, right.size, 1))
         width = int(max(top.size, bottom.size, 1))
-        flags = self._flags12_from_boundaries(top=top, right=right, bottom=bottom, left=left)
-        return BoundarySummary(
+        flags12 = self._flags12_from_boundaries(top=top, right=right, bottom=bottom, left=left)
+        flags6 = self._flags6_from_boundaries(top=top, right=right, bottom=bottom, left=left)
+        return BoundaryConnectivity(
             height=height,
             width=width,
             top=top,
@@ -798,7 +911,30 @@ class MultiScaleCPPObservationBuilder:
             bottom=bottom,
             left=left,
             segments=self._segments_for_summary(top=top, right=right, bottom=bottom, left=left),
-            flags12=flags,
+            flags12=flags12,
+            flags6=flags6,
+        )
+
+    def _compose_boundary_summary_2x2(self, children: Dict[Tuple[int, int], BoundarySummary]) -> BoundarySummary:
+        if not children:
+            return self._make_level0_boundary_summary(BLOCKED_STATE)
+        certain_children = {pos: child.certain for pos, child in children.items()}
+        possible_children = {pos: child.possible for pos, child in children.items()}
+        certain = self._compose_boundary_connectivity_2x2(certain_children)
+        possible = self._compose_boundary_connectivity_2x2(possible_children)
+        flags12 = self._ternary_flags(
+            certain_flags=certain.flags12,
+            possible_flags=possible.flags12,
+        )
+        flags6 = self._ternary_flags(
+            certain_flags=certain.flags6,
+            possible_flags=possible.flags6,
+        )
+        return BoundarySummary(
+            certain=certain,
+            possible=possible,
+            flags12=flags12,
+            flags6=flags6,
         )
 
     def _boundary_summary_grid_shape(self, child_shape: Tuple[int, int]) -> Tuple[int, int]:
@@ -911,9 +1047,13 @@ class MultiScaleCPPObservationBuilder:
         summaries = self._boundary_summary_cache[int(power)]
         h, w = summaries.shape
         cache = self._dtm_cache.get(level_id)
-        full_refresh = cache is None or cache.shape != (12, h, w)
+        native_mode = self._native_dtm_mode()
+        if native_mode not in {"port12", "six"}:
+            raise RuntimeError("boundary-summary DTM supports only port12/six native modes")
+        dtm_ch = 12 if native_mode == "port12" else 6
+        full_refresh = cache is None or cache.shape != (dtm_ch, h, w)
         if full_refresh:
-            dtm = np.full((12, h, w), float(self.config.dtm_unknown_fill), dtype=np.float32)
+            dtm = np.full((dtm_ch, h, w), float(self.config.dtm_unknown_fill), dtype=np.float32)
             targets = np.argwhere(np.ones((h, w), dtype=bool))
         else:
             dtm = cache
@@ -926,7 +1066,8 @@ class MultiScaleCPPObservationBuilder:
                 if targets.size == 0:
                     return dtm
         for r, c in targets:
-            dtm[:, int(r), int(c)] = summaries[int(r), int(c)].flags12
+            summary = summaries[int(r), int(c)]
+            dtm[:, int(r), int(c)] = summary.flags12 if native_mode == "port12" else summary.flags6
         self._dtm_cache[level_id] = dtm
         return dtm
 
@@ -1803,7 +1944,7 @@ class MultiScaleCPPObservationBuilder:
         use_boundary_summary_dtm = (
             self.include_dtm
             and self.config.dtm_coarse_mode == "bfs"
-            and self._native_dtm_mode() == "port12"
+            and self._native_dtm_mode() in {"port12", "six"}
         )
         boundary_dirty_by_power: Dict[int, np.ndarray] = {}
         block_power: Dict[int, int] = {}
