@@ -1,0 +1,197 @@
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
+
+import numpy as np
+
+
+GridPos = Tuple[int, int]
+
+
+@dataclass(frozen=True)
+class RobotStateObservationConfig:
+    # Number of recent steps used to measure stagnation.
+    stagnation_window: int = 20
+    # Number of recent executed actions to encode in robot_state.
+    action_history_len: int = 5
+    include_position: bool = True
+    include_action_history: bool = True
+    include_progress: bool = True
+    include_stagnation: bool = True
+
+
+class RobotStateObservationBuilder:
+    """
+    Builds a robot-state observation vector for imitation/RL.
+
+    Feature groups:
+    1) normalized position: [row_norm, col_norm]
+    2) previous move direction (one-hot): [stay, up, right, down, left]
+    3) coverage progress ratio over free cells: [progress]
+    4) stagnation index over recent window: [stagnation]
+    """
+
+    _DIR_INDEX = {"stay": 0, "up": 1, "right": 2, "down": 3, "left": 4}
+    _ACTION_INDEX = {0: 1, 1: 2, 2: 3, 3: 4}
+
+    def __init__(self, config: Optional[RobotStateObservationConfig] = None):
+        self.config = config or RobotStateObservationConfig()
+
+    def feature_names(self) -> Tuple[str, ...]:
+        names = []
+        if self.config.include_position:
+            names.extend(
+                [
+                    "pos_row_norm",
+                    "pos_col_norm",
+                ]
+            )
+        if self.config.include_action_history:
+            hist_len = max(1, int(self.config.action_history_len))
+            for t in range(hist_len):
+                suffix = f"action_hist_{t}"
+                names.extend(
+                    [
+                        f"{suffix}_stay",
+                        f"{suffix}_up",
+                        f"{suffix}_right",
+                        f"{suffix}_down",
+                        f"{suffix}_left",
+                    ]
+                )
+        if self.config.include_progress:
+            names.append("coverage_progress")
+        if self.config.include_stagnation:
+            names.append("stagnation_index")
+        return tuple(names)
+
+    def _normalize_position(self, robot_pos: GridPos, shape: Tuple[int, int]) -> np.ndarray:
+        h, w = shape
+        rr, cc = robot_pos
+        row_norm = 0.0 if h <= 1 else float(rr) / float(h - 1)
+        col_norm = 0.0 if w <= 1 else float(cc) / float(w - 1)
+        return np.array([row_norm, col_norm], dtype=np.float32)
+
+    def _direction_one_hot(self, prev_pos: Optional[GridPos], robot_pos: GridPos) -> np.ndarray:
+        vec = np.zeros(5, dtype=np.float32)
+        if prev_pos is None:
+            vec[self._DIR_INDEX["stay"]] = 1.0
+            return vec
+
+        pr, pc = prev_pos
+        rr, cc = robot_pos
+        dr = rr - pr
+        dc = cc - pc
+
+        direction = "stay"
+        if dr < 0 and dc == 0:
+            direction = "up"
+        elif dr > 0 and dc == 0:
+            direction = "down"
+        elif dc > 0 and dr == 0:
+            direction = "right"
+        elif dc < 0 and dr == 0:
+            direction = "left"
+
+        vec[self._DIR_INDEX[direction]] = 1.0
+        return vec
+
+    def _action_history_one_hot(
+        self,
+        recent_actions: Optional[Sequence[int]],
+        *,
+        prev_pos: Optional[GridPos],
+        robot_pos: GridPos,
+    ) -> np.ndarray:
+        hist_len = max(1, int(self.config.action_history_len))
+        hist = []
+        if recent_actions is not None:
+            hist = [int(a) for a in recent_actions][-hist_len:]
+
+        if len(hist) == 0:
+            fallback = self._direction_one_hot(prev_pos, robot_pos)
+            out = [np.zeros(5, dtype=np.float32) for _ in range(hist_len)]
+            out[-1] = fallback
+            return np.concatenate(out, axis=0).astype(np.float32)
+
+        out = []
+        for act in hist:
+            vec = np.zeros(5, dtype=np.float32)
+            idx = self._ACTION_INDEX.get(int(act), 0)
+            vec[idx] = 1.0
+            out.append(vec)
+        while len(out) < hist_len:
+            vec = np.zeros(5, dtype=np.float32)
+            vec[self._DIR_INDEX["stay"]] = 1.0
+            out.insert(0, vec)
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def _coverage_progress(self, occupancy: np.ndarray, explored: np.ndarray) -> float:
+        # Online setting: unknown (-1) must not be treated as free.
+        known_free = occupancy == 0
+        free_total = int(np.count_nonzero(known_free))
+        if free_total == 0:
+            return 0.0
+        covered_free = int(np.count_nonzero(known_free & explored.astype(bool)))
+        return float(covered_free) / float(free_total)
+
+    def _stagnation_index(self, recent_new_coverage: Optional[Sequence[float]]) -> float:
+        if recent_new_coverage is None:
+            return 0.0
+        hist = np.asarray(list(recent_new_coverage), dtype=np.float32)
+        if hist.size == 0:
+            return 0.0
+        window = max(1, int(self.config.stagnation_window))
+        hist = hist[-window:]
+        progress_steps = int(np.count_nonzero(hist > 0.0))
+        stagnation = 1.0 - (float(progress_steps) / float(hist.size))
+        return float(np.clip(stagnation, 0.0, 1.0))
+
+    def build(
+        self,
+        occupancy: np.ndarray,
+        explored: np.ndarray,
+        robot_pos: GridPos,
+        prev_pos: Optional[GridPos] = None,
+        recent_actions: Optional[Sequence[int]] = None,
+        recent_new_coverage: Optional[Sequence[float]] = None,
+        extra_features: Optional[Sequence[float]] = None,
+    ) -> np.ndarray:
+        if occupancy.ndim != 2:
+            raise ValueError("occupancy must be 2D")
+        if explored.shape != occupancy.shape:
+            raise ValueError("explored shape must match occupancy shape")
+
+        h, w = occupancy.shape
+        rr, cc = robot_pos
+        if not (0 <= rr < h and 0 <= cc < w):
+            raise ValueError(f"robot_pos {robot_pos} is out of bounds {(h, w)}")
+        if prev_pos is not None:
+            pr, pc = prev_pos
+            if not (0 <= pr < h and 0 <= pc < w):
+                raise ValueError(f"prev_pos {prev_pos} is out of bounds {(h, w)}")
+
+        parts = []
+        if self.config.include_position:
+            parts.append(self._normalize_position(robot_pos, (h, w)))
+        if self.config.include_action_history:
+            parts.append(
+                self._action_history_one_hot(
+                    recent_actions,
+                    prev_pos=prev_pos,
+                    robot_pos=robot_pos,
+                )
+            )
+        if self.config.include_progress:
+            parts.append(np.array([self._coverage_progress(occupancy, explored)], dtype=np.float32))
+        if self.config.include_stagnation:
+            parts.append(np.array([self._stagnation_index(recent_new_coverage)], dtype=np.float32))
+        if parts:
+            base = np.concatenate(parts, axis=0).astype(np.float32)
+        else:
+            base = np.zeros((0,), dtype=np.float32)
+        if extra_features is None:
+            return base
+        extra = np.asarray(list(extra_features), dtype=np.float32).reshape(-1)
+        if extra.size == 0:
+            return base
+        return np.concatenate([base, extra], axis=0).astype(np.float32)

@@ -1,0 +1,253 @@
+from __future__ import annotations
+
+import csv
+import json
+from collections import defaultdict
+from pathlib import Path
+from typing import DefaultDict, Dict, List, Sequence
+
+import numpy as np
+
+try:
+    from stable_baselines3.common.callbacks import BaseCallback
+except Exception as exc:  # pragma: no cover
+    BaseCallback = object  # type: ignore[assignment]
+    _SB3_IMPORT_ERROR = exc
+else:
+    _SB3_IMPORT_ERROR = None
+
+
+class PaperMetricsCallback(BaseCallback):
+    """
+    Rollout logger for paper experiments.
+
+    Step metrics are averaged over every environment step in the rollout.
+    Episode metrics are averaged only over episodes that terminated during the
+    rollout. step_to_XX is averaged over successful episodes for that threshold;
+    success_XX is the success rate among terminated episodes.
+    """
+
+    STEP_MEAN_KEYS: Sequence[str] = (
+        "reward_area",
+        "reward_tv_i",
+        "reward_tv_g",
+        "reward_coll",
+        "reward_const",
+        "reward_turn",
+        "reward_overlap",
+        "reward_milestone",
+        "reward_hole",
+        "reward_total",
+        "coverage_ratio",
+        "collision",
+        "turn_event",
+        "turn_ratio",
+        "revisit_ratio",
+        "overlap_ratio",
+        "no_progress_streak_paper",
+        "stagnation_detected",
+        "loop_detected",
+        "loop_or_stagnation_detected",
+        "executed_hole_risk",
+        "coverage_hole_count",
+        "coverage_hole_known_mass",
+        "coverage_hole_open_mass",
+        "hole_refresh_ms",
+        "hole_risk_ms",
+        "episode_map_index",
+    )
+    EPISODE_MEAN_KEYS: Sequence[str] = (
+        "episode_final_coverage_ratio",
+        "episode_final_collision",
+        "episode_final_steps",
+        "episode_turn_count",
+        "episode_turn_ratio",
+        "episode_revisit_count",
+        "episode_revisit_ratio",
+        "episode_overlap_ratio",
+        "episode_stagnation_step_count",
+        "episode_loop_step_count",
+        "episode_loop_or_stagnation_step_count",
+        "episode_loop_or_stagnation_ratio",
+    )
+    TREND_KEYS: Sequence[str] = (
+        "episode_final_coverage_ratio",
+        "success_90",
+        "success_95",
+        "success_99",
+        "step_to_90",
+        "step_to_95",
+        "step_to_99",
+        "episode_turn_ratio",
+        "episode_overlap_ratio",
+        "episode_loop_or_stagnation_ratio",
+    )
+    TREND_WINDOW = 10
+
+    def __init__(self, verbose: int = 0):
+        if _SB3_IMPORT_ERROR is not None:
+            raise ImportError("stable_baselines3 is required for PaperMetricsCallback") from _SB3_IMPORT_ERROR
+        super().__init__(verbose=verbose)
+        self._cur: DefaultDict[str, List[float]] = defaultdict(list)
+        self._episode: DefaultDict[str, List[float]] = defaultdict(list)
+        self._step_count = 0
+        self._override_step_count = 0
+        self.rollout_idx = 0
+        self.history: List[Dict[str, float]] = []
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        if isinstance(infos, dict):
+            infos = [infos]
+
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            self._step_count += 1
+            if bool(info.get("action_overridden", False)):
+                self._override_step_count += 1
+            for key in self.STEP_MEAN_KEYS:
+                if key in info:
+                    self._cur[key].append(float(info[key]))
+
+            if str(info.get("done_reason", "")):
+                if "coverage_ratio" in info:
+                    self._episode["episode_final_coverage_ratio"].append(float(info["coverage_ratio"]))
+                if "collision" in info:
+                    self._episode["episode_final_collision"].append(float(info["collision"]))
+                if "steps" in info:
+                    self._episode["episode_final_steps"].append(float(info["steps"]))
+                for key in self.EPISODE_MEAN_KEYS:
+                    if key in {
+                        "episode_final_coverage_ratio",
+                        "episode_final_collision",
+                        "episode_final_steps",
+                    }:
+                        continue
+                    if key in info:
+                        self._episode[key].append(float(info[key]))
+                for suffix in ("90", "95", "99"):
+                    success_key = f"episode_success_{suffix}"
+                    step_key = f"episode_step_to_{suffix}"
+                    if success_key in info:
+                        self._episode[success_key].append(float(info[success_key]))
+                    if step_key in info:
+                        val = float(info[step_key])
+                        if np.isfinite(val):
+                            self._episode[step_key].append(val)
+        return True
+
+    @staticmethod
+    def _mean(vals: List[float]) -> float:
+        if not vals:
+            return float("nan")
+        return float(np.mean(np.asarray(vals, dtype=np.float64)))
+
+    @staticmethod
+    def _slope(vals: List[float]) -> float:
+        ys = np.asarray([v for v in vals if np.isfinite(float(v))], dtype=np.float64)
+        if ys.size < 3:
+            return float("nan")
+        xs = np.arange(ys.size, dtype=np.float64)
+        return float(np.polyfit(xs, ys, deg=1)[0])
+
+    @staticmethod
+    def _std(vals: List[float]) -> float:
+        ys = np.asarray([v for v in vals if np.isfinite(float(v))], dtype=np.float64)
+        if ys.size < 2:
+            return float("nan")
+        return float(np.std(ys))
+
+    def _on_rollout_end(self) -> None:
+        self.rollout_idx += 1
+        rec: Dict[str, float] = {
+            "rollout": float(self.rollout_idx),
+            "timesteps": float(self.num_timesteps),
+        }
+        for key in self.STEP_MEAN_KEYS:
+            vals = self._cur.get(key, [])
+            if vals:
+                rec[key] = self._mean(vals)
+                self.logger.record(f"paper_metrics/{key}", rec[key])
+
+        if self._step_count > 0:
+            rec["action_override_rate"] = float(self._override_step_count) / float(self._step_count)
+            self.logger.record("paper_metrics/action_override_rate", rec["action_override_rate"])
+
+        done_count = len(self._episode.get("episode_final_coverage_ratio", []))
+        rec["episode_done_count"] = float(done_count)
+        self.logger.record("paper_metrics/episode_done_count", rec["episode_done_count"])
+        if done_count > 0:
+            for key in self.EPISODE_MEAN_KEYS:
+                vals = self._episode.get(key, [])
+                if vals:
+                    rec[key] = self._mean(vals)
+                    self.logger.record(f"paper_metrics/{key}", rec[key])
+            for suffix in ("90", "95", "99"):
+                success_key = f"episode_success_{suffix}"
+                step_key = f"episode_step_to_{suffix}"
+                success_vals = self._episode.get(success_key, [])
+                step_vals = self._episode.get(step_key, [])
+                if success_vals:
+                    rec[f"success_{suffix}"] = self._mean(success_vals)
+                    rec[f"step_to_{suffix}"] = self._mean(step_vals)
+                    rec[f"step_to_{suffix}_count"] = float(len(step_vals))
+                    self.logger.record(f"paper_metrics/success_{suffix}", rec[f"success_{suffix}"])
+                    self.logger.record(f"paper_metrics/step_to_{suffix}", rec[f"step_to_{suffix}"])
+
+        rows = [*self.history, rec]
+        for key in self.TREND_KEYS:
+            vals = [float(row[key]) for row in rows[-self.TREND_WINDOW :] if key in row]
+            if vals:
+                slope_key = f"trend{self.TREND_WINDOW}_{key}_slope"
+                std_key = f"trend{self.TREND_WINDOW}_{key}_std"
+                rec[slope_key] = self._slope(vals)
+                rec[std_key] = self._std(vals)
+                self.logger.record(f"paper_metrics/{slope_key}", rec[slope_key])
+                self.logger.record(f"paper_metrics/{std_key}", rec[std_key])
+
+        self.history.append(rec)
+        self._cur.clear()
+        self._episode.clear()
+        self._step_count = 0
+        self._override_step_count = 0
+
+    def save_json(self, path: str):
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "rollouts": self.history,
+            "step_mean_keys": list(self.STEP_MEAN_KEYS),
+            "episode_mean_keys": list(self.EPISODE_MEAN_KEYS),
+            "thresholds": [0.90, 0.95, 0.99],
+        }
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    def save_csv(self, path: str):
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        base_keys = [
+            "rollout",
+            "timesteps",
+            *self.STEP_MEAN_KEYS,
+            "action_override_rate",
+            "episode_done_count",
+            *self.EPISODE_MEAN_KEYS,
+            "success_90",
+            "step_to_90",
+            "step_to_90_count",
+            "success_95",
+            "step_to_95",
+            "step_to_95_count",
+            "success_99",
+            "step_to_99",
+            "step_to_99_count",
+        ]
+        extra = sorted({k for row in self.history for k in row.keys() if k not in base_keys})
+        keys = base_keys + extra
+        with p.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            for row in self.history:
+                writer.writerow({k: row.get(k, "") for k in keys})
