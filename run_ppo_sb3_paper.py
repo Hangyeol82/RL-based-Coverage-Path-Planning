@@ -63,8 +63,8 @@ def _parse_args() -> argparse.Namespace:
         help="Start method for SubprocVecEnv.",
     )
 
-    p.add_argument("--n-steps", type=int, default=512)
-    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--n-steps", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--n-epochs", type=int, default=4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
