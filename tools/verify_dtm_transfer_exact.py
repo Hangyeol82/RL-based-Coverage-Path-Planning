@@ -46,24 +46,27 @@ def _build_ref_graph(
             w = nid(r, c, 3)
 
             if mode == "six":
+                # six channel order:
+                # 0 U<->R, 1 U<->D, 2 U<->L,
+                # 3 R<->D, 4 R<->L, 5 D<->L
                 if float(ch[0]) > 0.5:
-                    add_edge(w, e)
-                    add_edge(e, w)
+                    add_edge(n, e)
+                    add_edge(e, n)
                 if float(ch[1]) > 0.5:
                     add_edge(n, s)
                     add_edge(s, n)
                 if float(ch[2]) > 0.5:
-                    add_edge(n, e)
-                    add_edge(w, s)
-                if float(ch[3]) > 0.5:
-                    add_edge(e, n)
-                    add_edge(s, w)
-                if float(ch[4]) > 0.5:
                     add_edge(n, w)
-                    add_edge(e, s)
-                if float(ch[5]) > 0.5:
                     add_edge(w, n)
+                if float(ch[3]) > 0.5:
+                    add_edge(e, s)
                     add_edge(s, e)
+                if float(ch[4]) > 0.5:
+                    add_edge(e, w)
+                    add_edge(w, e)
+                if float(ch[5]) > 0.5:
+                    add_edge(s, w)
+                    add_edge(w, s)
             else:
                 # port12:
                 # 0 U->R, 1 U->D, 2 U->L,
@@ -162,20 +165,17 @@ def _ref_flags(
     }
 
     if mode == "six":
-        def cell_nodes(r: int, c: int):
-            return [port_node(r, c, p) for p in range(4)]
-
-        nw_nodes = cell_nodes(0, 0)
-        se_nodes = cell_nodes(bh - 1, bw - 1)
-        ne_nodes = cell_nodes(0, bw - 1)
-        sw_nodes = cell_nodes(bh - 1, 0)
+        pairs = (
+            ("up", "right"),
+            ("up", "down"),
+            ("up", "left"),
+            ("right", "down"),
+            ("right", "left"),
+            ("down", "left"),
+        )
         out = np.zeros(6, dtype=np.float32)
-        out[0] = 1.0 if (_reachable(adj, side_nodes["left"], side_nodes["right"]) or _reachable(adj, side_nodes["right"], side_nodes["left"])) else 0.0
-        out[1] = 1.0 if (_reachable(adj, side_nodes["up"], side_nodes["down"]) or _reachable(adj, side_nodes["down"], side_nodes["up"])) else 0.0
-        out[2] = 1.0 if _reachable(adj, nw_nodes, se_nodes) else 0.0
-        out[3] = 1.0 if _reachable(adj, se_nodes, nw_nodes) else 0.0
-        out[4] = 1.0 if _reachable(adj, ne_nodes, sw_nodes) else 0.0
-        out[5] = 1.0 if _reachable(adj, sw_nodes, ne_nodes) else 0.0
+        for k, (a, b) in enumerate(pairs):
+            out[k] = 1.0 if _reachable(adj, side_nodes[a], side_nodes[b]) else 0.0
         return out
 
     pairs = (
@@ -224,19 +224,16 @@ def _run_handcrafted_cases(builder: MultiScaleCPPObservationBuilder, mode: str) 
 
     if mode == "six":
         dtm = np.zeros((6, 2, 2), dtype=np.float32)
-        # Diagonal case through all four cells:
-        # NW(S->E) -> NE(W->S) -> SE(N->E)
-        # This should set NW->SE due to quadrant-cell connectivity.
-        dtm[5, 0, 0] = 1.0  # SW->NE gives S->E
-        dtm[2, 0, 1] = 1.0  # NW->SE gives W->S
-        dtm[2, 1, 1] = 1.0  # NW->SE gives N->E
+        # Direct side-pair case: the top-right child connects the parent
+        # upper boundary to the parent right boundary.
+        dtm[0, 0, 1] = 1.0  # U<->R
         got = builder._aggregate_transfer_flags_block(dtm, state, dtm_mode=mode)
         ref = _ref_flags(dtm, state, mode)
         if not np.allclose(got, ref, atol=1e-6):
-            raise RuntimeError("handcrafted six-mode diagonal case mismatch")
-        # index 2 is NW->SE
-        if float(got[2]) != 1.0:
-            raise RuntimeError("handcrafted six diagonal path did not produce expected NW->SE=1")
+            raise RuntimeError("handcrafted six-mode side-pair case mismatch")
+        # index 0 is U<->R.
+        if float(got[0]) != 1.0:
+            raise RuntimeError("handcrafted six path did not produce expected U<->R=1")
 
 
 def main() -> None:

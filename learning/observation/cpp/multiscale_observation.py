@@ -124,12 +124,13 @@ class MultiScaleCPPObservationConfig:
     #   using child-cell transfer graph.
     dtm_coarse_mode: str = "bfs"
     # DTM output channel mode:
-    # - six: LR, UD, NW->SE, SE->NW, NE->SW, SW->NE
-    # - extent6: LR, UD, NW->SE, SE->NW, NE->SW, SW->NE extents in [0,1]
+    # - six: undirected side-to-side transitions
+    #   [U<->R, U<->D, U<->L, R<->D, R<->L, D<->L]
+    # - extent6: six side-pair traversability extents in [0,1]
     #   with unknown as -1
     # - axis2: LR, UD only
     # - axis2km: LR/UD split into passable(0/1) + known(0/1)
-    # - four: legacy projection to LR, UD, NW-SE, NE-SW
+    # - four: legacy projection to LR, UD, and two grouped turn channels
     # - port6: undirected side-to-side transitions
     #   [U<->R, U<->D, U<->L, R<->D, R<->L, D<->L]
     # - port12: directed side-to-side transitions
@@ -149,7 +150,7 @@ class MultiScaleCPPObservationBuilder:
     -----
     - baseline: coverage + obstacle + frontier
     - dtm: baseline + directional traversability maps
-      (LR, UD, NW->SE, SE->NW, NE->SW, SW->NE)
+      (six side-pair transitions or the requested DTM projection)
 
     Output
     ------
@@ -158,12 +159,12 @@ class MultiScaleCPPObservationBuilder:
 
     _BASELINE_CHANNELS = ("coverage", "obstacle", "frontier")
     _DTM_CHANNELS_6 = (
-        "dtm_lr",
-        "dtm_ud",
-        "dtm_nw_se",
-        "dtm_se_nw",
-        "dtm_ne_sw",
-        "dtm_sw_ne",
+        "dtm_u_r",
+        "dtm_u_d",
+        "dtm_u_l",
+        "dtm_r_d",
+        "dtm_r_l",
+        "dtm_d_l",
     )
     _DTM_CHANNELS_2 = (
         "dtm_lr",
@@ -176,14 +177,14 @@ class MultiScaleCPPObservationBuilder:
         "dtm_ud_known",
     )
     _DTM_CHANNELS_EXTENT6 = (
-        "dtm_extent_lr",
-        "dtm_extent_ud",
-        "dtm_extent_nw_se",
-        "dtm_extent_se_nw",
-        "dtm_extent_ne_sw",
-        "dtm_extent_sw_ne",
+        "dtm_extent_u_r",
+        "dtm_extent_u_d",
+        "dtm_extent_u_l",
+        "dtm_extent_r_d",
+        "dtm_extent_r_l",
+        "dtm_extent_d_l",
     )
-    _DTM_CHANNELS_4 = ("dtm_lr", "dtm_ud", "dtm_nw_se", "dtm_ne_sw")
+    _DTM_CHANNELS_4 = ("dtm_lr", "dtm_ud", "dtm_turn_ur_dl", "dtm_turn_ul_rd")
     _DTM_CHANNELS_12 = (
         "dtm_u_r",
         "dtm_u_d",
@@ -718,19 +719,13 @@ class MultiScaleCPPObservationBuilder:
             "down": cls._side_component_set(bottom),
             "left": cls._side_component_set(left),
         }
-        nw = cls._corner_component(top=top, right=right, bottom=bottom, left=left, corner="nw")
-        ne = cls._corner_component(top=top, right=right, bottom=bottom, left=left, corner="ne")
-        se = cls._corner_component(top=top, right=right, bottom=bottom, left=left, corner="se")
-        sw = cls._corner_component(top=top, right=right, bottom=bottom, left=left, corner="sw")
-        nw_se = nw >= 0 and nw == se
-        ne_sw = ne >= 0 and ne == sw
         flags = np.zeros(6, dtype=np.float32)
-        flags[0] = 1.0 if bool(side_sets["left"] & side_sets["right"]) else 0.0
+        flags[0] = 1.0 if bool(side_sets["up"] & side_sets["right"]) else 0.0
         flags[1] = 1.0 if bool(side_sets["up"] & side_sets["down"]) else 0.0
-        flags[2] = 1.0 if nw_se else 0.0
-        flags[3] = 1.0 if nw_se else 0.0
-        flags[4] = 1.0 if ne_sw else 0.0
-        flags[5] = 1.0 if ne_sw else 0.0
+        flags[2] = 1.0 if bool(side_sets["up"] & side_sets["left"]) else 0.0
+        flags[3] = 1.0 if bool(side_sets["right"] & side_sets["down"]) else 0.0
+        flags[4] = 1.0 if bool(side_sets["right"] & side_sets["left"]) else 0.0
+        flags[5] = 1.0 if bool(side_sets["down"] & side_sets["left"]) else 0.0
         return flags
 
     def _ternary_flags(
@@ -1204,14 +1199,14 @@ class MultiScaleCPPObservationBuilder:
             out[3] = (ud >= 0.0).astype(np.float32)  # ud_known
             return out
         # Legacy 4-channel projection for older models:
-        # diagonal directions are merged by max.
+        # side-turn directions are merged by max.
         if dtm_map.shape[0] != 6:
             raise ValueError("four-channel projection expects six-channel source DTM")
         out = np.empty((4, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
-        out[0] = dtm_map[0]  # LR
+        out[0] = dtm_map[4]  # LR
         out[1] = dtm_map[1]  # UD
-        out[2] = np.maximum(dtm_map[2], dtm_map[3])  # NW-SE or SE-NW
-        out[3] = np.maximum(dtm_map[4], dtm_map[5])  # NE-SW or SW-NE
+        out[2] = np.maximum(dtm_map[0], dtm_map[5])  # UR or DL turns
+        out[3] = np.maximum(dtm_map[2], dtm_map[3])  # UL or RD turns
         return out
 
     def _aggregate_dtm_block(self, dtm_fine: np.ndarray, block: int) -> np.ndarray:
@@ -1252,14 +1247,7 @@ class MultiScaleCPPObservationBuilder:
         def add_edge(u: int, v: int):
             adj[u].append(v)
 
-        if dtm_mode == "six":
-            side_related = {
-                0: (1, 2, 3, 4, 5),  # up
-                1: (0, 2, 3, 4, 5),  # right
-                2: (1, 2, 3, 4, 5),  # down
-                3: (0, 2, 3, 4, 5),  # left
-            }
-        elif dtm_mode == "port6":
+        if dtm_mode in {"six", "port6"}:
             side_related = {
                 0: (0, 1, 2),  # up
                 1: (0, 3, 4),  # right
@@ -1294,33 +1282,8 @@ class MultiScaleCPPObservationBuilder:
                 e = nid(r, c, 1)
                 s = nid(r, c, 2)
                 w = nid(r, c, 3)
-                if dtm_mode == "six":
-                    # ch0: LR (undirected)
-                    if float(ch[0]) > 0.5:
-                        add_edge(w, e)
-                        add_edge(e, w)
-                    # ch1: UD (undirected)
-                    if float(ch[1]) > 0.5:
-                        add_edge(n, s)
-                        add_edge(s, n)
-                    # ch2: NW->SE
-                    if float(ch[2]) > 0.5:
-                        add_edge(n, e)
-                        add_edge(w, s)
-                    # ch3: SE->NW
-                    if float(ch[3]) > 0.5:
-                        add_edge(e, n)
-                        add_edge(s, w)
-                    # ch4: NE->SW
-                    if float(ch[4]) > 0.5:
-                        add_edge(n, w)
-                        add_edge(e, s)
-                    # ch5: SW->NE
-                    if float(ch[5]) > 0.5:
-                        add_edge(w, n)
-                        add_edge(s, e)
-                elif dtm_mode == "port6":
-                    # port6 channel order:
+                if dtm_mode in {"six", "port6"}:
+                    # six/port6 channel order:
                     # 0 U<->R, 1 U<->D, 2 U<->L,
                     # 3 R<->D, 4 R<->L, 5 D<->L
                     if float(ch[0]) > 0.5:
@@ -1422,28 +1385,7 @@ class MultiScaleCPPObservationBuilder:
             "left": [port_node(r, 0, 3) for r in range(bh)],
         }
 
-        if dtm_mode == "six":
-            # Diagonal flags use quadrant-cell connectivity (all 4 ports on each corner cell)
-            # instead of only corner-facing ports. This captures loop/turn-based cases
-            # that still traverse from one corner quadrant to the opposite quadrant.
-            def cell_nodes(r: int, c: int):
-                return [port_node(r, c, p) for p in range(4)]
-
-            nw_nodes = cell_nodes(0, 0)
-            se_nodes = cell_nodes(bh - 1, bw - 1)
-            ne_nodes = cell_nodes(0, bw - 1)
-            sw_nodes = cell_nodes(bh - 1, 0)
-
-            flags = np.zeros(6, dtype=np.float32)
-            flags[0] = 1.0 if (reachable(side_nodes["left"], side_nodes["right"]) or reachable(side_nodes["right"], side_nodes["left"])) else 0.0
-            flags[1] = 1.0 if (reachable(side_nodes["up"], side_nodes["down"]) or reachable(side_nodes["down"], side_nodes["up"])) else 0.0
-            flags[2] = 1.0 if reachable(nw_nodes, se_nodes) else 0.0
-            flags[3] = 1.0 if reachable(se_nodes, nw_nodes) else 0.0
-            flags[4] = 1.0 if reachable(ne_nodes, sw_nodes) else 0.0
-            flags[5] = 1.0 if reachable(sw_nodes, ne_nodes) else 0.0
-            return flags
-
-        if dtm_mode == "port6":
+        if dtm_mode in {"six", "port6"}:
             pairs = (
                 ("up", "right"),
                 ("up", "down"),

@@ -97,28 +97,22 @@ def _reach_ratio_between_sets(
 
 def _ref_extent6(passable: np.ndarray, connectivity: int) -> np.ndarray:
     h, w = passable.shape
-    lr = _reach_ratio_between_sets(
-        passable,
-        sources=_side_cells(h, w, "left"),
-        targets=_side_cells(h, w, "right"),
-        connectivity=connectivity,
-    )
+    up = _side_cells(h, w, "up")
+    right = _side_cells(h, w, "right")
+    down = _side_cells(h, w, "down")
+    left = _side_cells(h, w, "left")
+    ur = _reach_ratio_between_sets(passable, sources=up, targets=right, connectivity=connectivity)
     ud = _reach_ratio_between_sets(
         passable,
-        sources=_side_cells(h, w, "up"),
-        targets=_side_cells(h, w, "down"),
+        sources=up,
+        targets=down,
         connectivity=connectivity,
     )
-    # Quadrant-based diagonal ratios (same semantics as runtime code).
-    nw = list({*(_side_cells(h, w, "up") + _side_cells(h, w, "left"))})
-    se = list({*(_side_cells(h, w, "down") + _side_cells(h, w, "right"))})
-    ne = list({*(_side_cells(h, w, "up") + _side_cells(h, w, "right"))})
-    sw = list({*(_side_cells(h, w, "down") + _side_cells(h, w, "left"))})
-    nw_se = _reach_ratio_between_sets(passable, sources=nw, targets=se, connectivity=connectivity)
-    se_nw = _reach_ratio_between_sets(passable, sources=se, targets=nw, connectivity=connectivity)
-    ne_sw = _reach_ratio_between_sets(passable, sources=ne, targets=sw, connectivity=connectivity)
-    sw_ne = _reach_ratio_between_sets(passable, sources=sw, targets=ne, connectivity=connectivity)
-    return np.asarray([lr, ud, nw_se, se_nw, ne_sw, sw_ne], dtype=np.float32)
+    ul = _reach_ratio_between_sets(passable, sources=up, targets=left, connectivity=connectivity)
+    rd = _reach_ratio_between_sets(passable, sources=right, targets=down, connectivity=connectivity)
+    rl = _reach_ratio_between_sets(passable, sources=right, targets=left, connectivity=connectivity)
+    dl = _reach_ratio_between_sets(passable, sources=down, targets=left, connectivity=connectivity)
+    return np.asarray([ur, ud, ul, rd, rl, dl], dtype=np.float32)
 
 
 def verify_known_exact(

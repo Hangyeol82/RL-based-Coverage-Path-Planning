@@ -96,13 +96,28 @@ def _ref_flags(passable: np.ndarray, connectivity: int, output_mode: str) -> np.
 
     mode = str(output_mode).strip().lower()
     if mode == "six":
+        side_cells = {
+            "up": up,
+            "right": right,
+            "down": down,
+            "left": left,
+        }
+        pairs = (
+            ("up", "right"),
+            ("up", "down"),
+            ("up", "left"),
+            ("right", "down"),
+            ("right", "left"),
+            ("down", "left"),
+        )
         flags = np.zeros(6, dtype=np.float32)
-        flags[0] = 1.0 if _bfs_any_reach(passable, sources=left, targets=right, connectivity=connectivity) else 0.0
-        flags[1] = 1.0 if _bfs_any_reach(passable, sources=up, targets=down, connectivity=connectivity) else 0.0
-        flags[2] = 1.0 if _bfs_any_reach(passable, sources=[(0, 0)], targets=[(h - 1, w - 1)], connectivity=connectivity) else 0.0
-        flags[3] = 1.0 if _bfs_any_reach(passable, sources=[(h - 1, w - 1)], targets=[(0, 0)], connectivity=connectivity) else 0.0
-        flags[4] = 1.0 if _bfs_any_reach(passable, sources=[(0, w - 1)], targets=[(h - 1, 0)], connectivity=connectivity) else 0.0
-        flags[5] = 1.0 if _bfs_any_reach(passable, sources=[(h - 1, 0)], targets=[(0, w - 1)], connectivity=connectivity) else 0.0
+        for k, (a, b) in enumerate(pairs):
+            flags[k] = 1.0 if _bfs_any_reach(
+                passable,
+                sources=side_cells[a],
+                targets=side_cells[b],
+                connectivity=connectivity,
+            ) else 0.0
         return flags
     if mode == "port12":
         side_cells = {

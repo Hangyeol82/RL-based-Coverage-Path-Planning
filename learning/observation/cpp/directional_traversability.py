@@ -176,23 +176,36 @@ def _direction_flags_from_mask6(
     *,
     connectivity: int,
 ) -> Tuple[bool, bool, bool, bool, bool, bool]:
+    """Six undirected side-pair traversability flags.
+
+    Channel order:
+    0) up <-> right
+    1) up <-> down
+    2) up <-> left
+    3) right <-> down
+    4) right <-> left
+    5) down <-> left
+    """
     h, w = passable_mask.shape
     if h <= 0 or w <= 0:
         return False, False, False, False, False, False
 
     labels = _component_labels(passable_mask, connectivity=connectivity)
-    left_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "left"))
-    right_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "right"))
-    up_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "up"))
-    down_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "down"))
-
-    lr = _components_connected(left_ids, right_ids)
-    ud = _components_connected(up_ids, down_ids)
-    nw_se = _point_connected_labels(labels, start=(0, 0), goal=(h - 1, w - 1))
-    se_nw = _point_connected_labels(labels, start=(h - 1, w - 1), goal=(0, 0))
-    ne_sw = _point_connected_labels(labels, start=(0, w - 1), goal=(h - 1, 0))
-    sw_ne = _point_connected_labels(labels, start=(h - 1, 0), goal=(0, w - 1))
-    return lr, ud, nw_se, se_nw, ne_sw, sw_ne
+    side_ids = {
+        "up": _component_ids_from_cells(labels, cells=_side_cells(h, w, "up")),
+        "right": _component_ids_from_cells(labels, cells=_side_cells(h, w, "right")),
+        "down": _component_ids_from_cells(labels, cells=_side_cells(h, w, "down")),
+        "left": _component_ids_from_cells(labels, cells=_side_cells(h, w, "left")),
+    }
+    pairs = (
+        ("up", "right"),
+        ("up", "down"),
+        ("up", "left"),
+        ("right", "down"),
+        ("right", "left"),
+        ("down", "left"),
+    )
+    return tuple(_components_connected(side_ids[a], side_ids[b]) for a, b in pairs)
 
 
 def _direction_extent_from_mask6(
@@ -210,30 +223,13 @@ def _direction_extent_from_mask6(
     up_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "up"))
     down_ids = _component_ids_from_cells(labels, cells=_side_cells(h, w, "down"))
 
-    lr = _reach_ratio_from_component_ids(left_ids, right_ids)
+    ur = _reach_ratio_from_component_ids(up_ids, right_ids)
     ud = _reach_ratio_from_component_ids(up_ids, down_ids)
-    # Diagonal extents use quadrant-to-opposite-quadrant reachability.
-    nw_se = _edge_pair_reach_ratio_labels(
-        labels,
-        source_sides=("up", "left"),
-        target_sides=("down", "right"),
-    )
-    se_nw = _edge_pair_reach_ratio_labels(
-        labels,
-        source_sides=("down", "right"),
-        target_sides=("up", "left"),
-    )
-    ne_sw = _edge_pair_reach_ratio_labels(
-        labels,
-        source_sides=("up", "right"),
-        target_sides=("down", "left"),
-    )
-    sw_ne = _edge_pair_reach_ratio_labels(
-        labels,
-        source_sides=("down", "left"),
-        target_sides=("up", "right"),
-    )
-    return lr, ud, nw_se, se_nw, ne_sw, sw_ne
+    ul = _reach_ratio_from_component_ids(up_ids, left_ids)
+    rd = _reach_ratio_from_component_ids(right_ids, down_ids)
+    rl = _reach_ratio_from_component_ids(right_ids, left_ids)
+    dl = _reach_ratio_from_component_ids(down_ids, left_ids)
+    return ur, ud, ul, rd, rl, dl
 
 
 def _direction_flags_from_mask12(
@@ -339,12 +335,12 @@ def compute_directional_traversability(
     Output modes:
     - six:
       shape (6, H, W), channel order:
-      0) left <-> right
+      0) up <-> right
       1) up <-> down
-      2) northwest -> southeast
-      3) southeast -> northwest
-      4) northeast -> southwest
-      5) southwest -> northeast
+      2) up <-> left
+      3) right <-> down
+      4) right <-> left
+      5) down <-> left
     - extent6:
       shape (6, H, W), same channel order as six.
       Values are continuous traversability extents in [0, 1].
