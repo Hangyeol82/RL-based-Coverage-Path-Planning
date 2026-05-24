@@ -211,6 +211,20 @@ def _parse_args() -> argparse.Namespace:
     hole_group.add_argument("--hole-signals", dest="hole_signals", action="store_true")
     hole_group.add_argument("--no-hole-signals", dest="hole_signals", action="store_false")
     p.add_argument("--coverage-hole-penalty-scale", type=float, default=0.0)
+    burden_group = p.add_mutually_exclusive_group()
+    burden_group.add_argument(
+        "--revisit-burden-shaping",
+        dest="revisit_burden_shaping",
+        action="store_true",
+    )
+    burden_group.add_argument(
+        "--no-revisit-burden-shaping",
+        dest="revisit_burden_shaping",
+        action="store_false",
+    )
+    p.add_argument("--revisit-burden-scale", type=float, default=0.0)
+    p.add_argument("--revisit-burden-normalizer", type=float, default=0.0)
+    p.add_argument("--revisit-burden-unreachable-cost", type=float, default=0.0)
     p.add_argument("--metric-stagnation-threshold", type=int, default=30)
     p.add_argument("--metric-loop-window", type=int, default=12)
     boundary_group = p.add_mutually_exclusive_group()
@@ -291,6 +305,7 @@ def _parse_args() -> argparse.Namespace:
         robot_state_stagnation=True,
         cell_phase_channels=True,
         hole_signals=False,
+        revisit_burden_shaping=False,
     )
 
     p.add_argument(
@@ -428,6 +443,12 @@ def _build_run_cmd(
         str(int(args.robot_state_action_history_len)),
         "--coverage-hole-penalty-scale",
         str(float(args.coverage_hole_penalty_scale)),
+        "--revisit-burden-scale",
+        str(float(args.revisit_burden_scale)),
+        "--revisit-burden-normalizer",
+        str(float(args.revisit_burden_normalizer)),
+        "--revisit-burden-unreachable-cost",
+        str(float(args.revisit_burden_unreachable_cost)),
         "--metric-stagnation-threshold",
         str(int(args.metric_stagnation_threshold)),
         "--metric-loop-window",
@@ -506,6 +527,10 @@ def _build_run_cmd(
         cmd.append("--hole-signals")
     else:
         cmd.append("--no-hole-signals")
+    if args.revisit_burden_shaping:
+        cmd.append("--revisit-burden-shaping")
+    else:
+        cmd.append("--no-revisit-burden-shaping")
     if args.boundary_exit_features:
         cmd.append("--boundary-exit-features")
     else:

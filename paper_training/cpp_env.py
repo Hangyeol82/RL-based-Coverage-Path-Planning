@@ -10,13 +10,14 @@ from learning.reinforcement.cpp_env import CPPDiscreteEnv, CPPDiscreteEnvConfig
 from learning.reinforcement.reward import CPPRewardBreakdown
 
 from .hole_observation import HoleObservationCalculator
+from .revisit_burden_shaping import RevisitBurdenPotential, RevisitBurdenStats
 
 
 GridPos = Tuple[int, int]
 
 
 class PaperCPPDiscreteEnv(CPPDiscreteEnv):
-    """Paper-only CPP env extension for hole-risk observation/reward."""
+    """Paper-only CPP env extension for extra observations, rewards, and metrics."""
 
     def __init__(
         self,
@@ -26,6 +27,11 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         config: Optional[CPPDiscreteEnvConfig] = None,
         include_hole_signals: bool = False,
         hole_penalty_scale: float = 0.0,
+        revisit_burden_shaping: bool = False,
+        revisit_burden_scale: float = 0.0,
+        revisit_burden_gamma: float = 0.99,
+        revisit_burden_normalizer: float = 0.0,
+        revisit_burden_unreachable_cost: float = 0.0,
         metric_stagnation_threshold: int = 30,
         metric_loop_window: int = 12,
         grid_map_pool: Optional[Sequence[np.ndarray]] = None,
@@ -53,6 +59,20 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         )
         self._paper_last_hole_risk = np.zeros(4, dtype=np.float32)
         self._paper_last_hole_stats = None
+        self.paper_revisit_burden_shaping = bool(revisit_burden_shaping)
+        self.paper_revisit_burden_scale = max(0.0, float(revisit_burden_scale))
+        self.paper_revisit_burden_gamma = float(revisit_burden_gamma)
+        self._paper_revisit_burden_enabled = (
+            self.paper_revisit_burden_shaping or self.paper_revisit_burden_scale > 0.0
+        )
+        self._paper_revisit_burden_calc: Optional[RevisitBurdenPotential] = (
+            RevisitBurdenPotential(
+                normalizer=float(revisit_burden_normalizer),
+                unreachable_cost=float(revisit_burden_unreachable_cost),
+            )
+            if self._paper_revisit_burden_enabled
+            else None
+        )
         self.paper_metric_stagnation_threshold = max(1, int(metric_stagnation_threshold))
         self.paper_metric_loop_window = max(2, int(metric_loop_window))
         self._reset_paper_metrics()
@@ -145,6 +165,15 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         self._paper_last_hole_risk = self._paper_hole_calc.risk_vector(self.current_pos, self.known_map)
         return self._paper_last_hole_risk
 
+    def _compute_revisit_burden_stats(self) -> Optional[RevisitBurdenStats]:
+        if self._paper_revisit_burden_calc is None:
+            return None
+        return self._paper_revisit_burden_calc.compute(
+            self.known_map,
+            self.explored,
+            self.current_pos,
+        )
+
     def _build_observation(self) -> Dict[str, object]:
         obs = super()._build_observation()
         if self._paper_hole_enabled:
@@ -175,7 +204,9 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
             if self._paper_hole_enabled
             else np.zeros(4, dtype=np.float32)
         )
+        pre_burden = self._compute_revisit_burden_stats()
         obs, reward, done, info = super().step(action)
+        post_burden = self._compute_revisit_burden_stats()
 
         executed_action = int(info.get("action_executed", int(action)))
         executed_hole_risk = 0.0
@@ -186,8 +217,20 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         if self.paper_hole_penalty_scale > 0.0 and (not bool(info.get("collision", False))):
             reward_hole = -self.paper_hole_penalty_scale * executed_hole_risk
 
-        if reward_hole != 0.0:
-            reward = float(reward) + float(reward_hole)
+        reward_revisit_burden_shape = 0.0
+        if (
+            self.paper_revisit_burden_scale > 0.0
+            and pre_burden is not None
+            and post_burden is not None
+            and (not bool(info.get("collision", False)))
+        ):
+            reward_revisit_burden_shape = self.paper_revisit_burden_scale * (
+                self.paper_revisit_burden_gamma * float(post_burden.phi) - float(pre_burden.phi)
+            )
+
+        reward_extra = float(reward_hole) + float(reward_revisit_burden_shape)
+        if reward_extra != 0.0:
+            reward = float(reward) + reward_extra
             last = self.last_reward
             self.last_reward = CPPRewardBreakdown(
                 area=float(last.area),
@@ -236,6 +279,25 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         info["hole_risk_left"] = float(pre_risk[3])
         info["executed_hole_risk"] = float(executed_hole_risk)
         info["reward_hole"] = float(reward_hole)
+        info["reward_revisit_burden_shape"] = float(reward_revisit_burden_shape)
+        if pre_burden is not None:
+            info["revisit_burden_phi_prev"] = float(pre_burden.phi)
+            info["revisit_burden_value_prev"] = float(pre_burden.burden)
+        if post_burden is not None:
+            info["revisit_burden_phi"] = float(post_burden.phi)
+            info["revisit_burden_value"] = float(post_burden.burden)
+            info["revisit_burden_target_count"] = float(post_burden.target_count)
+            info["revisit_burden_reachable_target_count"] = float(
+                post_burden.reachable_target_count
+            )
+            info["revisit_burden_unreachable_target_count"] = float(
+                post_burden.unreachable_target_count
+            )
+            info["revisit_burden_max_cost"] = float(post_burden.max_revisit_cost)
+            info["revisit_burden_compute_ms"] = float(post_burden.compute_ms)
+        if pre_burden is not None and post_burden is not None:
+            info["revisit_burden_phi_delta"] = float(post_burden.phi - pre_burden.phi)
+            info["revisit_burden_value_delta"] = float(post_burden.burden - pre_burden.burden)
         if self._paper_last_hole_stats is not None:
             info["coverage_hole_count"] = float(self._paper_last_hole_stats.count)
             info["coverage_hole_known_mass"] = float(self._paper_last_hole_stats.known_mass)
@@ -302,6 +364,11 @@ class PaperCPPDiscreteGymEnv(gym.Env):
         config: Optional[CPPDiscreteEnvConfig] = None,
         include_hole_signals: bool = False,
         hole_penalty_scale: float = 0.0,
+        revisit_burden_shaping: bool = False,
+        revisit_burden_scale: float = 0.0,
+        revisit_burden_gamma: float = 0.99,
+        revisit_burden_normalizer: float = 0.0,
+        revisit_burden_unreachable_cost: float = 0.0,
         metric_stagnation_threshold: int = 30,
         metric_loop_window: int = 12,
         grid_map_pool: Optional[Sequence[np.ndarray]] = None,
@@ -317,6 +384,11 @@ class PaperCPPDiscreteGymEnv(gym.Env):
             config=config,
             include_hole_signals=include_hole_signals,
             hole_penalty_scale=hole_penalty_scale,
+            revisit_burden_shaping=revisit_burden_shaping,
+            revisit_burden_scale=revisit_burden_scale,
+            revisit_burden_gamma=revisit_burden_gamma,
+            revisit_burden_normalizer=revisit_burden_normalizer,
+            revisit_burden_unreachable_cost=revisit_burden_unreachable_cost,
             metric_stagnation_threshold=metric_stagnation_threshold,
             metric_loop_window=metric_loop_window,
             grid_map_pool=grid_map_pool,

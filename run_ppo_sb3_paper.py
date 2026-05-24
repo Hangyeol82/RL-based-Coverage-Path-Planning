@@ -110,6 +110,36 @@ def _parse_args() -> argparse.Namespace:
         default=0.0,
         help="Penalty applied when the executed action has confirmed hole risk.",
     )
+    burden_group = p.add_mutually_exclusive_group()
+    burden_group.add_argument(
+        "--revisit-burden-shaping",
+        dest="revisit_burden_shaping",
+        action="store_true",
+        help="Enable potential-based shaping on known-free revisit burden.",
+    )
+    burden_group.add_argument(
+        "--no-revisit-burden-shaping",
+        dest="revisit_burden_shaping",
+        action="store_false",
+    )
+    p.add_argument(
+        "--revisit-burden-scale",
+        type=float,
+        default=0.0,
+        help="Scale for gamma*phi(s') - phi(s) revisit-burden shaping.",
+    )
+    p.add_argument(
+        "--revisit-burden-normalizer",
+        type=float,
+        default=0.0,
+        help="Normalizer for revisit-burden potential. 0 uses max(map height, width).",
+    )
+    p.add_argument(
+        "--revisit-burden-unreachable-cost",
+        type=float,
+        default=0.0,
+        help="Finite cost assigned to known-free targets unreachable in the known map. 0 uses max(map height, width).",
+    )
     p.add_argument(
         "--metric-stagnation-threshold",
         type=int,
@@ -315,6 +345,7 @@ def _parse_args() -> argparse.Namespace:
         robot_state_stagnation=True,
         cell_phase_channels=True,
         hole_signals=False,
+        revisit_burden_shaping=False,
     )
     return p.parse_args()
 
@@ -657,6 +688,11 @@ def main():
         config=env_cfg,
         include_hole_signals=bool(args.hole_signals),
         hole_penalty_scale=float(args.coverage_hole_penalty_scale),
+        revisit_burden_shaping=bool(args.revisit_burden_shaping),
+        revisit_burden_scale=float(args.revisit_burden_scale),
+        revisit_burden_gamma=float(args.gamma),
+        revisit_burden_normalizer=float(args.revisit_burden_normalizer),
+        revisit_burden_unreachable_cost=float(args.revisit_burden_unreachable_cost),
         metric_stagnation_threshold=int(args.metric_stagnation_threshold),
         metric_loop_window=int(args.metric_loop_window),
         grid_map_pool=grid_pool,
@@ -712,6 +748,11 @@ def main():
             config=env_cfg,
             include_hole_signals=bool(args.hole_signals),
             hole_penalty_scale=float(args.coverage_hole_penalty_scale),
+            revisit_burden_shaping=bool(args.revisit_burden_shaping),
+            revisit_burden_scale=float(args.revisit_burden_scale),
+            revisit_burden_gamma=float(args.gamma),
+            revisit_burden_normalizer=float(args.revisit_burden_normalizer),
+            revisit_burden_unreachable_cost=float(args.revisit_burden_unreachable_cost),
             metric_stagnation_threshold=int(args.metric_stagnation_threshold),
             metric_loop_window=int(args.metric_loop_window),
             grid_map_pool=grid_pool,
@@ -824,6 +865,14 @@ def main():
         "Hole features:"
         f" signals={bool(args.hole_signals)},"
         f" penalty_scale={float(args.coverage_hole_penalty_scale):.3f}"
+    )
+    print(
+        "Revisit-burden shaping:"
+        f" enabled={bool(args.revisit_burden_shaping) or float(args.revisit_burden_scale) > 0.0},"
+        f" scale={float(args.revisit_burden_scale):.4f},"
+        f" gamma={float(args.gamma):.4f},"
+        f" normalizer={float(args.revisit_burden_normalizer):.1f},"
+        f" unreachable_cost={float(args.revisit_burden_unreachable_cost):.1f}"
     )
     print(
         "Paper metrics:"
