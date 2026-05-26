@@ -40,6 +40,14 @@ def _parse_args() -> Tuple[argparse.Namespace, List[str]]:
         default=str(REPO_ROOT / "run_ppo_shapegrid_curriculum_paper.py"),
         help="Path to run_ppo_shapegrid_curriculum_paper.py.",
     )
+    parser.add_argument(
+        "--allow-revisit-burden-shaping",
+        action="store_true",
+        help=(
+            "Allow revisit-burden shaping passthrough. By default this offline "
+            "launcher rejects it so baseline/DTM comparisons stay reward-matched."
+        ),
+    )
     args, passthrough = parser.parse_known_args()
     return args, list(passthrough)
 
@@ -67,6 +75,22 @@ def _pop_option(args: List[str], option: str) -> Tuple[List[str], str]:
         out.append(item)
         i += 1
     return out, value
+
+
+def _reject_revisit_burden_args(args: argparse.Namespace, passthrough: List[str]):
+    if bool(args.allow_revisit_burden_shaping):
+        return
+    if _has_flag(passthrough, "--revisit-burden-shaping"):
+        raise ValueError(
+            "Offline baseline/DTM runs should not use revisit-burden shaping. "
+            "Remove --revisit-burden-shaping, or pass --allow-revisit-burden-shaping explicitly."
+        )
+    _, scale = _pop_option(list(passthrough), "--revisit-burden-scale")
+    if scale and abs(float(scale)) > 0.0:
+        raise ValueError(
+            "Offline baseline/DTM runs should keep --revisit-burden-scale 0.0. "
+            "Remove the nonzero scale, or pass --allow-revisit-burden-shaping explicitly."
+        )
 
 
 def _variant_tag(base_tag: str, variant: str, variants: List[str]) -> str:
@@ -116,6 +140,7 @@ def _run_variant(args: argparse.Namespace, passthrough: List[str], variant: str,
 
 def main():
     args, passthrough = _parse_args()
+    _reject_revisit_burden_args(args, passthrough)
     variants = ["baseline", "dtm"] if args.variant == "both" else [str(args.variant)]
     for variant in variants:
         _run_variant(args, passthrough, variant, variants)
