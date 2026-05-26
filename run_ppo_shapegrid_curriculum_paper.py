@@ -193,6 +193,14 @@ def _parse_args() -> argparse.Namespace:
         help="End episodes at this coverage threshold. 1.0 keeps full-coverage-only termination.",
     )
     p.add_argument("--sensor-range", type=int, default=2)
+    p.add_argument(
+        "--full-map-observation",
+        action="store_true",
+        help=(
+            "Offline/full-known setting forwarded to run_ppo_sb3_paper.py. "
+            "The true map is revealed as known_map at every step."
+        ),
+    )
     p.add_argument("--max-episode-steps", type=int, default=2000)
     rs_pos_group = p.add_mutually_exclusive_group()
     rs_pos_group.add_argument("--robot-state-position", dest="robot_state_position", action="store_true")
@@ -492,6 +500,8 @@ def _build_run_cmd(
         "--save-breakdown-csv",
         str(save_csv),
     ]
+    if args.full_map_observation:
+        cmd.append("--full-map-observation")
     if args.include_dtm:
         cmd.append("--include-dtm")
     if int(args.maps_per_chunk) > 1:
@@ -617,7 +627,8 @@ def main():
     print(
         f"[INFO] total={total} chunk={chunk} mode={args.curriculum_mode} "
         f"stage={args.stage_timesteps} chunks={num_chunks} "
-        f"num_envs={args.num_envs} vec={args.vec_env}"
+        f"num_envs={args.num_envs} vec={args.vec_env} "
+        f"observation={'offline_full_map' if args.full_map_observation else 'online_partial'}"
     , flush=True)
     print(f"[INFO] out_dir={out_dir}", flush=True)
     if args.curriculum_mode == "adaptive":
