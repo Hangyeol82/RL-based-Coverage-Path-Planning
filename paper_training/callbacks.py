@@ -39,6 +39,8 @@ class PaperMetricsCallback(BaseCallback):
         "reward_hole",
         "reward_revisit_burden_shape",
         "reward_total",
+        "offline_full_map",
+        "offline_known_ratio",
         "coverage_ratio",
         "collision",
         "turn_event",

@@ -30,6 +30,7 @@ from learning.reinforcement.reward import CPPRewardConfig
 from learning.reinforcement.sb3_policy import MAPSStateFeaturesExtractor
 from paper_training.callbacks import PaperMetricsCallback
 from paper_training.cpp_env import PaperCPPDiscreteEnv, PaperCPPDiscreteGymEnv
+from paper_training.offline_cpp_env import OfflinePaperCPPDiscreteEnv, OfflinePaperCPPDiscreteGymEnv
 from MapGenerator import MapGenerator
 from run_cstar_custom_map import CUSTOM_MAP_TEXT, parse_custom_map
 
@@ -81,6 +82,14 @@ def _parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--sensor-range", type=int, default=2, help="2 -> 5x5 sensing window")
+    p.add_argument(
+        "--full-map-observation",
+        action="store_true",
+        help=(
+            "Offline/full-known setting: reveal the complete true map as known_map "
+            "at every step while keeping the PPO loop, reward, and metrics unchanged."
+        ),
+    )
     p.add_argument(
         "--local-blocks",
         type=str,
@@ -682,7 +691,10 @@ def main():
         reward=reward_cfg,
     )
 
-    probe = PaperCPPDiscreteEnv(
+    CoreEnvClass = OfflinePaperCPPDiscreteEnv if bool(args.full_map_observation) else PaperCPPDiscreteEnv
+    GymEnvClass = OfflinePaperCPPDiscreteGymEnv if bool(args.full_map_observation) else PaperCPPDiscreteGymEnv
+
+    probe = CoreEnvClass(
         grid_map=grid,
         start_pos=start,
         config=env_cfg,
@@ -739,7 +751,7 @@ def main():
         vec_kwargs = {"start_method": start_method}
 
     vec_env = make_vec_env(
-        PaperCPPDiscreteGymEnv,
+        GymEnvClass,
         n_envs=args.num_envs,
         seed=args.seed,
         env_kwargs=dict(
@@ -818,6 +830,11 @@ def main():
 
     print(f"Device: {device}")
     print(f"Map: source={args.map_source}, shape={grid.shape}, include_dtm={args.include_dtm}")
+    print(
+        "Observation setting:"
+        f" {'offline_full_map' if bool(args.full_map_observation) else 'online_partial'},"
+        f" sensor_range={int(args.sensor_range)}"
+    )
     print(
         "Map pool:"
         f" size={len(grid_pool)},"
