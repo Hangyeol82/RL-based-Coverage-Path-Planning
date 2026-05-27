@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Dict, Optional, Sequence
 
 import gymnasium as gym
@@ -19,6 +20,25 @@ class OfflinePaperCPPDiscreteEnv(PaperCPPDiscreteEnv):
     the complete true map into known_map, so map-observation builders receive a
     fully known occupancy map at every step.
     """
+
+    def __init__(
+        self,
+        grid_map: np.ndarray,
+        *,
+        start_pos: Optional[GridPos] = None,
+        config: Optional[CPPDiscreteEnvConfig] = None,
+        **kwargs,
+    ):
+        config = replace(
+            config or CPPDiscreteEnvConfig(),
+            preserve_static_map_observation_cache_on_reset=True,
+        )
+        super().__init__(
+            grid_map=grid_map,
+            start_pos=start_pos,
+            config=config,
+            **kwargs,
+        )
 
     def _sense_at(self, pos: GridPos):
         self.known_map[:, :] = self.true_map

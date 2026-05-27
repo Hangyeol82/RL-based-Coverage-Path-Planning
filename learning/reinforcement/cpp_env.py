@@ -56,6 +56,10 @@ class CPPDiscreteEnvConfig:
     profile_observation: bool = False
     profile_interval_steps: int = 200
     profile_name: str = ""
+    # Offline/full-known maps have static occupancy within an episode reset.
+    # Preserving occupancy-derived DTM caches avoids rebuilding full-map DTM
+    # every time only coverage/explored state is reset.
+    preserve_static_map_observation_cache_on_reset: bool = False
 
     observation: MultiScaleCPPObservationConfig = field(
         default_factory=MultiScaleCPPObservationConfig,
@@ -562,9 +566,12 @@ class CPPDiscreteEnv:
 
         self.known_map.fill(-1)
         self.explored.fill(False)
-        self.maps_builder.reset_incremental_state()
+        preserve_static_map_cache = bool(self.config.preserve_static_map_observation_cache_on_reset)
+        self.maps_builder.reset_incremental_state(preserve_static_map=preserve_static_map_cache)
         if self._boundary_maps_builder is not None:
-            self._boundary_maps_builder.reset_incremental_state()
+            self._boundary_maps_builder.reset_incremental_state(
+                preserve_static_map=preserve_static_map_cache,
+            )
         self._sense_at(self.current_pos)
         self._mark_explored(self.current_pos)
 

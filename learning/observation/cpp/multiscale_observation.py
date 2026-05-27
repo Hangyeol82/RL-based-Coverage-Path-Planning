@@ -268,13 +268,15 @@ class MultiScaleCPPObservationBuilder:
         self._profile_totals = {}
         self._profile_calls = 0
 
-    def reset_incremental_state(self):
+    def reset_incremental_state(self, *, preserve_static_map: bool = False):
         self._coarse_cache = {}
-        self._prev_occupancy = None
         self._prev_explored = None
         self._prev_covered = None
-        self._prev_known_obstacle = None
         self._prev_frontier = None
+        if preserve_static_map:
+            return
+        self._prev_occupancy = None
+        self._prev_known_obstacle = None
         self._dtm_cache.clear()
         self._boundary_summary_cache.clear()
         self._boundary_summary_shape = None
