@@ -201,7 +201,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model-size",
         type=str,
-        default="small",
+        default="xlarge",
         choices=["small", "large", "xlarge"],
         help="Forwarded to run_ppo_sb3.py encoder size preset.",
     )
@@ -240,6 +240,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--n-steps", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--n-epochs", type=int, default=4)
+    p.add_argument(
+        "--ent-coef-base",
+        type=float,
+        default=0.01,
+        help="Base PPO entropy coefficient passed to run_ppo_sb3.py.",
+    )
+    p.add_argument(
+        "--ent-coef-boost",
+        type=float,
+        default=0.02,
+        help="Entropy coefficient used for a few chunks right after curriculum promotion.",
+    )
+    p.add_argument(
+        "--ent-coef-boost-chunks",
+        type=int,
+        default=2,
+        help="Number of chunks to apply boosted entropy after each promotion.",
+    )
 
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument("--action-mask", dest="action_mask", action="store_true")
@@ -388,6 +406,7 @@ def _build_run_cmd(
     *,
     runner: Path,
     chunk_timesteps: int,
+    ent_coef: float,
     run_seed: int,
     map_file: Path,
     save_model: Path,
@@ -417,6 +436,8 @@ def _build_run_cmd(
         str(int(args.batch_size)),
         "--n-epochs",
         str(int(args.n_epochs)),
+        "--ent-coef",
+        str(float(ent_coef)),
         "--verbose",
         "0",
         "--sensor-range",
@@ -560,6 +581,12 @@ def main():
         raise ValueError("--eval-every-chunks must be positive")
     if args.eval_max_episode_steps < 0:
         raise ValueError("--eval-max-episode-steps must be >= 0")
+    if float(args.ent_coef_base) < 0.0:
+        raise ValueError("--ent-coef-base must be >= 0")
+    if float(args.ent_coef_boost) < 0.0:
+        raise ValueError("--ent-coef-boost must be >= 0")
+    if int(args.ent_coef_boost_chunks) < 0:
+        raise ValueError("--ent-coef-boost-chunks must be >= 0")
 
     phase_levels = _parse_int_list(args.phase_levels, name="phase-levels")
     adaptive_cov_thresholds = _parse_float_list(
@@ -640,6 +667,13 @@ def main():
         f"num_envs={args.num_envs} vec={args.vec_env}"
     , flush=True)
     print(f"[INFO] out_dir={out_dir}", flush=True)
+    print(
+        "[INFO] entropy schedule:"
+        f" base={float(args.ent_coef_base):.6f},"
+        f" boost={float(args.ent_coef_boost):.6f},"
+        f" boost_chunks={int(args.ent_coef_boost_chunks)}",
+        flush=True,
+    )
     if args.curriculum_mode == "adaptive":
         print(
             "[INFO] adaptive gates:"
@@ -666,6 +700,8 @@ def main():
     failed = False
     adaptive_stage_idx = 0
     adaptive_stage_chunks: List[Dict] = []
+    prev_stage_idx: Optional[int] = None
+    ent_boost_remaining = 0
 
     for i in range(num_chunks):
         chunk_start = done_steps
@@ -681,6 +717,14 @@ def main():
             preset = PRESETS[level]
         map_seed = int(args.seed if args.map_seed_mode == "fixed" else (args.seed + i))
         run_seed = int(args.seed + i)
+        if prev_stage_idx is not None and stage_idx > prev_stage_idx:
+            ent_boost_remaining = int(args.ent_coef_boost_chunks)
+        if ent_boost_remaining > 0:
+            ent_coef = float(args.ent_coef_boost)
+            ent_boost_remaining -= 1
+        else:
+            ent_coef = float(args.ent_coef_base)
+        prev_stage_idx = int(stage_idx)
 
         grid = build_shape_grid_map(
             size=int(args.map_size),
@@ -713,6 +757,7 @@ def main():
             args,
             runner=runner,
             chunk_timesteps=chunk_t,
+            ent_coef=ent_coef,
             run_seed=run_seed,
             map_file=map_txt,
             save_model=save_model_base,
@@ -725,7 +770,7 @@ def main():
         print(
             f"\n[CHUNK {i+1}/{num_chunks}] steps={chunk_t} "
             f"curriculum=L{preset.level}({preset.name}) map_seed={map_seed} "
-            f"obs_ratio={obs_ratio:.3f}"
+            f"obs_ratio={obs_ratio:.3f} ent_coef={ent_coef:.6f}"
         , flush=True)
         print(f"[RUN] {' '.join(cmd)}", flush=True)
 

@@ -95,8 +95,11 @@ class MultiScaleCPPObservationConfig:
     # Robot-centered local levels.
     local_blocks: Tuple[int, ...] = (1, 2, 4, 8, 16)
     local_window_size: int = 7
-    # Global level.
+    # Final coarse level. It is also robot-centered; global_window_size controls
+    # the approximate number of coarse cells that span the full map axis
+    # (e.g. 128 / 4 => block size 32).
     global_window_size: int = 4
+    global_robot_centered_block: Optional[int] = None
     # Occupancy coding.
     unknown_value: int = -1
     obstacle_value: int = 1
@@ -139,7 +142,11 @@ class MultiScaleCPPObservationConfig:
     # Append per-level robot-in-cell phase channels:
     # [sin(row_phase), cos(row_phase), sin(col_phase), cos(col_phase)].
     # This helps disambiguate where the robot is inside each coarse cell.
-    include_cell_phase_channels: bool = True
+    include_cell_phase_channels: bool = False
+    # DTM at the finest local level duplicates one-cell occupancy/free-space
+    # information already represented by the baseline channels, so omit it
+    # from level 0 and keep DTM only for coarser summaries.
+    exclude_dtm_level0: bool = True
 
 
 class MultiScaleCPPObservationBuilder:
@@ -326,33 +333,65 @@ class MultiScaleCPPObservationBuilder:
     def num_levels(self) -> int:
         return len(self.config.local_blocks) + 1
 
+    def _global_level_block(self, map_shape: Tuple[int, int]) -> int:
+        override = self.config.global_robot_centered_block
+        if override is not None:
+            return max(1, int(override))
+        h, w = int(map_shape[0]), int(map_shape[1])
+        gsize = max(1, int(self.config.global_window_size))
+        max_dim = max(1, h, w)
+        return max(1, (max_dim + gsize - 1) // gsize)
+
     @property
     def channel_names(self) -> Tuple[str, ...]:
+        # Backward-compatible representative channel list. When DTM is enabled
+        # and level 0 is excluded, coarser levels still use the full list.
+        if self.include_dtm and self.config.exclude_dtm_level0 and self.num_levels > 1:
+            return self.channel_names_for_level(1)
+        return self.channel_names_for_level(0)
+
+    def _dtm_channel_names(self) -> Tuple[str, ...]:
         if self.include_dtm:
             if self.config.dtm_output_mode == "six":
-                dtm_names = self._DTM_CHANNELS_6
+                return self._DTM_CHANNELS_6
             elif self.config.dtm_output_mode == "extent6":
-                dtm_names = self._DTM_CHANNELS_EXTENT6
+                return self._DTM_CHANNELS_EXTENT6
             elif self.config.dtm_output_mode == "axis2":
-                dtm_names = self._DTM_CHANNELS_2
+                return self._DTM_CHANNELS_2
             elif self.config.dtm_output_mode == "axis2km":
-                dtm_names = self._DTM_CHANNELS_4_AXIS2KM
+                return self._DTM_CHANNELS_4_AXIS2KM
             elif self.config.dtm_output_mode == "four":
-                dtm_names = self._DTM_CHANNELS_4
+                return self._DTM_CHANNELS_4
             elif self.config.dtm_output_mode == "port6":
-                dtm_names = self._DTM_CHANNELS_PORT6
+                return self._DTM_CHANNELS_PORT6
             else:
-                dtm_names = self._DTM_CHANNELS_12
-            names = self._BASELINE_CHANNELS + dtm_names
-        else:
-            names = self._BASELINE_CHANNELS
+                return self._DTM_CHANNELS_12
+        return ()
+
+    def _include_dtm_for_level(self, level_id: int) -> bool:
+        return bool(self.include_dtm) and not (
+            bool(self.config.exclude_dtm_level0) and int(level_id) == 0
+        )
+
+    def channel_names_for_level(self, level_id: int) -> Tuple[str, ...]:
+        names = self._BASELINE_CHANNELS
+        if self._include_dtm_for_level(level_id):
+            names = names + self._dtm_channel_names()
         if self.config.include_cell_phase_channels:
             names = names + self._CELL_PHASE_CHANNELS
         return names
 
     @property
+    def channel_names_by_level(self) -> Tuple[Tuple[str, ...], ...]:
+        return tuple(self.channel_names_for_level(lv) for lv in range(self.num_levels))
+
+    @property
     def channels_per_level(self) -> int:
         return len(self.channel_names)
+
+    @property
+    def channels_per_level_by_level(self) -> Tuple[int, ...]:
+        return tuple(len(names) for names in self.channel_names_by_level)
 
     def _compute_changed_mask(self, occupancy: np.ndarray) -> np.ndarray:
         # First frame (or map shape change): force full DTM refresh.
@@ -1576,6 +1615,7 @@ class MultiScaleCPPObservationBuilder:
         center: Optional[GridPos],
         out_size: int,
         cell_phase: Optional[Tuple[float, float, float, float]] = None,
+        include_dtm: Optional[bool] = None,
     ) -> np.ndarray:
         if center is not None:
             cov = center_crop_with_pad(coverage_map, center, out_size, out_size, pad_value=0.0)
@@ -1588,7 +1628,8 @@ class MultiScaleCPPObservationBuilder:
 
         channels = [cov, obs, frn]
 
-        if self.include_dtm:
+        use_dtm = self.include_dtm if include_dtm is None else bool(include_dtm)
+        if use_dtm:
             if dtm_map is not None:
                 dtm = self._project_dtm_output(dtm_map)
             else:
@@ -1831,6 +1872,40 @@ class MultiScaleCPPObservationBuilder:
         col_sin, col_cos = self._phase_sincos(int(cc), float(coarse_w))
         return row_sin, row_cos, col_sin, col_cos
 
+    def build_cell_phase_features(
+        self,
+        map_shape: Tuple[int, int],
+        *,
+        robot_pos: GridPos,
+    ) -> np.ndarray:
+        if len(map_shape) != 2:
+            raise ValueError("map_shape must contain (height, width)")
+        h, w = int(map_shape[0]), int(map_shape[1])
+        rr, cc = robot_pos
+        if not (0 <= rr < h and 0 <= cc < w):
+            raise ValueError(f"robot_pos {robot_pos} is out of bounds {(h, w)}")
+
+        features: List[float] = []
+        # Level 0 corresponds to a single original grid cell, so robot-in-cell
+        # phase is constant and carries no useful relative-position signal.
+        for block in self.config.local_blocks[1:]:
+            features.extend(
+                self._compute_cell_phase(
+                    robot_pos=robot_pos,
+                    coarse_h=float(block),
+                    coarse_w=float(block),
+                )
+            )
+        global_block = self._global_level_block((h, w))
+        features.extend(
+            self._compute_cell_phase(
+                robot_pos=robot_pos,
+                coarse_h=float(global_block),
+                coarse_w=float(global_block),
+            )
+        )
+        return np.asarray(features, dtype=np.float32)
+
     def build_levels(
         self,
         occupancy: np.ndarray,
@@ -1899,12 +1974,10 @@ class MultiScaleCPPObservationBuilder:
                 if exp is not None:
                     block_power[int(block)] = exp
                     max_boundary_power = max(max_boundary_power, exp)
-            gsize_tmp = int(self.config.global_window_size)
-            if h == w and gsize_tmp > 0 and (h % gsize_tmp) == 0:
-                gblock = h // gsize_tmp
-                gexp = self._power_of_two_exp(gblock)
-                if gexp is not None:
-                    max_boundary_power = max(max_boundary_power, gexp)
+            global_block_tmp = self._global_level_block((h, w))
+            gexp = self._power_of_two_exp(global_block_tmp)
+            if gexp is not None:
+                max_boundary_power = max(max_boundary_power, gexp)
         need_fine_dtm = self.include_dtm and (
             use_boundary_summary_dtm
             or self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}
@@ -2042,17 +2115,18 @@ class MultiScaleCPPObservationBuilder:
                 center=center_coarse,
                 out_size=self.config.local_window_size,
                 cell_phase=cell_phase_local,
+                include_dtm=self._include_dtm_for_level(lv),
             )
             if self._profile_enabled:
                 self._profile_add("local_pack", perf_counter() - t2)
 
-        # Global non-centered level.
-        gsize = self.config.global_window_size
+        # Final robot-centered coarse level.
+        global_block = self._global_level_block((h, w))
         t0 = perf_counter() if self._profile_enabled else 0.0
         level_id = len(self.config.local_blocks)
-        cov_global, known_ratio_global, obs_global, frn_global, state_global = self._get_global_level_maps(
+        cov_global, known_ratio_global, obs_global, frn_global, state_global = self._get_local_level_maps(
             level_id=level_id,
-            out_size=gsize,
+            block=global_block,
             covered_f=covered_f,
             obstacle_f=obstacle_f,
             frontier_f=frontier_f,
@@ -2070,9 +2144,7 @@ class MultiScaleCPPObservationBuilder:
         dtm_global = None
         if self.include_dtm:
             t1 = perf_counter() if self._profile_enabled else 0.0
-            global_power = None
-            if use_boundary_summary_dtm and h == w and gsize > 0 and (h % gsize) == 0:
-                global_power = self._power_of_two_exp(h // gsize)
+            global_power = self._power_of_two_exp(global_block)
             if use_boundary_summary_dtm and global_power is not None:
                 dtm_global = self._dtm_from_boundary_summary_level(
                     level_id=level_id,
@@ -2080,38 +2152,52 @@ class MultiScaleCPPObservationBuilder:
                     dirty_mask=boundary_dirty_by_power.get(global_power),
                 )
             elif self.config.dtm_coarse_mode in {"aggregate", "aggregate_transfer"}:
-                dtm_global = self._aggregate_dtm_global(dtm_fine, gsize, gsize)
+                if global_block == 1:
+                    dtm_global = dtm_fine
+                elif self.config.dtm_coarse_mode == "aggregate_transfer":
+                    dtm_global = self._aggregate_dtm_block_transfer(
+                        dtm_fine=dtm_fine,
+                        state_fine=state_fine,
+                        state_coarse=state_global,
+                        block=global_block,
+                    )
+                else:
+                    dtm_global = self._aggregate_dtm_block(dtm_fine, global_block)
             else:
-                if dtm_fine is not None and state_fine is not None:
-                    row_edges = self._global_edges(h, gsize)
-                    col_edges = self._global_edges(w, gsize)
-                    dirty_parent = self._dirty_global_from_changed(occupancy_changed, gsize, gsize)
+                if global_block == 1:
+                    changed_global = self._dirty_blocks_from_changed(occupancy_changed, global_block)
+                    dtm_global = self._update_dtm_level(
+                        level_id=level_id,
+                        state_map=state_global,
+                        known_ratio_map=known_ratio_global,
+                        changed_mask=changed_global,
+                    )
+                elif dtm_fine is not None and state_fine is not None:
+                    dirty_parent = self._dirty_blocks_from_changed(occupancy_changed, global_block)
                     cache = self._dtm_cache.get(level_id, None)
                     if cache is not None and cache.shape == (
                         self._native_dtm_channels(),
-                        gsize,
-                        gsize,
+                        state_global.shape[0],
+                        state_global.shape[1],
                     ):
-                        dtm_global = self._compose_dtm_partition_from_children(
+                        dtm_global = self._compose_dtm_block_from_children(
                             dtm_child=dtm_fine,
                             state_child=state_fine,
                             known_ratio_parent=known_ratio_global,
-                            row_edges=row_edges,
-                            col_edges=col_edges,
+                            block_r=global_block,
                             out=cache,
                             dirty_mask=dirty_parent,
                         )
                     else:
-                        dtm_global = self._compose_dtm_partition_from_children(
+                        dtm_global = self._compose_dtm_block_from_children(
                             dtm_child=dtm_fine,
                             state_child=state_fine,
                             known_ratio_parent=known_ratio_global,
-                            row_edges=row_edges,
-                            col_edges=col_edges,
+                            block_r=global_block,
                         )
                     self._dtm_cache[level_id] = dtm_global
                 else:
-                    changed_global = self._dirty_global_from_changed(occupancy_changed, gsize, gsize)
+                    changed_global = self._dirty_blocks_from_changed(occupancy_changed, global_block)
                     dtm_global = self._update_dtm_level(
                         level_id=level_id,
                         state_map=state_global,
@@ -2121,26 +2207,25 @@ class MultiScaleCPPObservationBuilder:
             if self._profile_enabled:
                 self._profile_add("global_dtm", perf_counter() - t1)
 
-        # Global coarse cell size can be non-integer when map size is not divisible by gsize.
-        global_cell_h = float(max(1, h)) / float(max(1, gsize))
-        global_cell_w = float(max(1, w)) / float(max(1, gsize))
+        center_global = (rr // global_block, cc // global_block)
         cell_phase_global = self._compute_cell_phase(
             robot_pos=(rr, cc),
-            coarse_h=global_cell_h,
-            coarse_w=global_cell_w,
+            coarse_h=float(global_block),
+            coarse_w=float(global_block),
         )
 
         t2 = perf_counter() if self._profile_enabled else 0.0
-        levels[len(self.config.local_blocks)] = self._build_level_channels(
+        levels[level_id] = self._build_level_channels(
             cov_global,
             obs_global,
             frn_global,
             state_global,
             known_ratio_global,
             dtm_global,
-            center=None,
-            out_size=gsize,
+            center=center_global,
+            out_size=self.config.local_window_size,
             cell_phase=cell_phase_global,
+            include_dtm=self._include_dtm_for_level(level_id),
         )
         if self._profile_enabled:
             self._profile_add("global_pack", perf_counter() - t2)

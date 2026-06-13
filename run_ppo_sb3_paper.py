@@ -231,13 +231,13 @@ def _parse_args() -> argparse.Namespace:
         "--cell-phase-channels",
         dest="cell_phase_channels",
         action="store_true",
-        help="Append per-level robot-in-cell phase channels to map observations.",
+        help="Append per-level robot-in-cell phase features to robot_state.",
     )
     phase_group.add_argument(
         "--no-cell-phase-channels",
         dest="cell_phase_channels",
         action="store_false",
-        help="Disable per-level robot-in-cell phase channels.",
+        help="Disable per-level robot-in-cell phase features.",
     )
     p.add_argument(
         "--dtm-coarse-mode",
@@ -272,7 +272,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model-size",
         type=str,
-        default="small",
+        default="xlarge",
         choices=["small", "large", "xlarge"],
         help="Policy encoder size preset.",
     )
@@ -350,13 +350,16 @@ def _parse_args() -> argparse.Namespace:
         boundary_exit_features=False,
         robot_state_position=True,
         robot_state_action_history=True,
-        robot_state_progress=True,
-        robot_state_stagnation=True,
+        robot_state_progress=False,
+        robot_state_stagnation=False,
         cell_phase_channels=True,
         hole_signals=False,
         revisit_burden_shaping=False,
     )
-    return p.parse_args()
+    args = p.parse_args()
+    args.robot_state_progress = False
+    args.robot_state_stagnation = False
+    return args
 
 
 def _set_seed(seed: int):
@@ -643,9 +646,8 @@ def main():
     local_blocks = _parse_local_blocks(args.local_blocks)
 
     reward_cfg = CPPRewardConfig(
-        newly_visited_reward_scale=0.7,
-        newly_visited_reward_max=1.5,
-        local_tv_reward_scale=1.0,
+        new_cell_reward=0.7,
+        local_tv_reward_scale=0.0,
         local_tv_reward_max=5.0,
         local_tv_normalizer=2.5,
         global_tv_reward_scale=0.0,
@@ -678,7 +680,7 @@ def main():
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_connectivity=int(args.dtm_connectivity),
-            include_cell_phase_channels=bool(args.cell_phase_channels),
+            include_cell_phase_channels=False,
         ),
         robot_state=RobotStateObservationConfig(
             action_history_len=int(args.robot_state_action_history_len),
@@ -687,6 +689,7 @@ def main():
             include_progress=bool(args.robot_state_progress),
             include_stagnation=bool(args.robot_state_stagnation),
         ),
+        use_cell_phase_features=bool(args.cell_phase_channels),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
     )
@@ -715,10 +718,15 @@ def main():
     )
     probe_obs = probe.reset()
     robot_state_dim = int(np.asarray(probe_obs["robot_state"], dtype=np.float32).shape[0])
+    level_ids = tuple(sorted(probe_obs["levels"].keys()))
+    level_channels = tuple(
+        int(np.asarray(probe_obs["levels"][lv], dtype=np.float32).shape[0])
+        for lv in level_ids
+    )
     model_cfg = _model_preset(str(args.model_size))
     maps_cfg = MultiLevelMAPSEncoderConfig(
         num_levels=probe.maps_builder.num_levels,
-        in_channels_per_level=probe.maps_builder.channels_per_level,
+        in_channels_per_level=level_channels,
         conv_channels=model_cfg["conv_channels"],
         level_embed_dim=int(model_cfg["level_embed_dim"]),
         mode=args.maps_encoder_mode,
@@ -830,6 +838,7 @@ def main():
 
     print(f"Device: {device}")
     print(f"Map: source={args.map_source}, shape={grid.shape}, include_dtm={args.include_dtm}")
+    print(f"Map observation channels by level: {level_channels}")
     print(
         "Observation setting:"
         f" {'offline_full_map' if bool(args.full_map_observation) else 'online_partial'},"
@@ -843,7 +852,7 @@ def main():
         f" success_threshold={float(args.episode_success_threshold):.3f}"
     )
     print(f"Obs unknown policy: {args.obs_unknown_policy}")
-    print(f"Cell phase channels: {bool(args.cell_phase_channels)}")
+    print(f"Cell phase features: {bool(args.cell_phase_channels)}")
     print(f"Start: {start}")
     print(
         f"Action mask: {bool(args.action_mask)} | algo={algo_name} | "
@@ -855,6 +864,16 @@ def main():
         f" vec_env={vec_env_mode}, n_steps={args.n_steps},"
         f" rollout_batch={args.n_steps * args.num_envs},"
         f" batch_size={args.batch_size}, n_epochs={args.n_epochs}"
+    )
+    print(
+        "Reward shaping:"
+        f" new_cell={float(reward_cfg.new_cell_reward):.3f},"
+        f" local_tv_scale={float(reward_cfg.local_tv_reward_scale):.3f},"
+        f" global_tv_scale={float(reward_cfg.global_tv_reward_scale):.3f},"
+        f" collision={float(reward_cfg.collision_reward):.3f},"
+        f" step={float(reward_cfg.constant_reward):.3f},"
+        f" turn={float(reward_cfg.turn_change_penalty):.3f},"
+        f" revisit={float(reward_cfg.revisit_penalty):.3f}"
     )
     print(
         "Milestone reward:"

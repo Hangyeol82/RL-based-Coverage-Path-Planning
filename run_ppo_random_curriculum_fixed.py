@@ -114,7 +114,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model-size",
         type=str,
-        default="large",
+        default="xlarge",
         choices=["small", "large", "xlarge"],
         help="Forwarded to run_ppo_sb3.py encoder size preset.",
     )

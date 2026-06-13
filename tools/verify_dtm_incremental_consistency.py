@@ -73,12 +73,11 @@ def verify_incremental_consistency(
             ref_builder = MultiScaleCPPObservationBuilder(config=config, include_dtm=True)
             levels_ref = ref_builder.build_levels(observed, robot_pos=robot_pos, explored=explored)
 
-            names = list(inc_builder.channel_names)
-            dtm_idx = _dtm_channel_indices(names)
-            if not dtm_idx:
-                raise RuntimeError("No DTM channels found in channel_names")
-
             for lv in range(inc_builder.num_levels):
+                names = list(inc_builder.channel_names_for_level(lv))
+                dtm_idx = _dtm_channel_indices(names)
+                if not dtm_idx:
+                    continue
                 a = levels_inc[lv][dtm_idx]
                 b = levels_ref[lv][dtm_idx]
                 if a.shape != b.shape:

@@ -28,11 +28,13 @@ import numpy as np
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 
+from evaluation.cpp_metrics import compute_cpp_path_metrics
 from learning.observation import MultiScaleCPPObservationConfig
 from learning.reinforcement.cpp_env import CPPDiscreteEnvConfig
 from learning.reinforcement.reward import CPPRewardConfig
 from learning.reinforcement.sb3_env import CPPDiscreteGymEnv
 from map_generators.shape_grid import build_shape_grid_map
+from map_generators.validation import parse_map_txt
 
 
 GridPos = Tuple[int, int]
@@ -47,6 +49,12 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--baseline-model", type=str, required=True, help="Baseline model .zip or extracted SB3 dir")
     p.add_argument("--dtm-model", type=str, required=True, help="DTM model .zip or extracted SB3 dir")
+    p.add_argument(
+        "--map-files",
+        type=str,
+        default="",
+        help="Comma-separated fixed txt maps. If provided, --seeds map generation is skipped.",
+    )
     p.add_argument("--seeds", type=str, default="101,102,103,104,105,106,107,108,109,110")
     p.add_argument("--map-size", type=int, default=32)
     p.add_argument("--sensor-range", type=int, default=2)
@@ -102,6 +110,15 @@ def _parse_int_list(raw: str) -> List[int]:
             out.append(int(s))
     if not out:
         raise ValueError("No seeds provided")
+    return out
+
+
+def _parse_map_files(raw: str) -> List[Path]:
+    out: List[Path] = []
+    for tok in raw.split(","):
+        s = tok.strip()
+        if s:
+            out.append(Path(s).expanduser().resolve())
     return out
 
 
@@ -250,9 +267,8 @@ def _evaluate_one_map(
     dtm_coarse_mode: str,
 ) -> Dict[str, object]:
     reward_cfg = CPPRewardConfig(
-        newly_visited_reward_scale=0.7,
-        newly_visited_reward_max=1.5,
-        local_tv_reward_scale=1.0,
+        new_cell_reward=0.7,
+        local_tv_reward_scale=0.0,
         local_tv_reward_max=5.0,
         local_tv_normalizer=2.5,
         global_tv_reward_scale=0.0,
@@ -312,8 +328,8 @@ def _evaluate_one_map(
                 break
 
         steps = int(final_info.get("steps", len(path) - 1))
-        unique_positions = len({(int(r), int(c)) for r, c in path})
-        # Track overlap directly from env-level revisits for consistency.
+        path_metrics = compute_cpp_path_metrics(grid, path)
+        # Track env-level revisits for reward-consistent overlap; keep path metrics for thresholds.
         overlap_rate = float(revisited_count) / float(max(1, steps))
 
         return {
@@ -326,11 +342,19 @@ def _evaluate_one_map(
             "action_overridden_count": int(action_overridden_count),
             "action_override_rate": float(action_overridden_count) / float(max(1, steps)),
             "revisited_count": int(revisited_count),
+            "revisit_ratio": float(overlap_rate),
+            "overlap_count": int(revisited_count),
             "overlap_rate": float(overlap_rate),
-            "unique_positions": int(unique_positions),
+            "unique_positions": int(path_metrics.unique_positions),
             "path_length": int(len(path)),
-            "path_overlap_count": int(max(0, len(path) - unique_positions)),
-            "path_overlap_rate": float(max(0, len(path) - unique_positions)) / float(max(1, len(path) - 1)),
+            "path_overlap_count": int(path_metrics.overlap_count),
+            "path_overlap_rate": float(path_metrics.overlap_ratio),
+            "step_to_90": path_metrics.step_to_90,
+            "step_to_95": path_metrics.step_to_95,
+            "step_to_99": path_metrics.step_to_99,
+            "success_90": bool(path_metrics.success_90),
+            "success_95": bool(path_metrics.success_95),
+            "success_99": bool(path_metrics.success_99),
             "total_reward_sum": float(total_reward),
             "done_reason": str(final_info.get("done_reason", "")),
             "path": [[int(r), int(c)] for r, c in path],
@@ -393,29 +417,44 @@ def main() -> None:
     print(f"[INFO] device={device}")
     print(f"[INFO] baseline model={baseline_model_path} algo={baseline_algo}")
     print(f"[INFO] dtm model={dtm_model_path} algo={dtm_algo}")
-    print(f"[INFO] seeds={seeds}")
+    map_files = _parse_map_files(str(args.map_files))
+    if map_files:
+        print(f"[INFO] map_files={len(map_files)}")
+    else:
+        print(f"[INFO] seeds={seeds}")
 
     long_rows: List[Dict[str, object]] = []
     per_map_compare_rows: List[Dict[str, object]] = []
     baseline_by_seed: Dict[int, Dict[str, object]] = {}
     dtm_by_seed: Dict[int, Dict[str, object]] = {}
 
-    for seed in seeds:
-        grid = build_shape_grid_map(
-            size=int(args.map_size),
-            seed=int(seed),
-            grid_step=int(args.grid_step),
-            spawn_prob=float(args.spawn_prob),
-            min_half_extent=int(args.min_half_extent),
-            max_half_extent=int(args.max_half_extent),
-            jitter=int(args.jitter),
-            clearance=int(args.clearance),
-            shape_types=shape_types,
-            ensure_start_clear=True,
-        )
+    eval_cases: List[Tuple[int, str, np.ndarray, Path]] = []
+    if map_files:
+        for idx, path in enumerate(map_files, start=1):
+            if not path.exists():
+                raise FileNotFoundError(f"Map file not found: {path}")
+            grid = parse_map_txt(path)
+            eval_cases.append((idx, path.stem, grid, path))
+    else:
+        for seed in seeds:
+            grid = build_shape_grid_map(
+                size=int(args.map_size),
+                seed=int(seed),
+                grid_step=int(args.grid_step),
+                spawn_prob=float(args.spawn_prob),
+                min_half_extent=int(args.min_half_extent),
+                max_half_extent=int(args.max_half_extent),
+                jitter=int(args.jitter),
+                clearance=int(args.clearance),
+                shape_types=shape_types,
+                ensure_start_clear=True,
+            )
+            map_txt = map_dir / f"shapegrid_l4_seed{int(seed)}.txt"
+            np.savetxt(map_txt, np.asarray(grid, dtype=np.int32), fmt="%d")
+            eval_cases.append((int(seed), f"shapegrid_l4_seed{int(seed)}", grid, map_txt))
+
+    for seed, map_id, grid, map_txt in eval_cases:
         start = _pick_start(grid)
-        map_txt = map_dir / f"shapegrid_l4_seed{int(seed)}.txt"
-        np.savetxt(map_txt, np.asarray(grid, dtype=np.int32), fmt="%d")
 
         for mode, model, maskable, include_dtm in (
             ("baseline", baseline_model, baseline_maskable, False),
@@ -439,6 +478,7 @@ def main() -> None:
             row = {
                 "mode": mode,
                 "seed": int(seed),
+                "map_id": str(map_id),
                 "map_file": str(map_txt),
                 "model": str(baseline_model_path if mode == "baseline" else dtm_model_path),
                 "include_dtm": bool(include_dtm),
@@ -449,9 +489,17 @@ def main() -> None:
                 "collision_rate": float(result["collision_rate"]),
                 "collision_count": int(result["collision_count"]),
                 "overlap_rate": float(result["overlap_rate"]),
+                "revisit_ratio": float(result["revisit_ratio"]),
+                "overlap_count": int(result["overlap_count"]),
                 "revisited_count": int(result["revisited_count"]),
                 "path_overlap_rate": float(result["path_overlap_rate"]),
                 "path_overlap_count": int(result["path_overlap_count"]),
+                "step_to_90": result["step_to_90"],
+                "step_to_95": result["step_to_95"],
+                "step_to_99": result["step_to_99"],
+                "success_90": bool(result["success_90"]),
+                "success_95": bool(result["success_95"]),
+                "success_99": bool(result["success_99"]),
                 "action_override_rate": float(result["action_override_rate"]),
                 "action_overridden_count": int(result["action_overridden_count"]),
                 "unique_positions": int(result["unique_positions"]),
@@ -463,15 +511,16 @@ def main() -> None:
 
             mode_path_dir = path_dir / mode
             mode_traj_dir = traj_dir / mode
-            path_json = mode_path_dir / f"seed{int(seed)}.json"
-            plot_png = mode_traj_dir / f"seed{int(seed)}.png"
+            safe_case = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(map_id))
+            path_json = mode_path_dir / f"{safe_case}.json"
+            plot_png = mode_traj_dir / f"{safe_case}.png"
             payload = dict(row)
             payload["path"] = result["path"]
             path_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             _plot_trajectory_rainbow(
                 grid=grid,
                 path=np.asarray(result["path"], dtype=np.int32),
-                title=f"{mode} | shapegrid lv4 | seed={int(seed)}",
+                title=f"{mode} | {map_id}",
                 out_png=plot_png,
             )
 
@@ -482,6 +531,7 @@ def main() -> None:
 
             print(
                 f"[DONE] seed={seed} mode={mode} "
+                f"map={map_id} "
                 f"cov={row['coverage_ratio']:.4f} overlap={row['overlap_rate']:.4f} "
                 f"coll={row['collision_rate']:.4f} steps={row['steps']}"
             )
@@ -490,12 +540,16 @@ def main() -> None:
         d = dtm_by_seed[int(seed)]
         cmp_row = {
             "seed": int(seed),
+            "map_id": str(map_id),
             "baseline_coverage_ratio": float(b["coverage_ratio"]),
             "dtm_coverage_ratio": float(d["coverage_ratio"]),
             "delta_coverage_ratio": _safe_delta(float(b["coverage_ratio"]), float(d["coverage_ratio"])),
             "baseline_overlap_rate": float(b["overlap_rate"]),
             "dtm_overlap_rate": float(d["overlap_rate"]),
             "delta_overlap_rate": _safe_delta(float(b["overlap_rate"]), float(d["overlap_rate"])),
+            "baseline_revisit_ratio": float(b["revisit_ratio"]),
+            "dtm_revisit_ratio": float(d["revisit_ratio"]),
+            "delta_revisit_ratio": _safe_delta(float(b["revisit_ratio"]), float(d["revisit_ratio"])),
             "baseline_collision_rate": float(b["collision_rate"]),
             "dtm_collision_rate": float(d["collision_rate"]),
             "delta_collision_rate": _safe_delta(float(b["collision_rate"]), float(d["collision_rate"])),
@@ -505,12 +559,19 @@ def main() -> None:
             "baseline_steps": int(b["steps"]),
             "dtm_steps": int(d["steps"]),
             "delta_steps": int(d["steps"]) - int(b["steps"]),
+            "baseline_step_to_90": b["step_to_90"],
+            "dtm_step_to_90": d["step_to_90"],
+            "baseline_step_to_95": b["step_to_95"],
+            "dtm_step_to_95": d["step_to_95"],
+            "baseline_step_to_99": b["step_to_99"],
+            "dtm_step_to_99": d["step_to_99"],
         }
         per_map_compare_rows.append(cmp_row)
 
     long_fieldnames = [
         "mode",
         "seed",
+        "map_id",
         "map_file",
         "model",
         "include_dtm",
@@ -519,9 +580,17 @@ def main() -> None:
         "coverage_cells",
         "free_cells",
         "overlap_rate",
+        "revisit_ratio",
+        "overlap_count",
         "revisited_count",
         "path_overlap_rate",
         "path_overlap_count",
+        "step_to_90",
+        "step_to_95",
+        "step_to_99",
+        "success_90",
+        "success_95",
+        "success_99",
         "collision_rate",
         "collision_count",
         "action_override_rate",
@@ -535,12 +604,16 @@ def main() -> None:
 
     cmp_fieldnames = [
         "seed",
+        "map_id",
         "baseline_coverage_ratio",
         "dtm_coverage_ratio",
         "delta_coverage_ratio",
         "baseline_overlap_rate",
         "dtm_overlap_rate",
         "delta_overlap_rate",
+        "baseline_revisit_ratio",
+        "dtm_revisit_ratio",
+        "delta_revisit_ratio",
         "baseline_collision_rate",
         "dtm_collision_rate",
         "delta_collision_rate",
@@ -550,6 +623,12 @@ def main() -> None:
         "baseline_steps",
         "dtm_steps",
         "delta_steps",
+        "baseline_step_to_90",
+        "dtm_step_to_90",
+        "baseline_step_to_95",
+        "dtm_step_to_95",
+        "baseline_step_to_99",
+        "dtm_step_to_99",
     ]
     _write_rows_csv(out_dir / "comparison_per_map.csv", per_map_compare_rows, cmp_fieldnames)
 
@@ -557,10 +636,17 @@ def main() -> None:
         vals = [float(r[key]) for r in rows]
         return float(np.mean(np.asarray(vals, dtype=np.float64)))
 
+    def _mean_optional(rows: List[Dict[str, object]], key: str) -> float:
+        vals = [float(r[key]) for r in rows if r.get(key) not in (None, "")]
+        if not vals:
+            return float("nan")
+        return float(np.mean(np.asarray(vals, dtype=np.float64)))
+
     baseline_rows = [r for r in long_rows if r["mode"] == "baseline"]
     dtm_rows = [r for r in long_rows if r["mode"] == "dtm"]
     aggregate = {
-        "seeds": seeds,
+        "seeds": seeds if not map_files else [],
+        "map_files": [str(p) for p in map_files],
         "baseline_model": str(baseline_model_path),
         "dtm_model": str(dtm_model_path),
         "mean_baseline_coverage_ratio": _mean(baseline_rows, "coverage_ratio"),
@@ -569,6 +655,9 @@ def main() -> None:
         "mean_baseline_overlap_rate": _mean(baseline_rows, "overlap_rate"),
         "mean_dtm_overlap_rate": _mean(dtm_rows, "overlap_rate"),
         "delta_overlap_rate": _mean(dtm_rows, "overlap_rate") - _mean(baseline_rows, "overlap_rate"),
+        "mean_baseline_revisit_ratio": _mean(baseline_rows, "revisit_ratio"),
+        "mean_dtm_revisit_ratio": _mean(dtm_rows, "revisit_ratio"),
+        "delta_revisit_ratio": _mean(dtm_rows, "revisit_ratio") - _mean(baseline_rows, "revisit_ratio"),
         "mean_baseline_collision_rate": _mean(baseline_rows, "collision_rate"),
         "mean_dtm_collision_rate": _mean(dtm_rows, "collision_rate"),
         "delta_collision_rate": _mean(dtm_rows, "collision_rate") - _mean(baseline_rows, "collision_rate"),
@@ -578,6 +667,12 @@ def main() -> None:
         "mean_baseline_steps": _mean(baseline_rows, "steps"),
         "mean_dtm_steps": _mean(dtm_rows, "steps"),
         "delta_steps": _mean(dtm_rows, "steps") - _mean(baseline_rows, "steps"),
+        "mean_baseline_step_to_90": _mean_optional(baseline_rows, "step_to_90"),
+        "mean_dtm_step_to_90": _mean_optional(dtm_rows, "step_to_90"),
+        "mean_baseline_step_to_95": _mean_optional(baseline_rows, "step_to_95"),
+        "mean_dtm_step_to_95": _mean_optional(dtm_rows, "step_to_95"),
+        "mean_baseline_step_to_99": _mean_optional(baseline_rows, "step_to_99"),
+        "mean_dtm_step_to_99": _mean_optional(dtm_rows, "step_to_99"),
     }
     (out_dir / "comparison_aggregate.json").write_text(
         json.dumps(aggregate, indent=2),

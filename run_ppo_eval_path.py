@@ -36,6 +36,27 @@ from run_cstar_custom_map import CUSTOM_MAP_TEXT, parse_custom_map
 GridPos = Tuple[int, int]
 
 
+def _parse_local_blocks(text: str) -> Optional[Tuple[int, ...]]:
+    s = str(text).strip()
+    if not s:
+        return None
+    vals = []
+    for tok in s.split(","):
+        t = tok.strip()
+        if not t:
+            continue
+        vals.append(int(t))
+    if not vals:
+        return None
+    if any(v <= 0 for v in vals):
+        raise ValueError("--local-blocks values must be positive")
+    if sorted(vals) != vals:
+        raise ValueError("--local-blocks must be in increasing order")
+    if len(set(vals)) != len(vals):
+        raise ValueError("--local-blocks must not contain duplicates")
+    return tuple(vals)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Evaluate a trained SB3 PPO model and visualize trajectory on a map.",
@@ -51,6 +72,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=101)
 
     p.add_argument("--sensor-range", type=int, default=2)
+    p.add_argument(
+        "--local-blocks",
+        type=str,
+        default="",
+        help="Optional comma list overriding MAPS local block sizes, e.g. 1,2,4,8",
+    )
     p.add_argument("--max-episode-steps", type=int, default=2000)
     boundary_group = p.add_mutually_exclusive_group()
     boundary_group.add_argument(
@@ -88,6 +115,13 @@ def _parse_args() -> argparse.Namespace:
         choices=["bfs", "aggregate", "aggregate_transfer"],
         help="DTM coarse-level calculation mode for env observation.",
     )
+    p.add_argument(
+        "--dtm-connectivity",
+        type=int,
+        default=4,
+        choices=[4, 8],
+        help="Connectivity used inside DTM connectivity checks.",
+    )
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument(
         "--action-mask",
@@ -124,7 +158,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-plot", type=str, default="")
     p.add_argument("--show-plot", action="store_true")
     p.add_argument("--title", type=str, default="PPO Coverage Trajectory")
-    return p.parse_args()
+    args = p.parse_args()
+    args.local_blocks = _parse_local_blocks(args.local_blocks)
+    return args
 
 
 def _select_device(device_arg: str) -> str:
@@ -289,9 +325,8 @@ def main():
     start = _pick_start(grid)
 
     reward_cfg = CPPRewardConfig(
-        newly_visited_reward_scale=0.7,
-        newly_visited_reward_max=1.5,
-        local_tv_reward_scale=1.0,
+        new_cell_reward=0.7,
+        local_tv_reward_scale=0.0,
         local_tv_reward_max=5.0,
         local_tv_normalizer=2.5,
         global_tv_reward_scale=0.0,
@@ -310,9 +345,11 @@ def main():
         use_boundary_exit_features=bool(args.boundary_exit_features),
         boundary_exit_threshold=float(args.boundary_exit_threshold),
         observation=MultiScaleCPPObservationConfig(
+            local_blocks=args.local_blocks or MultiScaleCPPObservationConfig.local_blocks,
             unknown_policy=str(args.obs_unknown_policy),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_coarse_mode=str(args.dtm_coarse_mode),
+            dtm_connectivity=int(args.dtm_connectivity),
         ),
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,

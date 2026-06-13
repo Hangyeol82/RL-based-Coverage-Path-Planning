@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
 
 import numpy as np
 import torch
@@ -344,7 +344,7 @@ def _pick_start_node(grid: np.ndarray) -> Tuple[int, int]:
 def _train_one_mode(
     mode_name: str,
     dataset: BCTensorDataset,
-    in_channels_per_level: int,
+    in_channels_per_level: Union[int, Tuple[int, ...]],
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[float, float, Dict[str, list]]:
@@ -492,7 +492,9 @@ def main():
     baseline_loss, baseline_acc, baseline_hist = _train_one_mode(
         "baseline",
         baseline_ds,
-        in_channels_per_level=baseline_builder.channels_per_level,
+        in_channels_per_level=tuple(
+            int(baseline_ds.levels[lv].shape[1]) for lv in sorted(baseline_ds.levels.keys())
+        ),
         args=args,
         device=device,
     )
@@ -501,7 +503,9 @@ def main():
     dtm_loss, dtm_acc, dtm_hist = _train_one_mode(
         "dtm",
         dtm_ds,
-        in_channels_per_level=dtm_builder.channels_per_level,
+        in_channels_per_level=tuple(
+            int(dtm_ds.levels[lv].shape[1]) for lv in sorted(dtm_ds.levels.keys())
+        ),
         args=args,
         device=device,
     )

@@ -53,6 +53,9 @@ class CPPDiscreteEnvConfig:
     use_boundary_exit_features: bool = False
     boundary_exit_threshold: float = 0.0
     boundary_exit_include_valid: bool = True
+    # Append per-scale robot-in-cell phase to robot_state instead of broadcasting
+    # it as constant CNN map channels.
+    use_cell_phase_features: bool = True
     profile_observation: bool = False
     profile_interval_steps: int = 200
     profile_name: str = ""
@@ -211,18 +214,18 @@ class CPPDiscreteEnv:
         if not (0.0 < thr90 < 1.0 and 0.0 < thr99 <= 1.0 and thr90 < thr99):
             return 0.0, False, False
 
-        area_unit = max(0.0, float(cfg.newly_visited_reward_scale))
+        new_cell_unit = max(0.0, float(cfg.new_cell_reward))
         bonus90 = (
             max(0.0, float(cfg.milestone_lambda_90))
             * max(0.0, 1.0 - thr90)
             * float(self.free_total)
-            * area_unit
+            * new_cell_unit
         )
         bonus99 = (
             max(0.0, float(cfg.milestone_lambda_99))
             * max(0.0, 1.0 - thr99)
             * float(self.free_total)
-            * area_unit
+            * new_cell_unit
         )
 
         hit90_now = False
@@ -300,9 +303,11 @@ class CPPDiscreteEnv:
             t0 = perf_counter() if self._profile_observation else 0.0
             if self.config.include_dtm:
                 boundary_levels = levels
+                boundary_maps_builder = self.maps_builder
             else:
                 if self._boundary_maps_builder is None:
                     raise RuntimeError("Boundary maps builder is not initialized")
+                boundary_maps_builder = self._boundary_maps_builder
                 boundary_levels = self._boundary_maps_builder.build_levels(
                     self.known_map,
                     robot_pos=self.current_pos,
@@ -313,10 +318,28 @@ class CPPDiscreteEnv:
                         self._boundary_maps_builder.profile_snapshot(reset=True),
                         prefix="boundary_maps",
                     )
-            boundary_exit_features = self._build_boundary_exit_features(boundary_levels)
+            boundary_exit_features = self._build_boundary_exit_features(
+                boundary_levels,
+                maps_builder=boundary_maps_builder,
+            )
             if self._profile_observation:
                 self._profile_add("boundary_exit_features", perf_counter() - t0)
         t0 = perf_counter() if self._profile_observation else 0.0
+        robot_extra_parts: List[np.ndarray] = []
+        if self.config.use_cell_phase_features:
+            robot_extra_parts.append(
+                self.maps_builder.build_cell_phase_features(
+                    self.known_map.shape,
+                    robot_pos=self.current_pos,
+                )
+            )
+        if boundary_exit_features is not None:
+            robot_extra_parts.append(np.asarray(boundary_exit_features, dtype=np.float32).reshape(-1))
+        robot_extra_features = (
+            np.concatenate(robot_extra_parts, axis=0).astype(np.float32)
+            if robot_extra_parts
+            else None
+        )
         robot_state = self.robot_state_builder.build(
             occupancy=self.known_map,
             explored=self.explored,
@@ -324,7 +347,7 @@ class CPPDiscreteEnv:
             prev_pos=self.prev_pos,
             recent_actions=list(self.recent_actions),
             recent_new_coverage=list(self.recent_new_coverage),
-            extra_features=boundary_exit_features,
+            extra_features=robot_extra_features,
         )
         if self._profile_observation:
             self._profile_add("robot_state", perf_counter() - t0)
@@ -400,15 +423,8 @@ class CPPDiscreteEnv:
         raise ValueError(f"Unsupported dtm_output_mode: {self.config.observation.dtm_output_mode}")
 
     def _level_cell_index(self, level_id: int) -> GridPos:
-        local_count = len(self.config.observation.local_blocks)
-        if level_id < local_count:
-            c = int(self.config.observation.local_window_size) // 2
-            return int(c), int(c)
-        gsize = int(self.config.observation.global_window_size)
-        rr, cc = self.current_pos
-        gr = min(gsize - 1, max(0, int((float(rr) * float(gsize)) / float(max(1, self.rows)))))
-        gc = min(gsize - 1, max(0, int((float(cc) * float(gsize)) / float(max(1, self.cols)))))
-        return int(gr), int(gc)
+        c = int(self.config.observation.local_window_size) // 2
+        return int(c), int(c)
 
     def _exit_scores_from_dtm(self, dtm_values: np.ndarray) -> Tuple[float, float, float, float]:
         mode = str(self.config.observation.dtm_output_mode).strip().lower()
@@ -476,7 +492,13 @@ class CPPDiscreteEnv:
             return float(np.all(known >= 0.5))
         return float(np.all(vals >= 0.0))
 
-    def _build_boundary_exit_features(self, levels: Dict[int, np.ndarray]) -> np.ndarray:
+    def _build_boundary_exit_features(
+        self,
+        levels: Dict[int, np.ndarray],
+        *,
+        maps_builder: Optional[MultiScaleCPPObservationBuilder] = None,
+    ) -> np.ndarray:
+        maps_builder = maps_builder or self.maps_builder
         thr = float(self.config.boundary_exit_threshold)
         if thr < 0.0:
             thr = 0.0
@@ -485,7 +507,12 @@ class CPPDiscreteEnv:
 
         dtm_ch = self._dtm_channel_count()
         out: List[float] = []
-        for lv in range(self.maps_builder.num_levels):
+        for lv in range(maps_builder.num_levels):
+            if not maps_builder._include_dtm_for_level(lv):
+                out.extend([0.0, 0.0, 0.0, 0.0])
+                if self.config.boundary_exit_include_valid:
+                    out.append(0.0)
+                continue
             level_arr = np.asarray(levels[lv], dtype=np.float32)
             if level_arr.ndim != 3:
                 raise ValueError(f"Level tensor must be [C,H,W], got shape={level_arr.shape}")
@@ -640,13 +667,11 @@ class CPPDiscreteEnv:
 
         rew_in = CPPRewardInput(
             newly_visited=float(newly_visited),
-            max_newly_visited=1.0,
             local_tv_old=local_tv_old,
             local_tv_new=local_tv_new,
             global_tv=global_tv,
             coverage_pixels=float(coverage_cells),
             collided=collided,
-            local_tv_velocity_norm=1.0,
         )
         base_reward = compute_cpp_reward(rew_in, self.config.reward)
         reward_turn = 0.0

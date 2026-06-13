@@ -117,7 +117,9 @@ def main():
     enc_cfg = FusedMAPSStateEncoderConfig(
         maps=MultiLevelMAPSEncoderConfig(
             num_levels=len(dataset.levels),
-            in_channels_per_level=int(dataset.levels[0].shape[1]),
+            in_channels_per_level=tuple(
+                int(dataset.levels[lv].shape[1]) for lv in sorted(dataset.levels.keys())
+            ),
             conv_channels=(16, 32),
             level_embed_dim=64,
             mode=args.maps_encoder_mode,

@@ -25,6 +25,7 @@ class RewardBreakdownCallback(BaseCallback):
     """
 
     TRACK_KEYS: Sequence[str] = (
+        "reward_new_cell",
         "reward_area",
         "reward_tv_i",
         "reward_tv_g",

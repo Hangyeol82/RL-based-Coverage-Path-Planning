@@ -32,6 +32,51 @@ def _shape_mask_circle(h: int, w: int, cy: int, cx: int, radius: int) -> np.ndar
     return (yy - cy) * (yy - cy) + (xx - cx) * (xx - cx) <= radius * radius
 
 
+def _shape_mask_pocket(
+    h: int,
+    w: int,
+    cy: int,
+    cx: int,
+    hh: int,
+    hw: int,
+    open_side: str,
+    thickness: int = 1,
+) -> np.ndarray:
+    mask = np.zeros((h, w), dtype=bool)
+    top = int(np.clip(cy - hh, 0, h - 1))
+    left = int(np.clip(cx - hw, 0, w - 1))
+    bottom = int(np.clip(cy + hh, 0, h - 1))
+    right = int(np.clip(cx + hw, 0, w - 1))
+    height = bottom - top + 1
+    width = right - left + 1
+    if height < 5 or width < 5:
+        return mask
+
+    thickness = max(1, int(thickness))
+    gap = max(2, min(height, width) // 4)
+
+    mask[top : top + thickness, left : right + 1] = True
+    mask[bottom - thickness + 1 : bottom + 1, left : right + 1] = True
+    mask[top : bottom + 1, left : left + thickness] = True
+    mask[top : bottom + 1, right - thickness + 1 : right + 1] = True
+
+    if open_side in {"left", "right"}:
+        center = top + height // 2
+        g0 = int(np.clip(center - gap // 2, top + thickness, bottom - thickness - gap + 1))
+        if open_side == "left":
+            mask[g0 : g0 + gap, left : left + thickness] = False
+        else:
+            mask[g0 : g0 + gap, right - thickness + 1 : right + 1] = False
+    else:
+        center = left + width // 2
+        g0 = int(np.clip(center - gap // 2, left + thickness, right - thickness - gap + 1))
+        if open_side == "up":
+            mask[top : top + thickness, g0 : g0 + gap] = False
+        else:
+            mask[bottom - thickness + 1 : bottom + 1, g0 : g0 + gap] = False
+    return mask
+
+
 def _triangle_vertices(cy: int, cx: int, hh: int, hw: int, orientation: str) -> Tuple[Tuple[float, float], ...]:
     if orientation == "up":
         return ((cy - hh, cx), (cy + hh, cx - hw), (cy + hh, cx + hw))
@@ -108,6 +153,12 @@ def build_shape_grid_map(
     jitter: int = 2,
     clearance: int = 1,
     shape_types: Sequence[str] = ("rect", "triangle", "circle"),
+    pocket_min_half_extent: int | None = None,
+    pocket_max_half_extent: int | None = None,
+    pocket_thickness: int = 1,
+    pocket_count_min: int = 0,
+    pocket_count_max: int = 0,
+    pocket_clearance: int = 0,
     ensure_start_clear: bool = True,
 ) -> np.ndarray:
     size = int(size)
@@ -117,7 +168,17 @@ def build_shape_grid_map(
     max_half_extent = max(min_half_extent, int(max_half_extent))
     jitter = max(0, int(jitter))
     clearance = max(0, int(clearance))
-    types = [t for t in shape_types if t in {"rect", "triangle", "circle"}]
+    if pocket_min_half_extent is None:
+        pocket_min_half_extent = min_half_extent
+    if pocket_max_half_extent is None:
+        pocket_max_half_extent = max_half_extent
+    pocket_min_half_extent = max(1, int(pocket_min_half_extent))
+    pocket_max_half_extent = max(pocket_min_half_extent, int(pocket_max_half_extent))
+    pocket_thickness = max(1, int(pocket_thickness))
+    pocket_count_min = max(0, int(pocket_count_min))
+    pocket_count_max = max(pocket_count_min, int(pocket_count_max))
+    pocket_clearance = max(0, int(pocket_clearance))
+    types = [t for t in shape_types if t in {"rect", "triangle", "circle", "pocket"}]
     if not types:
         types = ["rect", "triangle", "circle"]
 
@@ -125,16 +186,59 @@ def build_shape_grid_map(
     grid = np.zeros((size, size), dtype=np.int32)
     occupied = grid == 1
 
-    border = max(max_half_extent + clearance + 2, 2)
-    anchors = _grid_centers(size=size, step=grid_step, border=border)
+    if pocket_count_max > 0:
+        pocket_target = int(rng.randint(pocket_count_min, pocket_count_max + 1))
+        pocket_border = max(pocket_max_half_extent + pocket_clearance + 2, 2)
+        max_attempts = max(200, pocket_target * 400)
+        pockets_placed = 0
+        for _ in range(max_attempts):
+            if pockets_placed >= pocket_target:
+                break
+            cy = int(rng.randint(pocket_border, max(pocket_border + 1, size - pocket_border)))
+            cx = int(rng.randint(pocket_border, max(pocket_border + 1, size - pocket_border)))
+            pocket_hh = int(rng.randint(pocket_min_half_extent, pocket_max_half_extent + 1))
+            pocket_hw = int(rng.randint(pocket_min_half_extent, pocket_max_half_extent + 1))
+            orientation = ("up", "down", "left", "right")[int(rng.randint(0, 4))]
+            candidate = _shape_mask_pocket(
+                size,
+                size,
+                cy,
+                cx,
+                hh=pocket_hh,
+                hw=pocket_hw,
+                open_side=orientation,
+                thickness=pocket_thickness,
+            )
+            if np.count_nonzero(candidate) < 6:
+                continue
+            if _has_neighbor_conflict(occupied, candidate, pocket_clearance):
+                continue
+            grid[candidate] = 1
+            occupied = grid == 1
+            pockets_placed += 1
+
+    base_border = max(max_half_extent + clearance + 2, 2)
+    anchors = _grid_centers(size=size, step=grid_step, border=base_border)
     rng.shuffle(anchors)
 
     for ay, ax in anchors:
         if rng.rand() > spawn_prob:
             continue
 
-        cy = int(np.clip(ay + rng.randint(-jitter, jitter + 1), border, size - border - 1))
-        cx = int(np.clip(ax + rng.randint(-jitter, jitter + 1), border, size - border - 1))
+        cy = int(
+            np.clip(
+                ay + rng.randint(-jitter, jitter + 1),
+                base_border,
+                size - base_border - 1,
+            )
+        )
+        cx = int(
+            np.clip(
+                ax + rng.randint(-jitter, jitter + 1),
+                base_border,
+                size - base_border - 1,
+            )
+        )
         hh = int(rng.randint(min_half_extent, max_half_extent + 1))
         hw = int(rng.randint(min_half_extent, max_half_extent + 1))
         shape = str(types[int(rng.randint(0, len(types)))])
@@ -143,6 +247,20 @@ def build_shape_grid_map(
             candidate = _shape_mask_rect(size, size, cy, cx, hh, hw)
         elif shape == "circle":
             candidate = _shape_mask_circle(size, size, cy, cx, radius=min(hh, hw))
+        elif shape == "pocket":
+            orientation = ("up", "down", "left", "right")[int(rng.randint(0, 4))]
+            pocket_hh = int(rng.randint(pocket_min_half_extent, pocket_max_half_extent + 1))
+            pocket_hw = int(rng.randint(pocket_min_half_extent, pocket_max_half_extent + 1))
+            candidate = _shape_mask_pocket(
+                size,
+                size,
+                cy,
+                cx,
+                hh=pocket_hh,
+                hw=pocket_hw,
+                open_side=orientation,
+                thickness=pocket_thickness,
+            )
         else:
             orientation = ("up", "down", "left", "right")[int(rng.randint(0, 4))]
             candidate = _shape_mask_triangle(size, size, cy, cx, hh, hw, orientation)

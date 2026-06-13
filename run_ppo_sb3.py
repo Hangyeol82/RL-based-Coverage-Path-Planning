@@ -179,7 +179,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model-size",
         type=str,
-        default="small",
+        default="xlarge",
         choices=["small", "large", "xlarge"],
         help="Policy encoder size preset.",
     )
@@ -494,8 +494,7 @@ def main():
     local_blocks = _parse_local_blocks(args.local_blocks)
 
     reward_cfg = CPPRewardConfig(
-        newly_visited_reward_scale=0.7,
-        newly_visited_reward_max=1.5,
+        new_cell_reward=0.7,
         local_tv_reward_scale=1.0,
         local_tv_reward_max=5.0,
         local_tv_normalizer=2.5,
@@ -529,7 +528,9 @@ def main():
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_connectivity=int(args.dtm_connectivity),
+            include_cell_phase_channels=False,
         ),
+        use_cell_phase_features=True,
         use_action_mask=bool(args.action_mask),
         reward=reward_cfg,
     )
@@ -537,10 +538,15 @@ def main():
     probe = CPPDiscreteEnv(grid_map=grid, start_pos=start, config=env_cfg)
     probe_obs = probe.reset()
     robot_state_dim = int(np.asarray(probe_obs["robot_state"], dtype=np.float32).shape[0])
+    level_ids = tuple(sorted(probe_obs["levels"].keys()))
+    level_channels = tuple(
+        int(np.asarray(probe_obs["levels"][lv], dtype=np.float32).shape[0])
+        for lv in level_ids
+    )
     model_cfg = _model_preset(str(args.model_size))
     maps_cfg = MultiLevelMAPSEncoderConfig(
         num_levels=probe.maps_builder.num_levels,
-        in_channels_per_level=probe.maps_builder.channels_per_level,
+        in_channels_per_level=level_channels,
         conv_channels=model_cfg["conv_channels"],
         level_embed_dim=int(model_cfg["level_embed_dim"]),
         mode=args.maps_encoder_mode,
@@ -634,6 +640,7 @@ def main():
 
     print(f"Device: {device}")
     print(f"Map: source={args.map_source}, shape={grid.shape}, include_dtm={args.include_dtm}")
+    print(f"Map observation channels by level: {level_channels}")
     print(f"Obs unknown policy: {args.obs_unknown_policy}")
     print(f"Start: {start}")
     print(

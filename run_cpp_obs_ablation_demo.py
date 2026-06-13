@@ -21,14 +21,15 @@ def _reveal_local(gt_map: np.ndarray, robot_pos, radius: int = 3) -> np.ndarray:
     return known
 
 
-def _print_stats(name: str, levels, channel_names):
-    print(f"\n[{name}] channels={channel_names}")
+def _print_stats(name: str, levels, builder):
+    print(f"\n[{name}] channels_by_level={builder.channels_per_level_by_level}")
     for lv in sorted(levels.keys()):
         x = levels[lv]
         c, h, w = x.shape
+        channel_names = builder.channel_names_for_level(lv)
         print(
             f"  level {lv}: shape=({c},{h},{w}) "
-            f"min={x.min():.3f} max={x.max():.3f}"
+            f"channels={channel_names} min={x.min():.3f} max={x.max():.3f}"
         )
 
 
@@ -65,8 +66,8 @@ def main():
 
     print("Map shape:", gt_map.shape)
     print("Known cells:", int(np.count_nonzero(known_map != -1)))
-    _print_stats("baseline", baseline_levels, baseline_builder.channel_names)
-    _print_stats("dtm", dtm_levels, dtm_builder.channel_names)
+    _print_stats("baseline", baseline_levels, baseline_builder)
+    _print_stats("dtm", dtm_levels, dtm_builder)
 
 
 if __name__ == "__main__":

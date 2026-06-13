@@ -92,7 +92,14 @@ def make_pairwise_table(base: pd.DataFrame, dtm: pd.DataFrame) -> pd.DataFrame:
     return m
 
 
-def plot_timeline(base: pd.DataFrame, dtm: pd.DataFrame, out_path: Path, ma_window: int) -> None:
+def plot_timeline(
+    base: pd.DataFrame,
+    dtm: pd.DataFrame,
+    out_path: Path,
+    ma_window: int,
+    baseline_label: str,
+    dtm_label: str,
+) -> None:
     fig, axes = plt.subplots(3, 1, figsize=(16, 14), sharex=True)
     x_b = base["global_step"].to_numpy(dtype=np.float64) / 1_000_000.0
     x_d = dtm["global_step"].to_numpy(dtype=np.float64) / 1_000_000.0
@@ -100,22 +107,34 @@ def plot_timeline(base: pd.DataFrame, dtm: pd.DataFrame, out_path: Path, ma_wind
     for ax, metric in zip(axes, KEY_METRICS):
         yb = base[metric].to_numpy(dtype=np.float64)
         yd = dtm[metric].to_numpy(dtype=np.float64)
-        ax.plot(x_b, yb, color="#1f77b4", alpha=0.18, linewidth=1.0, label="baseline raw")
-        ax.plot(x_d, yd, color="#ff7f0e", alpha=0.18, linewidth=1.0, label="dtm raw")
-        ax.plot(x_b, moving_average(yb, ma_window), color="#1f77b4", linewidth=2.5, label=f"baseline MA{ma_window}")
-        ax.plot(x_d, moving_average(yd, ma_window), color="#ff7f0e", linewidth=2.5, label=f"dtm MA{ma_window}")
+        ax.plot(x_b, yb, color="#1f77b4", alpha=0.18, linewidth=1.0, label=f"{baseline_label} raw")
+        ax.plot(x_d, yd, color="#ff7f0e", alpha=0.18, linewidth=1.0, label=f"{dtm_label} raw")
+        ax.plot(
+            x_b,
+            moving_average(yb, ma_window),
+            color="#1f77b4",
+            linewidth=2.5,
+            label=f"{baseline_label} MA{ma_window}",
+        )
+        ax.plot(
+            x_d,
+            moving_average(yd, ma_window),
+            color="#ff7f0e",
+            linewidth=2.5,
+            label=f"{dtm_label} MA{ma_window}",
+        )
         ax.set_ylabel(metric)
         ax.grid(alpha=0.25)
         ax.legend(loc="best")
 
     axes[-1].set_xlabel("global_step (millions)")
-    fig.suptitle("Merged Rollout Comparison: Baseline vs DTM", fontsize=16)
+    fig.suptitle(f"Merged Rollout Comparison: {baseline_label} vs {dtm_label}", fontsize=16)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
 
 
-def plot_levelwise(level_df: pd.DataFrame, out_path: Path) -> None:
+def plot_levelwise(level_df: pd.DataFrame, out_path: Path, baseline_label: str, dtm_label: str) -> None:
     if level_df.empty:
         return
     levels = level_df["chunk_level"].to_numpy(dtype=int)
@@ -126,8 +145,8 @@ def plot_levelwise(level_df: pd.DataFrame, out_path: Path) -> None:
     for ax, metric in zip(axes, KEY_METRICS):
         b = level_df[f"{metric}_baseline"].to_numpy(dtype=float)
         d = level_df[f"{metric}_dtm"].to_numpy(dtype=float)
-        ax.bar(x - width / 2.0, b, width=width, color="#1f77b4", alpha=0.85, label="baseline")
-        ax.bar(x + width / 2.0, d, width=width, color="#ff7f0e", alpha=0.85, label="dtm")
+        ax.bar(x - width / 2.0, b, width=width, color="#1f77b4", alpha=0.85, label=baseline_label)
+        ax.bar(x + width / 2.0, d, width=width, color="#ff7f0e", alpha=0.85, label=dtm_label)
         ax.set_ylabel(metric)
         ax.grid(axis="y", alpha=0.25)
         ax.legend(loc="best")
@@ -140,7 +159,7 @@ def plot_levelwise(level_df: pd.DataFrame, out_path: Path) -> None:
     plt.close(fig)
 
 
-def plot_pairwise_diffs(pair_df: pd.DataFrame, out_path: Path) -> None:
+def plot_pairwise_diffs(pair_df: pd.DataFrame, out_path: Path, baseline_label: str, dtm_label: str) -> None:
     if pair_df.empty:
         return
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -148,7 +167,7 @@ def plot_pairwise_diffs(pair_df: pd.DataFrame, out_path: Path) -> None:
         d = pair_df[f"{metric}_diff"].to_numpy(dtype=float)
         ax.hist(d, bins=40, color="#2ca02c", alpha=0.85)
         ax.axvline(0.0, color="black", linestyle="--", linewidth=1.5)
-        ax.set_title(f"{metric} diff (dtm - baseline)")
+        ax.set_title(f"{metric} diff ({dtm_label} - {baseline_label})")
         ax.grid(alpha=0.2)
     fig.suptitle("Pairwise Diff Distribution", fontsize=16)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
@@ -161,6 +180,8 @@ def write_report_md(
     level_df: pd.DataFrame,
     pair_df: pd.DataFrame,
     out_path: Path,
+    baseline_label: str,
+    dtm_label: str,
 ) -> None:
     lines: List[str] = []
     lines.append("# Merged Rollout Comparison Report")
@@ -169,9 +190,11 @@ def write_report_md(
     lines.append("")
     for _, row in overall_df.iterrows():
         lines.append(
-            "- {}: baseline={:.6f}, dtm={:.6f}, diff={:+.6f} ({:+.2f}%)".format(
+            "- {}: {}={:.6f}, {}={:.6f}, diff={:+.6f} ({:+.2f}%)".format(
                 row["metric"],
+                baseline_label,
                 row["baseline_mean"],
+                dtm_label,
                 row["dtm_mean"],
                 row["diff_dtm_minus_baseline"],
                 row["rel_diff_percent"],
@@ -180,7 +203,7 @@ def write_report_md(
     lines.append("")
 
     if not pair_df.empty:
-        lines.append("## Pairwise Win Rate (DTM > Baseline)")
+        lines.append(f"## Pairwise Win Rate ({dtm_label} > {baseline_label})")
         lines.append("")
         for metric in KEY_METRICS:
             win = float((pair_df[f"{metric}_diff"] > 0.0).mean() * 100.0)
@@ -188,7 +211,7 @@ def write_report_md(
         lines.append("")
 
     if not level_df.empty:
-        lines.append("## Level-wise DTM Advantage")
+        lines.append(f"## Level-wise {dtm_label} Advantage")
         lines.append("")
         for _, row in level_df.iterrows():
             lv = int(row["chunk_level"])
@@ -205,6 +228,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare merged rollout CSV logs (baseline vs dtm).")
     p.add_argument("--baseline", type=str, required=True, help="Path to baseline merged CSV")
     p.add_argument("--dtm", type=str, required=True, help="Path to dtm merged CSV")
+    p.add_argument("--baseline-label", type=str, default="baseline", help="Legend/report label for baseline CSV")
+    p.add_argument("--dtm-label", type=str, default="dtm", help="Legend/report label for dtm CSV")
     p.add_argument("--out-dir", type=str, default="log_analysis/logs/merged_compare")
     p.add_argument("--ma-window", type=int, default=31)
     p.add_argument("--tail-ratio", type=float, default=0.2)
@@ -237,14 +262,28 @@ def main() -> None:
     if not pair_df.empty:
         pair_df.to_csv(pair_csv, index=False)
 
-    write_report_md(overall_df, level_df, pair_df, report_md)
+    write_report_md(
+        overall_df,
+        level_df,
+        pair_df,
+        report_md,
+        baseline_label=args.baseline_label,
+        dtm_label=args.dtm_label,
+    )
 
     timeline_png = out_dir / "timeline_compare_hd.png"
     level_png = out_dir / "levelwise_compare_hd.png"
     diff_png = out_dir / "pairwise_diff_hist_hd.png"
-    plot_timeline(baseline, dtm, timeline_png, ma_window=args.ma_window)
-    plot_levelwise(level_df, level_png)
-    plot_pairwise_diffs(pair_df, diff_png)
+    plot_timeline(
+        baseline,
+        dtm,
+        timeline_png,
+        ma_window=args.ma_window,
+        baseline_label=args.baseline_label,
+        dtm_label=args.dtm_label,
+    )
+    plot_levelwise(level_df, level_png, baseline_label=args.baseline_label, dtm_label=args.dtm_label)
+    plot_pairwise_diffs(pair_df, diff_png, baseline_label=args.baseline_label, dtm_label=args.dtm_label)
 
     print(f"[DONE] output dir: {out_dir}")
     print(f"[DONE] {overall_csv}")

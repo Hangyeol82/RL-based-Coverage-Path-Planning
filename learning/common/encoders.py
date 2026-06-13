@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,7 @@ def _make_mlp(dims: Sequence[int], last_activation: bool = True) -> nn.Sequentia
 @dataclass(frozen=True)
 class MultiLevelMAPSEncoderConfig:
     num_levels: int = 6
-    in_channels_per_level: int = 3
+    in_channels_per_level: Union[int, Tuple[int, ...]] = 3
     conv_channels: Tuple[int, ...] = (16, 32)
     level_embed_dim: int = 64
     # "sgcnn" uses grouped conv blocks over stacked level maps.
@@ -69,6 +69,24 @@ class _LevelCNNBranch(nn.Module):
         return self.proj(h)
 
 
+def _normalize_level_channels(
+    in_channels_per_level: Union[int, Sequence[int]],
+    num_levels: int,
+) -> Tuple[int, ...]:
+    if isinstance(in_channels_per_level, int):
+        channels = (int(in_channels_per_level),) * int(num_levels)
+    else:
+        channels = tuple(int(c) for c in in_channels_per_level)
+        if len(channels) != int(num_levels):
+            raise ValueError(
+                "in_channels_per_level must be an int or contain one value per level "
+                f"(expected {num_levels}, got {len(channels)})"
+            )
+    if any(c <= 0 for c in channels):
+        raise ValueError("in_channels_per_level values must be positive")
+    return channels
+
+
 class _SGCNNGroupedEncoder(nn.Module):
     """
     Scale-Grouped CNN encoder:
@@ -80,23 +98,26 @@ class _SGCNNGroupedEncoder(nn.Module):
     def __init__(
         self,
         num_levels: int,
-        in_channels_per_level: int,
+        in_channels_per_level: Union[int, Sequence[int]],
         conv_channels: Sequence[int],
         level_embed_dim: int,
         target_hw: Tuple[int, int],
+        allow_implicit_channel_padding: bool = False,
     ):
         super().__init__()
         if num_levels <= 0:
             raise ValueError("num_levels must be positive")
-        if in_channels_per_level <= 0:
-            raise ValueError("in_channels_per_level must be positive")
         if len(conv_channels) == 0:
             raise ValueError("conv_channels must contain at least one channel size")
         if target_hw[0] <= 0 or target_hw[1] <= 0:
             raise ValueError("sgcnn_target_hw values must be positive")
 
         self.num_levels = int(num_levels)
-        self.in_channels_per_level = int(in_channels_per_level)
+        self.level_in_channels = _normalize_level_channels(in_channels_per_level, self.num_levels)
+        self.allow_implicit_channel_padding = bool(allow_implicit_channel_padding)
+        # Grouped conv requires equal input channels for each group. Levels with
+        # fewer observation channels are zero-padded before stacking.
+        self.in_channels_per_level = max(self.level_in_channels)
         self.target_hw = (int(target_hw[0]), int(target_hw[1]))
 
         layers = []
@@ -130,14 +151,18 @@ class _SGCNNGroupedEncoder(nn.Module):
         batch_size: Optional[int] = None
         th, tw = self.target_hw
 
-        for lv in level_ids:
+        for i, lv in enumerate(level_ids):
             x = levels[lv]
             if x.ndim != 4:
                 raise ValueError(f"Level {lv} tensor must be 4D [B,C,H,W], got shape={tuple(x.shape)}")
-            if x.shape[1] != self.in_channels_per_level:
+            observed_c = int(x.shape[1])
+            if observed_c > self.in_channels_per_level:
                 raise ValueError(
-                    f"Level {lv} expected C={self.in_channels_per_level}, got C={x.shape[1]}"
+                    f"Level {lv} expected at most C={self.in_channels_per_level}, got C={x.shape[1]}"
                 )
+            expected_c = self.level_in_channels[i]
+            if observed_c != expected_c and not self.allow_implicit_channel_padding:
+                raise ValueError(f"Level {lv} expected C={expected_c}, got C={observed_c}")
             if batch_size is None:
                 batch_size = int(x.shape[0])
             elif batch_size != int(x.shape[0]):
@@ -145,6 +170,14 @@ class _SGCNNGroupedEncoder(nn.Module):
 
             if (int(x.shape[2]), int(x.shape[3])) != (th, tw):
                 x = F.interpolate(x, size=(th, tw), mode="nearest")
+            pad_c = self.in_channels_per_level - int(x.shape[1])
+            if pad_c > 0:
+                pad = torch.zeros(
+                    (x.shape[0], pad_c, x.shape[2], x.shape[3]),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                x = torch.cat([x, pad], dim=1)
             xs.append(x)
 
         stacked = torch.cat(xs, dim=1)  # [B, L*C, H, W]
@@ -169,6 +202,11 @@ class MultiLevelMAPSEncoder(nn.Module):
         super().__init__()
         self.config = config or MultiLevelMAPSEncoderConfig()
         self.level_ids = tuple(range(self.config.num_levels))
+        input_channels_was_uniform = isinstance(self.config.in_channels_per_level, int)
+        self.level_in_channels = _normalize_level_channels(
+            self.config.in_channels_per_level,
+            self.config.num_levels,
+        )
         mode = self.config.mode.lower().strip()
         if mode not in {"sgcnn", "independent"}:
             raise ValueError("maps encoder mode must be one of {'sgcnn', 'independent'}")
@@ -178,7 +216,7 @@ class MultiLevelMAPSEncoder(nn.Module):
             self.branches = nn.ModuleDict(
                 {
                     str(lv): _LevelCNNBranch(
-                        in_channels=self.config.in_channels_per_level,
+                        in_channels=self.level_in_channels[lv],
                         conv_channels=self.config.conv_channels,
                         out_dim=self.config.level_embed_dim,
                     )
@@ -191,10 +229,11 @@ class MultiLevelMAPSEncoder(nn.Module):
             self.branches = None
             self.sgcnn = _SGCNNGroupedEncoder(
                 num_levels=self.config.num_levels,
-                in_channels_per_level=self.config.in_channels_per_level,
+                in_channels_per_level=self.level_in_channels,
                 conv_channels=self.config.conv_channels,
                 level_embed_dim=self.config.level_embed_dim,
                 target_hw=self.config.sgcnn_target_hw,
+                allow_implicit_channel_padding=input_channels_was_uniform,
             )
             self.output_dim = self.sgcnn.output_dim
 
@@ -217,9 +256,10 @@ class MultiLevelMAPSEncoder(nn.Module):
             x = levels[lv]
             if x.ndim != 4:
                 raise ValueError(f"Level {lv} tensor must be 4D [B,C,H,W], got shape={tuple(x.shape)}")
-            if x.shape[1] != self.config.in_channels_per_level:
+            expected_c = self.level_in_channels[lv]
+            if x.shape[1] != expected_c:
                 raise ValueError(
-                    f"Level {lv} expected C={self.config.in_channels_per_level}, got C={x.shape[1]}"
+                    f"Level {lv} expected C={expected_c}, got C={x.shape[1]}"
                 )
             if batch_size is None:
                 batch_size = int(x.shape[0])

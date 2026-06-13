@@ -1,0 +1,506 @@
+import argparse
+import csv
+import json
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List
+
+import numpy as np
+
+
+METRICS = (
+    "reward_total",
+    "coverage_ratio",
+    "collision",
+    "reward_area",
+    "reward_tv_i",
+    "episode_final_coverage_ratio",
+)
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Run PPO DTM-known ablation across manifest entries: "
+            "known-aware DTM vs no-known DTM."
+        )
+    )
+    p.add_argument("--manifest", type=str, default="map/manifest_32.json")
+    p.add_argument("--groups", type=str, default="indoor,random")
+    p.add_argument("--max-maps", type=int, default=0, help="0 means use all selected maps")
+
+    p.add_argument("--total-timesteps", type=int, default=50000)
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--num-envs", type=int, default=6)
+    p.add_argument("--vec-env", type=str, default="subproc", choices=["auto", "dummy", "subproc"])
+    p.add_argument(
+        "--subproc-start-method",
+        type=str,
+        default="spawn",
+        choices=["auto", "spawn", "fork", "forkserver"],
+    )
+    p.add_argument("--n-steps", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--n-epochs", type=int, default=4)
+    p.add_argument("--sensor-range", type=int, default=2)
+    p.add_argument("--max-episode-steps", type=int, default=2000)
+    p.add_argument("--map-size", type=int, default=32)
+
+    p.add_argument(
+        "--seed-mode",
+        type=str,
+        default="map",
+        choices=["map", "index", "fixed"],
+        help="map: use seed from manifest, index: base+idx, fixed: always seed-base",
+    )
+    p.add_argument("--seed-base", type=int, default=100)
+
+    p.add_argument("--python-bin", type=str, default=sys.executable)
+    p.add_argument(
+        "--init-from-bc",
+        type=str,
+        default="",
+        help="Warm-start each PPO run from this BC checkpoint (.pt).",
+    )
+    p.add_argument(
+        "--init-from-bc-strict",
+        action="store_true",
+        help="Use strict BC->PPO encoder key/shape matching.",
+    )
+
+    # DTM ablation knobs.
+    p.add_argument(
+        "--known-dtm-output-mode",
+        type=str,
+        default="axis2km",
+        choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
+        help="DTM output mode for known-aware branch (default axis2km = pass+known).",
+    )
+    p.add_argument(
+        "--no-known-dtm-output-mode",
+        type=str,
+        default="axis2",
+        choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
+        help="DTM output mode for no-known branch (default axis2 = pass-only).",
+    )
+    p.add_argument(
+        "--dtm-coarse-mode",
+        type=str,
+        default="bfs",
+        choices=["bfs", "aggregate", "aggregate_transfer"],
+    )
+    p.add_argument(
+        "--obs-unknown-policy",
+        type=str,
+        default="keep",
+        choices=["keep", "as_free", "as_obstacle"],
+    )
+
+    p.add_argument("--run-tag", type=str, default="")
+    p.add_argument("--out-dir", type=str, default="")
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--continue-on-error", action="store_true")
+    p.add_argument("--skip-existing", action="store_true")
+    return p.parse_args()
+
+
+def _load_manifest(path: Path, groups: List[str], max_maps: int) -> List[Dict]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    entries: List[Dict] = []
+    for group in groups:
+        if group not in raw:
+            raise KeyError(f"group '{group}' not found in manifest: {path}")
+        arr = raw[group]
+        if not isinstance(arr, list):
+            raise ValueError(f"manifest group '{group}' is not a list")
+        for item in arr:
+            if "txt" not in item or "seed" not in item:
+                raise ValueError(f"invalid manifest entry in group '{group}': {item}")
+            e = dict(item)
+            e["group"] = group
+            entries.append(e)
+    if max_maps > 0:
+        entries = entries[:max_maps]
+    return entries
+
+
+def _run_seed(args: argparse.Namespace, entry_seed: int, idx: int) -> int:
+    if args.seed_mode == "map":
+        return int(entry_seed)
+    if args.seed_mode == "index":
+        return int(args.seed_base + idx)
+    return int(args.seed_base)
+
+
+def _build_run_cmd(
+    args: argparse.Namespace,
+    *,
+    map_file: str,
+    run_seed: int,
+    dtm_output_mode: str,
+    save_model: Path,
+    save_json: Path,
+    save_csv: Path,
+) -> List[str]:
+    runner = Path(__file__).resolve().parent / "run_ppo_sb3.py"
+    cmd = [
+        args.python_bin,
+        str(runner),
+        "--total-timesteps",
+        str(args.total_timesteps),
+        "--device",
+        args.device,
+        "--num-envs",
+        str(args.num_envs),
+        "--vec-env",
+        args.vec_env,
+        "--subproc-start-method",
+        args.subproc_start_method,
+        "--map-source",
+        "file",
+        "--map-file",
+        map_file,
+        "--map-size",
+        str(args.map_size),
+        "--sensor-range",
+        str(args.sensor_range),
+        "--max-episode-steps",
+        str(args.max_episode_steps),
+        "--n-steps",
+        str(args.n_steps),
+        "--batch-size",
+        str(args.batch_size),
+        "--n-epochs",
+        str(args.n_epochs),
+        "--seed",
+        str(run_seed),
+        "--include-dtm",
+        "--dtm-output-mode",
+        str(dtm_output_mode),
+        "--dtm-coarse-mode",
+        str(args.dtm_coarse_mode),
+        "--obs-unknown-policy",
+        str(args.obs_unknown_policy),
+        "--save-model",
+        str(save_model),
+        "--save-breakdown-json",
+        str(save_json),
+        "--save-breakdown-csv",
+        str(save_csv),
+    ]
+    if args.init_from_bc:
+        cmd += ["--init-from-bc", args.init_from_bc]
+    if args.init_from_bc_strict:
+        cmd.append("--init-from-bc-strict")
+    return cmd
+
+
+def _load_breakdown(path: Path) -> Dict:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rollouts = data.get("rollouts", [])
+    if not isinstance(rollouts, list) or len(rollouts) == 0:
+        raise ValueError(f"empty rollouts in {path}")
+    return {"rollouts": rollouts}
+
+
+def _metric_summary(rollouts: List[Dict]) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for m in METRICS:
+        vals = np.asarray([float(r[m]) for r in rollouts if m in r], dtype=np.float64)
+        if vals.size == 0:
+            out[m] = {"last": float("nan"), "mean": float("nan")}
+        else:
+            out[m] = {"last": float(vals[-1]), "mean": float(vals.mean())}
+    return out
+
+
+def _delta(a: Dict[str, Dict[str, float]], b: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    # delta = b - a
+    out: Dict[str, Dict[str, float]] = {}
+    for m in METRICS:
+        out[m] = {
+            "last": float(b[m]["last"] - a[m]["last"]),
+            "mean": float(b[m]["mean"] - a[m]["mean"]),
+        }
+    return out
+
+
+def _write_per_map_csv(path: Path, rows: List[Dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "map_id",
+        "group",
+        "seed",
+        "map_file",
+        "known_mode",
+        "no_known_mode",
+        "known_last_reward_total",
+        "no_known_last_reward_total",
+        "delta_last_reward_total",
+        "known_last_coverage_ratio",
+        "no_known_last_coverage_ratio",
+        "delta_last_coverage_ratio",
+        "known_last_collision",
+        "no_known_last_collision",
+        "delta_last_collision",
+        "known_last_episode_final_coverage_ratio",
+        "no_known_last_episode_final_coverage_ratio",
+        "delta_last_episode_final_coverage_ratio",
+        "delta_mean_reward_total",
+        "delta_mean_coverage_ratio",
+        "delta_mean_collision",
+        "delta_mean_episode_final_coverage_ratio",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def _aggregate(per_map: List[Dict]) -> Dict:
+    if len(per_map) == 0:
+        return {}
+
+    def arr(key: str):
+        return np.asarray([float(x[key]) for x in per_map], dtype=np.float64)
+
+    deltas = {
+        "reward_total_last": arr("delta_last_reward_total"),
+        "coverage_ratio_last": arr("delta_last_coverage_ratio"),
+        "collision_last": arr("delta_last_collision"),
+        "episode_final_coverage_ratio_last": arr("delta_last_episode_final_coverage_ratio"),
+        "reward_total_mean": arr("delta_mean_reward_total"),
+        "coverage_ratio_mean": arr("delta_mean_coverage_ratio"),
+        "collision_mean": arr("delta_mean_collision"),
+        "episode_final_coverage_ratio_mean": arr("delta_mean_episode_final_coverage_ratio"),
+    }
+
+    agg = {
+        "num_maps": int(len(per_map)),
+        "delta_stats": {},
+        "wins": {},
+    }
+    for k, v in deltas.items():
+        valid = v[~np.isnan(v)]
+        if valid.size == 0:
+            agg["delta_stats"][k] = {
+                "mean": float("nan"),
+                "std": float("nan"),
+                "min": float("nan"),
+                "max": float("nan"),
+            }
+            continue
+        agg["delta_stats"][k] = {
+            "mean": float(np.mean(valid)),
+            "std": float(np.std(valid)),
+            "min": float(np.min(valid)),
+            "max": float(np.max(valid)),
+        }
+
+    # win definition:
+    # - reward/coverage/final-coverage: known > no-known
+    # - collision: known < no-known
+    agg["wins"]["reward_total_last"] = int(np.count_nonzero(deltas["reward_total_last"] > 0.0))
+    agg["wins"]["coverage_ratio_last"] = int(np.count_nonzero(deltas["coverage_ratio_last"] > 0.0))
+    agg["wins"]["collision_last"] = int(np.count_nonzero(deltas["collision_last"] < 0.0))
+    agg["wins"]["episode_final_coverage_ratio_last"] = int(
+        np.count_nonzero(deltas["episode_final_coverage_ratio_last"] > 0.0)
+    )
+    agg["wins"]["reward_total_mean"] = int(np.count_nonzero(deltas["reward_total_mean"] > 0.0))
+    agg["wins"]["coverage_ratio_mean"] = int(np.count_nonzero(deltas["coverage_ratio_mean"] > 0.0))
+    agg["wins"]["collision_mean"] = int(np.count_nonzero(deltas["collision_mean"] < 0.0))
+    agg["wins"]["episode_final_coverage_ratio_mean"] = int(
+        np.count_nonzero(deltas["episode_final_coverage_ratio_mean"] > 0.0)
+    )
+    return agg
+
+
+def main():
+    args = _parse_args()
+    repo_root = Path(__file__).resolve().parent
+    groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    if not groups:
+        raise ValueError("No groups selected")
+
+    manifest = Path(args.manifest)
+    if not manifest.is_absolute():
+        manifest = repo_root / manifest
+    if not manifest.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest}")
+    entries = _load_manifest(manifest, groups, args.max_maps)
+    if len(entries) == 0:
+        raise RuntimeError("No map entries selected")
+
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    else:
+        tag = args.run_tag.strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = Path("learning/checkpoints/rl") / f"dtm_known_ablation_{tag}"
+
+    models_dir = out_dir / "models"
+    logs_dir = out_dir / "logs"
+    report_dir = out_dir / "reports"
+    for d in (models_dir, logs_dir, report_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    print(f"[INFO] selected maps: {len(entries)} from groups={groups}")
+    print(f"[INFO] output dir: {out_dir}")
+    print(
+        "[INFO] known vs no-known:"
+        f" known_mode={args.known_dtm_output_mode}, no_known_mode={args.no_known_dtm_output_mode}"
+    )
+
+    per_map_rows: List[Dict] = []
+    failures: List[Dict] = []
+
+    for i, entry in enumerate(entries):
+        map_file = str(entry["txt"])
+        map_seed = int(entry["seed"])
+        group = str(entry["group"])
+        run_seed = _run_seed(args, map_seed, i)
+        map_id = f"{group}_seed{map_seed}"
+        print(f"\n[MAP {i+1}/{len(entries)}] {map_id} | run_seed={run_seed}")
+
+        known_json = logs_dir / f"{map_id}_known.json"
+        known_csv = logs_dir / f"{map_id}_known.csv"
+        known_model = models_dir / f"{map_id}_known"
+        no_known_json = logs_dir / f"{map_id}_no_known.json"
+        no_known_csv = logs_dir / f"{map_id}_no_known.csv"
+        no_known_model = models_dir / f"{map_id}_no_known"
+
+        tasks = [
+            ("known", args.known_dtm_output_mode, known_model, known_json, known_csv),
+            ("no_known", args.no_known_dtm_output_mode, no_known_model, no_known_json, no_known_csv),
+        ]
+
+        for mode_name, dtm_mode, model_path, json_path, csv_path in tasks:
+            model_zip = model_path.with_suffix(".zip")
+            if args.skip_existing and json_path.exists() and model_zip.exists():
+                print(f"  [SKIP] {mode_name}: existing outputs found")
+                continue
+            if (not args.overwrite) and (json_path.exists() or model_zip.exists()):
+                raise FileExistsError(
+                    f"Output already exists for {map_id} {mode_name}. "
+                    f"Use --overwrite or --skip-existing."
+                )
+            if args.overwrite:
+                if json_path.exists():
+                    json_path.unlink()
+                if csv_path.exists():
+                    csv_path.unlink()
+                if model_zip.exists():
+                    model_zip.unlink()
+
+            cmd = _build_run_cmd(
+                args,
+                map_file=map_file,
+                run_seed=run_seed,
+                dtm_output_mode=dtm_mode,
+                save_model=model_path,
+                save_json=json_path,
+                save_csv=csv_path,
+            )
+            print(f"  [RUN] {mode_name}: {' '.join(cmd)}")
+            try:
+                subprocess.run(cmd, check=True, cwd=str(repo_root))
+            except subprocess.CalledProcessError as e:
+                fail = {"map_id": map_id, "mode": mode_name, "returncode": int(e.returncode)}
+                failures.append(fail)
+                print(f"  [FAIL] {fail}")
+                if not args.continue_on_error:
+                    raise
+                continue
+
+        if not known_json.exists() or not no_known_json.exists():
+            print(f"  [WARN] missing logs for {map_id}, skip report row")
+            continue
+
+        known_rollouts = _load_breakdown(known_json)["rollouts"]
+        no_known_rollouts = _load_breakdown(no_known_json)["rollouts"]
+        known_s = _metric_summary(known_rollouts)
+        no_known_s = _metric_summary(no_known_rollouts)
+        dlt = _delta(no_known_s, known_s)  # known - no_known
+
+        row = {
+            "map_id": map_id,
+            "group": group,
+            "seed": map_seed,
+            "map_file": map_file,
+            "known_mode": args.known_dtm_output_mode,
+            "no_known_mode": args.no_known_dtm_output_mode,
+            "known_last_reward_total": known_s["reward_total"]["last"],
+            "no_known_last_reward_total": no_known_s["reward_total"]["last"],
+            "delta_last_reward_total": dlt["reward_total"]["last"],
+            "known_last_coverage_ratio": known_s["coverage_ratio"]["last"],
+            "no_known_last_coverage_ratio": no_known_s["coverage_ratio"]["last"],
+            "delta_last_coverage_ratio": dlt["coverage_ratio"]["last"],
+            "known_last_collision": known_s["collision"]["last"],
+            "no_known_last_collision": no_known_s["collision"]["last"],
+            "delta_last_collision": dlt["collision"]["last"],
+            "known_last_episode_final_coverage_ratio": known_s["episode_final_coverage_ratio"]["last"],
+            "no_known_last_episode_final_coverage_ratio": no_known_s["episode_final_coverage_ratio"]["last"],
+            "delta_last_episode_final_coverage_ratio": dlt["episode_final_coverage_ratio"]["last"],
+            "delta_mean_reward_total": dlt["reward_total"]["mean"],
+            "delta_mean_coverage_ratio": dlt["coverage_ratio"]["mean"],
+            "delta_mean_collision": dlt["collision"]["mean"],
+            "delta_mean_episode_final_coverage_ratio": dlt["episode_final_coverage_ratio"]["mean"],
+        }
+        per_map_rows.append(row)
+        print(
+            "  [RESULT] "
+            f"known-no_known delta_last(reward={row['delta_last_reward_total']:+.4f}, "
+            f"cov={row['delta_last_coverage_ratio']:+.4f}, "
+            f"final_cov={row['delta_last_episode_final_coverage_ratio']:+.4f}, "
+            f"collision={row['delta_last_collision']:+.4f})"
+        )
+
+    per_map_csv = report_dir / "per_map_comparison.csv"
+    _write_per_map_csv(per_map_csv, per_map_rows)
+
+    summary = {
+        "config": {
+            "manifest": str(manifest),
+            "groups": groups,
+            "max_maps": int(args.max_maps),
+            "total_timesteps": int(args.total_timesteps),
+            "num_envs": int(args.num_envs),
+            "vec_env": args.vec_env,
+            "subproc_start_method": args.subproc_start_method,
+            "seed_mode": args.seed_mode,
+            "seed_base": int(args.seed_base),
+            "map_size": int(args.map_size),
+            "sensor_range": int(args.sensor_range),
+            "n_steps": int(args.n_steps),
+            "batch_size": int(args.batch_size),
+            "n_epochs": int(args.n_epochs),
+            "init_from_bc": str(args.init_from_bc),
+            "init_from_bc_strict": bool(args.init_from_bc_strict),
+            "known_dtm_output_mode": str(args.known_dtm_output_mode),
+            "no_known_dtm_output_mode": str(args.no_known_dtm_output_mode),
+            "dtm_coarse_mode": str(args.dtm_coarse_mode),
+            "obs_unknown_policy": str(args.obs_unknown_policy),
+        },
+        "num_selected_maps": int(len(entries)),
+        "num_reported_maps": int(len(per_map_rows)),
+        "failures": failures,
+        "aggregate": _aggregate(per_map_rows),
+    }
+    summary_json = report_dir / "summary.json"
+    summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print("\n[DONE]")
+    print(f"  per-map csv: {per_map_csv}")
+    print(f"  summary json: {summary_json}")
+    if summary["aggregate"]:
+        agg = summary["aggregate"]
+        print("  aggregate delta means (known - no_known):")
+        for k, v in agg["delta_stats"].items():
+            print(f"    {k}: {v['mean']:+.6f} (std={v['std']:.6f})")
+        print("  wins:", agg["wins"])
+
+
+if __name__ == "__main__":
+    main()

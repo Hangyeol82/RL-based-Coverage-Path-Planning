@@ -3,75 +3,21 @@ import json
 import math
 import subprocess
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from map_generators.shape_grid import build_shape_grid_map
-
-
-@dataclass(frozen=True)
-class ShapeGridPreset:
-    level: int
-    name: str
-    grid_step: int
-    spawn_prob: float
-    min_half_extent: int
-    max_half_extent: int
-    jitter: int
-    clearance: int
-    shape_types: tuple
-
-
-PRESETS: Dict[int, ShapeGridPreset] = {
-    1: ShapeGridPreset(
-        level=1,
-        name="easy",
-        grid_step=14,
-        spawn_prob=0.55,
-        min_half_extent=1,
-        max_half_extent=2,
-        jitter=1,
-        clearance=1,
-        shape_types=("rect", "circle"),
-    ),
-    2: ShapeGridPreset(
-        level=2,
-        name="easy_plus",
-        grid_step=12,
-        spawn_prob=0.60,
-        min_half_extent=1,
-        max_half_extent=2,
-        jitter=1,
-        clearance=1,
-        shape_types=("rect", "circle"),
-    ),
-    3: ShapeGridPreset(
-        level=3,
-        name="medium",
-        grid_step=10,
-        spawn_prob=0.65,
-        min_half_extent=1,
-        max_half_extent=3,
-        jitter=1,
-        clearance=1,
-        shape_types=("rect", "circle"),
-    ),
-    4: ShapeGridPreset(
-        level=4,
-        name="hard",
-        grid_step=8,
-        spawn_prob=0.75,
-        min_half_extent=1,
-        max_half_extent=3,
-        jitter=1,
-        clearance=0,
-        shape_types=("rect", "circle"),
-    ),
-}
+from map_generators.macro_detail_grid import build_macro_detail_grid_map
+from map_generators.shape_grid_presets import (
+    PAPER_SHAPE_GRID_PRESETS as PRESETS,
+    ShapeGridPreset,
+    build_validated_shape_grid_map,
+)
+from map_generators.structured import build_room_corridor_map
+from map_generators.trail_grid import build_trail_grid_map
+from map_generators.validation import MapValidationStats, analyze_grid_map, map_passes_paper_checks
 
 
 def _parse_int_list(raw: str, *, name: str) -> List[int]:
@@ -109,6 +55,53 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--total-timesteps", type=int, default=1_000_000)
     p.add_argument("--chunk-timesteps", type=int, default=100_000, help="Log/report interval")
     p.add_argument("--stage-timesteps", type=int, default=200_000, help="Difficulty switch interval")
+    p.add_argument(
+        "--generator-curriculum",
+        type=str,
+        default="shapegrid",
+        choices=["shapegrid", "mixed_paper"],
+        help=(
+            "shapegrid: original paper shape-grid curriculum. "
+            "mixed_paper: object-placement, trail-grid, and room-corridor curriculum."
+        ),
+    )
+    p.add_argument(
+        "--phase-timesteps",
+        type=str,
+        default="5000000,10000000,15000000,20000000",
+        help=(
+            "Mixed-paper fixed curriculum phase durations. Default gives "
+            "0-5M, 5-15M, 15-30M, 30-50M for a 50M run."
+        ),
+    )
+    p.add_argument(
+        "--phase-level-probs",
+        type=str,
+        default="1:1.0;1:0.2,2:0.8;2:0.2,3:0.8;3:0.2,4:0.8",
+        help=(
+            "Mixed-paper level mixture per phase. Phases use ';', entries use ','. "
+            "Example: '1:1;1:0.2,2:0.8;2:0.2,3:0.8;3:0.2,4:0.8'."
+        ),
+    )
+    p.add_argument(
+        "--family-weights",
+        type=str,
+        default="object:1,trail_grid:1,room_corridor:1",
+        help=(
+            "Mixed-paper map-family weights. 'object' internally samples "
+            "shape_grid and macro_detail."
+        ),
+    )
+    p.add_argument(
+        "--object-generator-weights",
+        type=str,
+        default="shape_grid:1,macro_detail:1",
+        help="Generator weights used inside the object-placement family.",
+    )
+    p.add_argument("--mixed-map-max-retries", type=int, default=64)
+    p.add_argument("--mixed-min-start-component-ratio", type=float, default=0.995)
+    p.add_argument("--mixed-min-free-ratio", type=float, default=0.05)
+    p.add_argument("--mixed-max-obstacle-ratio", type=float, default=0.95)
     p.add_argument(
         "--phase-levels",
         type=str,
@@ -178,6 +171,17 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Generate this many maps per chunk and refresh maps on episode reset.",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate map manifests and print runner commands without launching PPO.",
+    )
+    p.add_argument(
+        "--dry-run-chunks",
+        type=int,
+        default=1,
+        help="Number of chunks to materialize when --dry-run is set.",
     )
     p.add_argument(
         "--map-refresh-mode",
@@ -250,7 +254,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model-size",
         type=str,
-        default="small",
+        default="xlarge",
         choices=["small", "large", "xlarge"],
         help="Forwarded to run_ppo_sb3_paper.py encoder size preset.",
     )
@@ -276,8 +280,18 @@ def _parse_args() -> argparse.Namespace:
         help="Unknown-cell handling forwarded to run_ppo_sb3_paper.py map-observation builder.",
     )
     phase_group = p.add_mutually_exclusive_group()
-    phase_group.add_argument("--cell-phase-channels", dest="cell_phase_channels", action="store_true")
-    phase_group.add_argument("--no-cell-phase-channels", dest="cell_phase_channels", action="store_false")
+    phase_group.add_argument(
+        "--cell-phase-channels",
+        dest="cell_phase_channels",
+        action="store_true",
+        help="Forward per-level robot-in-cell phase features in robot_state.",
+    )
+    phase_group.add_argument(
+        "--no-cell-phase-channels",
+        dest="cell_phase_channels",
+        action="store_false",
+        help="Disable per-level robot-in-cell phase features.",
+    )
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument("--dtm-connectivity", type=int, default=4, choices=[4, 8])
 
@@ -309,8 +323,8 @@ def _parse_args() -> argparse.Namespace:
         boundary_exit_features=False,
         robot_state_position=True,
         robot_state_action_history=True,
-        robot_state_progress=True,
-        robot_state_stagnation=True,
+        robot_state_progress=False,
+        robot_state_stagnation=False,
         cell_phase_channels=True,
         hole_signals=False,
         revisit_burden_shaping=False,
@@ -328,7 +342,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=str, default="")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--continue-on-error", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    args.robot_state_progress = False
+    args.robot_state_stagnation = False
+    return args
 
 
 def _resolve_out_dir(args: argparse.Namespace, repo_root: Path) -> Path:
@@ -336,7 +353,8 @@ def _resolve_out_dir(args: argparse.Namespace, repo_root: Path) -> Path:
         p = Path(args.out_dir)
         return p if p.is_absolute() else (repo_root / p)
     tag = args.run_tag.strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
-    return repo_root / "learning" / "checkpoints" / "rl" / f"shapegrid_curriculum_{tag}"
+    prefix = "mixed_curriculum" if args.generator_curriculum == "mixed_paper" else "shapegrid_curriculum"
+    return repo_root / "learning" / "checkpoints" / "rl" / f"{prefix}_{tag}"
 
 
 def _load_rollouts(json_path: Path) -> List[Dict]:
@@ -349,6 +367,13 @@ def _load_rollouts(json_path: Path) -> List[Dict]:
 
 def _safe_mean(rows: List[Dict], key: str) -> float:
     vals = [float(r[key]) for r in rows if key in r]
+    if len(vals) == 0:
+        return float("nan")
+    return float(np.mean(np.asarray(vals, dtype=np.float64)))
+
+
+def _safe_mean_finite(rows: List[Dict], key: str) -> float:
+    vals = [float(r[key]) for r in rows if key in r and np.isfinite(float(r[key]))]
     if len(vals) == 0:
         return float("nan")
     return float(np.mean(np.asarray(vals, dtype=np.float64)))
@@ -387,6 +412,272 @@ def _preset_for_chunk(
     if level not in PRESETS:
         raise ValueError(f"Unsupported shape-grid level in phase-levels: {level}")
     return PRESETS[level]
+
+
+def _parse_weight_spec(
+    raw: str,
+    *,
+    name: str,
+    allowed: Sequence[str] | None = None,
+) -> List[Tuple[str, float]]:
+    pairs: List[Tuple[str, float]] = []
+    allowed_set = set(allowed) if allowed is not None else None
+    for tok in raw.split(","):
+        s = tok.strip()
+        if not s:
+            continue
+        sep = ":" if ":" in s else "=" if "=" in s else None
+        if sep is None:
+            raise ValueError(f"{name} entries must be key:weight or key=weight: {s}")
+        key, weight_s = s.split(sep, 1)
+        key = key.strip()
+        if allowed_set is not None and key not in allowed_set:
+            raise ValueError(f"Unsupported {name} key: {key}; allowed={sorted(allowed_set)}")
+        weight = float(weight_s.strip())
+        if weight < 0:
+            raise ValueError(f"{name} weights must be non-negative")
+        pairs.append((key, weight))
+    if not pairs or sum(w for _k, w in pairs) <= 0.0:
+        raise ValueError(f"{name} must contain at least one positive weight")
+    return pairs
+
+
+def _parse_level_prob_phases(raw: str) -> List[List[Tuple[int, float]]]:
+    phases: List[List[Tuple[int, float]]] = []
+    for phase_raw in raw.split(";"):
+        s = phase_raw.strip()
+        if not s:
+            continue
+        level_pairs: List[Tuple[int, float]] = []
+        for tok in s.split(","):
+            entry = tok.strip()
+            if not entry:
+                continue
+            sep = ":" if ":" in entry else "=" if "=" in entry else None
+            if sep is None:
+                raise ValueError(f"phase-level-probs entries must be level:prob: {entry}")
+            level_s, weight_s = entry.split(sep, 1)
+            level = int(level_s.strip())
+            if level not in PRESETS:
+                raise ValueError(f"Unsupported mixed-paper level: {level}")
+            weight = float(weight_s.strip())
+            if weight < 0:
+                raise ValueError("phase-level-probs weights must be non-negative")
+            level_pairs.append((level, weight))
+        if not level_pairs or sum(w for _level, w in level_pairs) <= 0.0:
+            raise ValueError("Every phase in phase-level-probs must have a positive weight")
+        phases.append(level_pairs)
+    if not phases:
+        raise ValueError("phase-level-probs must not be empty")
+    return phases
+
+
+def _phase_for_mixed_chunk(
+    phase_timesteps: List[int],
+    phase_level_probs: List[List[Tuple[int, float]]],
+    chunk_start_t: int,
+) -> Tuple[int, List[Tuple[int, float]]]:
+    elapsed = 0
+    phase_idx = 0
+    for idx, duration in enumerate(phase_timesteps):
+        elapsed += int(duration)
+        if int(chunk_start_t) < elapsed:
+            phase_idx = idx
+            break
+    else:
+        phase_idx = len(phase_timesteps) - 1
+    return phase_idx, phase_level_probs[min(phase_idx, len(phase_level_probs) - 1)]
+
+
+def _normalised_prob_dict(pairs: Sequence[Tuple[object, float]]) -> Dict[str, float]:
+    total = float(sum(float(w) for _k, w in pairs))
+    return {str(k): float(w) / total for k, w in pairs}
+
+
+def _jsonable(obj):
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    return obj
+
+
+def _count_by(rows: List[Dict], key: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        val = str(row.get(key, ""))
+        counts[val] = int(counts.get(val, 0) + 1)
+    return counts
+
+
+def _allocate_weighted_counts(total: int, pairs: Sequence[Tuple[object, float]]) -> Dict[object, int]:
+    n = max(0, int(total))
+    weights = np.asarray([float(w) for _k, w in pairs], dtype=np.float64)
+    probs = weights / float(np.sum(weights))
+    raw = probs * float(n)
+    floors = np.floor(raw).astype(np.int64)
+    counts = {pairs[idx][0]: int(floors[idx]) for idx in range(len(pairs))}
+    remaining = int(n - int(np.sum(floors)))
+    if remaining > 0:
+        remainders = raw - floors
+        order = np.argsort(-remainders)
+        for idx in order[:remaining]:
+            key = pairs[int(idx)][0]
+            counts[key] = int(counts.get(key, 0) + 1)
+    return counts
+
+
+def _expand_weighted_plan(
+    total: int,
+    pairs: Sequence[Tuple[object, float]],
+    *,
+    rng: np.random.Generator,
+) -> List[object]:
+    counts = _allocate_weighted_counts(total, pairs)
+    items: List[object] = []
+    for key, _weight in pairs:
+        items.extend([key] * int(counts.get(key, 0)))
+    if items:
+        order = rng.permutation(len(items))
+        items = [items[int(idx)] for idx in order]
+    return items
+
+
+def _build_balanced_mixed_spec_plan(
+    *,
+    maps_per_chunk: int,
+    level_probs: List[Tuple[int, float]],
+    family_weights: List[Tuple[str, float]],
+    object_generator_weights: List[Tuple[str, float]],
+    rng: np.random.Generator,
+) -> List[Tuple[str, str, int]]:
+    families = _expand_weighted_plan(maps_per_chunk, family_weights, rng=rng)
+    levels = [int(v) for v in _expand_weighted_plan(maps_per_chunk, level_probs, rng=rng)]
+    family_generators: List[Tuple[str, str]] = []
+    object_count = int(sum(1 for family in families if str(family) == "object"))
+    object_generators = _expand_weighted_plan(
+        object_count,
+        object_generator_weights,
+        rng=rng,
+    )
+    object_cursor = 0
+    for family_raw in families:
+        family = str(family_raw)
+        if family == "object":
+            generator = str(object_generators[object_cursor])
+            object_cursor += 1
+            family_generators.append(("object_placement", generator))
+        else:
+            family_generators.append((family, family))
+    if len(family_generators) != len(levels):
+        raise RuntimeError("Internal mixed curriculum plan size mismatch")
+    return [
+        (family, generator, int(level))
+        for (family, generator), level in zip(family_generators, levels)
+    ]
+
+
+def _build_non_shape_grid_map(
+    *,
+    generator: str,
+    size: int,
+    seed: int,
+    level: int,
+):
+    if generator == "macro_detail":
+        return build_macro_detail_grid_map(
+            size=int(size),
+            seed=int(seed),
+            level=int(level),
+            return_metadata=True,
+        )
+    if generator == "trail_grid":
+        return build_trail_grid_map(
+            size=int(size),
+            seed=int(seed),
+            level=int(level),
+            return_metadata=True,
+        )
+    if generator == "room_corridor":
+        return build_room_corridor_map(
+            size=int(size),
+            seed=int(seed),
+            level=int(level),
+            return_metadata=True,
+        )
+    raise ValueError(f"Unsupported mixed-paper generator: {generator}")
+
+
+def _build_validated_curriculum_map(
+    *,
+    generator: str,
+    family: str,
+    size: int,
+    seed: int,
+    level: int,
+    max_retries: int,
+    min_start_component_ratio: float,
+    min_free_ratio: float,
+    max_obstacle_ratio: float,
+) -> Tuple[np.ndarray, MapValidationStats, int, int, Dict]:
+    if generator == "shape_grid":
+        grid, stats, used_seed, attempt = build_validated_shape_grid_map(
+            size=int(size),
+            seed=int(seed),
+            level=int(level),
+            max_retries=int(max_retries),
+            min_start_component_ratio=float(min_start_component_ratio),
+            min_free_ratio=float(min_free_ratio),
+            max_obstacle_ratio=float(max_obstacle_ratio),
+        )
+        meta = {
+            "family": str(family),
+            "generator": "shape_grid",
+            "level": int(level),
+            "shape_grid_preset": PRESETS[int(level)].name,
+        }
+        return grid, stats, int(used_seed), int(attempt), meta
+
+    last_stats = None
+    last_meta = None
+    for attempt in range(max(1, int(max_retries))):
+        candidate_seed = int(seed) + attempt * 1_000_003
+        grid, source_meta = _build_non_shape_grid_map(
+            generator=str(generator),
+            size=int(size),
+            seed=int(candidate_seed),
+            level=int(level),
+        )
+        stats = analyze_grid_map(grid, start=(0, 0))
+        if map_passes_paper_checks(
+            stats,
+            min_start_component_ratio=float(min_start_component_ratio),
+            min_free_ratio=float(min_free_ratio),
+            max_obstacle_ratio=float(max_obstacle_ratio),
+        ):
+            meta = {
+                "family": str(family),
+                "generator": str(generator),
+                "level": int(level),
+                "source": _jsonable(source_meta),
+            }
+            return np.asarray(grid, dtype=np.int32), stats, int(candidate_seed), int(attempt), meta
+        last_stats = stats
+        last_meta = source_meta
+
+    raise RuntimeError(
+        "Failed to generate a valid mixed-paper map "
+        f"family={family} generator={generator} level={level} seed={seed} "
+        f"after {max_retries} retries; "
+        f"last_stats={last_stats.as_dict() if last_stats is not None else None}; "
+        f"last_meta={_jsonable(last_meta)}"
+    )
 
 
 def _write_map_txt(path: Path, grid: np.ndarray):
@@ -566,6 +857,8 @@ def main():
         raise ValueError("--chunk-timesteps must be positive")
     if args.curriculum_mode == "fixed" and args.stage_timesteps <= 0:
         raise ValueError("--stage-timesteps must be positive")
+    if args.generator_curriculum == "mixed_paper" and args.curriculum_mode != "fixed":
+        raise ValueError("--generator-curriculum mixed_paper currently supports --curriculum-mode fixed only")
     if args.adaptive_min_chunks <= 0:
         raise ValueError("--adaptive-min-chunks must be positive")
     if args.adaptive_window <= 0:
@@ -578,12 +871,30 @@ def main():
         raise ValueError("--map-size must be >= 2")
     if args.maps_per_chunk <= 0:
         raise ValueError("--maps-per-chunk must be positive")
+    if args.mixed_map_max_retries <= 0:
+        raise ValueError("--mixed-map-max-retries must be positive")
+    if args.dry_run_chunks <= 0:
+        raise ValueError("--dry-run-chunks must be positive")
     if not (0.0 < float(args.episode_success_threshold) <= 1.0):
         raise ValueError("--episode-success-threshold must be in (0, 1]")
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
 
     phase_levels = _parse_int_list(args.phase_levels, name="phase-levels")
+    phase_timesteps = _parse_int_list(args.phase_timesteps, name="phase-timesteps")
+    if any(int(v) <= 0 for v in phase_timesteps):
+        raise ValueError("--phase-timesteps entries must be positive")
+    phase_level_probs = _parse_level_prob_phases(args.phase_level_probs)
+    family_weights = _parse_weight_spec(
+        args.family_weights,
+        name="family-weights",
+        allowed=("object", "trail_grid", "room_corridor"),
+    )
+    object_generator_weights = _parse_weight_spec(
+        args.object_generator_weights,
+        name="object-generator-weights",
+        allowed=("shape_grid", "macro_detail"),
+    )
     adaptive_cov_thresholds = _parse_float_list(
         args.adaptive_cov_thresholds,
         name="adaptive-cov-thresholds",
@@ -608,7 +919,13 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     if args.overwrite:
-        for p in list(models_dir.glob("*.zip")) + list(logs_dir.glob("*")) + list(maps_dir.glob("*.txt")):
+        for p in (
+            list(models_dir.glob("*.zip"))
+            + list(logs_dir.glob("*"))
+            + list(maps_dir.glob("*.txt"))
+            + list(report_dir.glob("*.json"))
+            + list(report_dir.glob("*.jsonl"))
+        ):
             p.unlink()
 
     bc_ckpt = ""
@@ -623,14 +940,28 @@ def main():
     total = int(args.total_timesteps)
     chunk = int(args.chunk_timesteps)
     num_chunks = int(math.ceil(total / float(chunk)))
+    if args.dry_run:
+        num_chunks = int(min(num_chunks, max(1, int(args.dry_run_chunks))))
+    progress_jsonl = report_dir / "progress.jsonl"
+    manifest_jsonl = report_dir / "map_manifest.jsonl"
 
     print(
         f"[INFO] total={total} chunk={chunk} mode={args.curriculum_mode} "
+        f"generator_curriculum={args.generator_curriculum} "
         f"stage={args.stage_timesteps} chunks={num_chunks} "
         f"num_envs={args.num_envs} vec={args.vec_env} "
         f"observation={'offline_full_map' if args.full_map_observation else 'online_partial'}"
     , flush=True)
     print(f"[INFO] out_dir={out_dir}", flush=True)
+    if args.generator_curriculum == "mixed_paper":
+        print(
+            "[INFO] mixed-paper schedule:"
+            f" phase_timesteps={phase_timesteps},"
+            f" phase_level_probs={[ _normalised_prob_dict(pairs) for pairs in phase_level_probs ]},"
+            f" family_probs={_normalised_prob_dict(family_weights)},"
+            f" object_generator_probs={_normalised_prob_dict(object_generator_weights)}",
+            flush=True,
+        )
     if args.curriculum_mode == "adaptive":
         print(
             "[INFO] adaptive gates:"
@@ -655,15 +986,6 @@ def main():
     for i in range(num_chunks):
         chunk_start = done_steps
         chunk_t = int(min(chunk, total - done_steps))
-        if args.curriculum_mode == "fixed":
-            preset = _preset_for_chunk(phase_levels, int(args.stage_timesteps), chunk_start)
-            stage_idx = int(chunk_start // int(args.stage_timesteps))
-        else:
-            stage_idx = int(adaptive_stage_idx)
-            level = int(phase_levels[min(stage_idx, len(phase_levels) - 1)])
-            if level not in PRESETS:
-                raise ValueError(f"Unsupported shape-grid level in phase-levels: {level}")
-            preset = PRESETS[level]
         maps_per_chunk = max(1, int(args.maps_per_chunk))
         map_seed = int(args.seed if args.map_seed_mode == "fixed" else (args.seed + i * maps_per_chunk))
         run_seed = int(args.seed + i)
@@ -674,32 +996,140 @@ def main():
             old_map.unlink()
         map_files: List[Path] = []
         obs_ratios: List[float] = []
-        for j in range(maps_per_chunk):
-            this_seed = int(map_seed if args.map_seed_mode == "fixed" else (map_seed + j))
-            grid = build_shape_grid_map(
-                size=int(args.map_size),
-                seed=this_seed,
-                grid_step=preset.grid_step,
-                spawn_prob=preset.spawn_prob,
-                min_half_extent=preset.min_half_extent,
-                max_half_extent=preset.max_half_extent,
-                jitter=preset.jitter,
-                clearance=preset.clearance,
-                shape_types=preset.shape_types,
-                ensure_start_clear=True,
-            )
-            if maps_per_chunk == 1:
-                map_txt = maps_dir / f"chunk{i+1:02d}_L{preset.level}_{preset.name}_seed{this_seed}.txt"
+        used_map_seeds: List[int] = []
+        start_component_ratios: List[float] = []
+        map_records: List[Dict] = []
+        level_prob_dict: Dict[str, float] = {}
+
+        if args.generator_curriculum == "shapegrid":
+            if args.curriculum_mode == "fixed":
+                preset = _preset_for_chunk(phase_levels, int(args.stage_timesteps), chunk_start)
+                stage_idx = int(chunk_start // int(args.stage_timesteps))
             else:
-                map_txt = map_pool_dir / (
-                    f"map{j+1:03d}_L{preset.level}_{preset.name}_seed{this_seed}.txt"
+                stage_idx = int(adaptive_stage_idx)
+                level = int(phase_levels[min(stage_idx, len(phase_levels) - 1)])
+                if level not in PRESETS:
+                    raise ValueError(f"Unsupported shape-grid level in phase-levels: {level}")
+                preset = PRESETS[level]
+            curriculum_desc = f"L{preset.level}({preset.name})"
+            curriculum_name = preset.name
+            curriculum_level = int(preset.level)
+            level_prob_dict = {str(preset.level): 1.0}
+
+            for j in range(maps_per_chunk):
+                this_seed = int(map_seed if args.map_seed_mode == "fixed" else (map_seed + j))
+                grid, stats, used_seed, attempt = build_validated_shape_grid_map(
+                    size=int(args.map_size),
+                    seed=this_seed,
+                    level=int(preset.level),
                 )
-            _write_map_txt(map_txt, grid)
-            map_files.append(map_txt)
-            obs_cells = int(np.count_nonzero(grid == 1))
-            obs_ratios.append(float(obs_cells) / float(grid.size))
+                if maps_per_chunk == 1:
+                    map_txt = maps_dir / f"chunk{i+1:02d}_L{preset.level}_{preset.name}_seed{this_seed}.txt"
+                else:
+                    map_txt = map_pool_dir / (
+                        f"map{j+1:03d}_L{preset.level}_{preset.name}_seed{this_seed}.txt"
+                    )
+                _write_map_txt(map_txt, grid)
+                map_files.append(map_txt)
+                obs_ratios.append(float(stats.obstacle_ratio))
+                used_map_seeds.append(int(used_seed))
+                start_component_ratios.append(float(stats.start_component_ratio))
+                map_records.append(
+                    {
+                        "chunk": int(i + 1),
+                        "map_index": int(j + 1),
+                        "family": "object_placement",
+                        "generator": "shape_grid",
+                        "level": int(preset.level),
+                        "seed_requested": int(this_seed),
+                        "seed_used": int(used_seed),
+                        "attempt": int(attempt),
+                        "path": str(map_txt),
+                        "free_ratio": float(stats.free_ratio),
+                        "obstacle_ratio": float(stats.obstacle_ratio),
+                        "start_component_ratio": float(stats.start_component_ratio),
+                    }
+                )
+                if int(used_seed) != int(this_seed):
+                    print(
+                        f"[MAP] requested_seed={this_seed} replaced_by={used_seed} "
+                        f"for validated L{preset.level} map",
+                        flush=True,
+                    )
+        else:
+            stage_idx, level_probs = _phase_for_mixed_chunk(
+                phase_timesteps,
+                phase_level_probs,
+                chunk_start,
+            )
+            level_prob_dict = _normalised_prob_dict(level_probs)
+            curriculum_desc = f"mixed_paper_phase{stage_idx + 1}_levels={level_prob_dict}"
+            curriculum_name = "mixed_paper"
+            curriculum_level = -1
+            spec_plan = _build_balanced_mixed_spec_plan(
+                maps_per_chunk=maps_per_chunk,
+                level_probs=level_probs,
+                family_weights=family_weights,
+                object_generator_weights=object_generator_weights,
+                rng=np.random.default_rng(map_seed),
+            )
+
+            for j in range(maps_per_chunk):
+                this_seed = int(map_seed if args.map_seed_mode == "fixed" else (map_seed + j))
+                family, generator, level = spec_plan[j]
+                generator_seed = int(this_seed + 7919)
+                grid, stats, used_seed, attempt, meta = _build_validated_curriculum_map(
+                    generator=generator,
+                    family=family,
+                    size=int(args.map_size),
+                    seed=generator_seed,
+                    level=int(level),
+                    max_retries=int(args.mixed_map_max_retries),
+                    min_start_component_ratio=float(args.mixed_min_start_component_ratio),
+                    min_free_ratio=float(args.mixed_min_free_ratio),
+                    max_obstacle_ratio=float(args.mixed_max_obstacle_ratio),
+                )
+                stem = f"map{j+1:03d}_P{stage_idx+1}_L{level}_{generator}_seed{this_seed}"
+                map_txt = maps_dir / f"chunk{i+1:02d}_{stem}.txt" if maps_per_chunk == 1 else map_pool_dir / f"{stem}.txt"
+                _write_map_txt(map_txt, grid)
+                map_files.append(map_txt)
+                obs_ratios.append(float(stats.obstacle_ratio))
+                used_map_seeds.append(int(used_seed))
+                start_component_ratios.append(float(stats.start_component_ratio))
+                map_records.append(
+                    {
+                        "chunk": int(i + 1),
+                        "map_index": int(j + 1),
+                        "family": str(family),
+                        "generator": str(generator),
+                        "level": int(level),
+                        "phase_index": int(stage_idx),
+                        "phase_level_probs": level_prob_dict,
+                        "seed_requested": int(this_seed),
+                        "seed_generator": int(generator_seed),
+                        "seed_used": int(used_seed),
+                        "attempt": int(attempt),
+                        "path": str(map_txt),
+                        "free_ratio": float(stats.free_ratio),
+                        "obstacle_ratio": float(stats.obstacle_ratio),
+                        "start_component_ratio": float(stats.start_component_ratio),
+                        "meta": _jsonable(meta),
+                    }
+                )
+                if int(used_seed) != int(generator_seed):
+                    print(
+                        f"[MAP] requested_seed={generator_seed} replaced_by={used_seed} "
+                        f"for validated {generator} L{level} map",
+                        flush=True,
+                    )
         map_txt = map_files[0]
         obs_ratio = float(np.mean(np.asarray(obs_ratios, dtype=np.float64)))
+        family_counts = _count_by(map_records, "family")
+        generator_counts = _count_by(map_records, "generator")
+        level_counts = _count_by(map_records, "level")
+        with manifest_jsonl.open("a", encoding="utf-8") as f:
+            for row in map_records:
+                f.write(json.dumps(_jsonable(row), ensure_ascii=False) + "\n")
 
         save_model_base = models_dir / f"chunk{i+1:02d}"
         save_model_zip = save_model_base.with_suffix(".zip")
@@ -724,10 +1154,44 @@ def main():
 
         print(
             f"\n[CHUNK {i+1}/{num_chunks}] steps={chunk_t} "
-            f"curriculum=L{preset.level}({preset.name}) map_seed={map_seed} "
-            f"maps={maps_per_chunk} obs_ratio_mean={obs_ratio:.3f}"
+            f"curriculum={curriculum_desc} map_seed={map_seed} "
+            f"maps={maps_per_chunk} obs_ratio_mean={obs_ratio:.3f} "
+            f"family_counts={family_counts} generator_counts={generator_counts} "
+            f"level_counts={level_counts}"
         , flush=True)
         print(f"[RUN] {' '.join(cmd)}", flush=True)
+
+        if args.dry_run:
+            done_steps += chunk_t
+            rec = {
+                "chunk": i + 1,
+                "status": "dry_run",
+                "chunk_timesteps": int(chunk_t),
+                "timesteps_done": int(done_steps),
+                "generator_curriculum": str(args.generator_curriculum),
+                "curriculum_mode": str(args.curriculum_mode),
+                "curriculum_stage_index": int(stage_idx),
+                "curriculum_level": int(curriculum_level),
+                "curriculum_name": curriculum_name,
+                "curriculum_level_probs": level_prob_dict,
+                "map_seed": int(map_seed),
+                "used_map_seeds": used_map_seeds,
+                "maps_per_chunk": int(maps_per_chunk),
+                "episode_map_refresh": bool(maps_per_chunk > 1),
+                "run_seed": int(run_seed),
+                "map_file": str(map_txt),
+                "map_obstacle_ratio": float(obs_ratio),
+                "map_start_component_ratio_mean": float(
+                    np.mean(np.asarray(start_component_ratios, dtype=np.float64))
+                ),
+                "map_family_counts": family_counts,
+                "map_generator_counts": generator_counts,
+                "map_level_counts": level_counts,
+            }
+            progress_rows.append(rec)
+            with progress_jsonl.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(_jsonable(rec), ensure_ascii=False) + "\n")
+            continue
 
         try:
             subprocess.run(cmd, cwd=str(repo_root), check=True)
@@ -767,17 +1231,26 @@ def main():
             "status": "ok",
             "chunk_timesteps": int(chunk_t),
             "timesteps_done": int(done_steps),
+            "generator_curriculum": str(args.generator_curriculum),
             "curriculum_mode": str(args.curriculum_mode),
             "curriculum_stage_index": int(stage_idx),
-            "curriculum_level": int(preset.level),
-            "curriculum_name": preset.name,
+            "curriculum_level": int(curriculum_level),
+            "curriculum_name": curriculum_name,
+            "curriculum_level_probs": level_prob_dict,
             "map_seed": int(map_seed),
+            "used_map_seeds": used_map_seeds,
             "maps_per_chunk": int(maps_per_chunk),
             "episode_map_refresh": bool(maps_per_chunk > 1),
             "run_seed": int(run_seed),
             "map_file": str(map_txt),
             "map_obstacle_cells": int(round(float(obs_ratio) * float(args.map_size * args.map_size))),
             "map_obstacle_ratio": float(obs_ratio),
+            "map_start_component_ratio_mean": float(
+                np.mean(np.asarray(start_component_ratios, dtype=np.float64))
+            ),
+            "map_family_counts": family_counts,
+            "map_generator_counts": generator_counts,
+            "map_level_counts": level_counts,
             "chunk_last_reward_total": float(last.get("reward_total", float("nan"))),
             "chunk_last_coverage_ratio": float(last.get("coverage_ratio", float("nan"))),
             "chunk_last_collision": float(last.get("collision", float("nan"))),
@@ -790,6 +1263,25 @@ def main():
         rec["chunk_mean_coverage_ratio"] = _safe_mean(rollouts, "coverage_ratio")
         rec["chunk_mean_collision"] = _safe_mean(rollouts, "collision")
         rec["chunk_mean_done_final_coverage_ratio"] = _safe_mean(rollouts, "episode_final_coverage_ratio")
+        rec["chunk_mean_episode_final_steps"] = _safe_mean_finite(rollouts, "episode_final_steps")
+        rec["chunk_mean_episode_revisit_ratio"] = _safe_mean_finite(rollouts, "episode_revisit_ratio")
+        rec["chunk_mean_episode_overlap_ratio"] = _safe_mean_finite(rollouts, "episode_overlap_ratio")
+        for suffix in ("90", "95", "99"):
+            rec[f"chunk_mean_success_{suffix}"] = _safe_mean_finite(rollouts, f"success_{suffix}")
+            rec[f"chunk_mean_step_to_{suffix}"] = _safe_mean_finite(rollouts, f"step_to_{suffix}")
+            rec[f"chunk_step_to_{suffix}_sample_count"] = int(
+                sum(
+                    1
+                    for row in rollouts
+                    if f"step_to_{suffix}" in row and np.isfinite(float(row[f"step_to_{suffix}"]))
+                )
+            )
+        rec["cum_mean_episode_final_steps"] = _safe_mean_finite(all_rollouts, "episode_final_steps")
+        rec["cum_mean_episode_revisit_ratio"] = _safe_mean_finite(all_rollouts, "episode_revisit_ratio")
+        rec["cum_mean_episode_overlap_ratio"] = _safe_mean_finite(all_rollouts, "episode_overlap_ratio")
+        for suffix in ("90", "95", "99"):
+            rec[f"cum_mean_success_{suffix}"] = _safe_mean_finite(all_rollouts, f"success_{suffix}")
+            rec[f"cum_mean_step_to_{suffix}"] = _safe_mean_finite(all_rollouts, f"step_to_{suffix}")
         progress_rows.append(rec)
 
         print(
@@ -899,12 +1391,11 @@ def main():
                     flush=True,
                 )
 
-        progress_jsonl = report_dir / "progress.jsonl"
         with progress_jsonl.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.write(json.dumps(_jsonable(rec), ensure_ascii=False) + "\n")
 
     summary = {
-        "config": vars(args),
+        "config": _jsonable(vars(args)),
         "completed_steps": int(done_steps),
         "requested_steps": int(total),
         "num_chunks": int(num_chunks),

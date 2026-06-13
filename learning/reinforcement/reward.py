@@ -8,12 +8,14 @@ import numpy as np
 @dataclass(frozen=True)
 class CPPRewardConfig:
     """
-    Reward template aligned with rl-cpp:
-    R = R_area + R_TV^I + R_TV^G + R_coll + R_const
+    Discrete-grid CPP reward template:
+    R = R_cell + R_TV^I + R_TV^G + R_coll + R_const
+
+    R_cell gives a fixed bonus when the executed move covers one previously
+    unvisited free cell. It is not area- or velocity-normalized.
     """
 
-    newly_visited_reward_scale: float = 0.7
-    newly_visited_reward_max: float = 1.5
+    new_cell_reward: float = 0.7
 
     local_tv_reward_scale: float = 1.0
     local_tv_reward_max: float = 5.0
@@ -45,7 +47,7 @@ class CPPRewardConfig:
     overlap_streak_increment: float = 0.05
     overlap_streak_max_abs: float = 0.4
     # Coverage milestone shaping (applied in env step logic, once per episode).
-    # Bonus_i = milestone_lambda_i * (1 - milestone_threshold_i) * free_total * newly_visited_reward_scale
+    # Bonus_i = milestone_lambda_i * (1 - milestone_threshold_i) * free_total * new_cell_reward
     milestone_reward_enabled: bool = False
     milestone_threshold_90: float = 0.90
     milestone_threshold_99: float = 0.99
@@ -57,27 +59,24 @@ class CPPRewardConfig:
 class CPPRewardInput:
     """
     Required runtime signals for reward computation.
-    - newly_visited: number of newly covered cells in this step
-    - max_newly_visited: normalization constant for area reward
+    - newly_visited: 1 when the step covers a previously unvisited free cell, else 0
     - local_tv_old/new: local TV before/after step
     - global_tv: global TV after step
     - coverage_pixels: number of covered free cells after step
     - collided: whether the current step caused a collision
-    - local_tv_velocity_norm: optional speed-based TV normalization factor
     """
 
     newly_visited: float
-    max_newly_visited: float
     local_tv_old: float
     local_tv_new: float
     global_tv: float
     coverage_pixels: float
     collided: bool = False
-    local_tv_velocity_norm: float = 1.0
 
 
 @dataclass(frozen=True)
 class CPPRewardBreakdown:
+    # Kept as `area`/`reward_area` for historical log compatibility.
     area: float
     tv_local: float
     tv_global: float
@@ -87,6 +86,7 @@ class CPPRewardBreakdown:
 
     def as_dict(self) -> Dict[str, float]:
         return {
+            "reward_new_cell": float(self.area),
             "reward_area": float(self.area),
             "reward_tv_i": float(self.tv_local),
             "reward_tv_g": float(self.tv_global),
@@ -111,25 +111,21 @@ def _signed_clip(value: float, max_abs: float) -> float:
 def compute_cpp_reward(inp: CPPRewardInput, cfg: CPPRewardConfig) -> CPPRewardBreakdown:
     """
     Compute reward terms:
-      R_area + R_TV^I + R_TV^G + R_coll + R_const
+      R_cell + R_TV^I + R_TV^G + R_coll + R_const
     """
 
     newly_visited = max(0.0, float(inp.newly_visited))
     collided = bool(inp.collided)
 
-    reward_area = 0.0
+    reward_cell = 0.0
     reward_tv_i = 0.0
     reward_tv_g = 0.0
 
     if not collided:
-        denom = max(1.0, float(inp.max_newly_visited))
-
-        reward_area = cfg.newly_visited_reward_scale * newly_visited / denom
-        reward_area = min(float(cfg.newly_visited_reward_max), reward_area)
+        reward_cell = float(cfg.new_cell_reward) if newly_visited > 0.0 else 0.0
 
         tv_diff = float(inp.local_tv_new) - float(inp.local_tv_old)
         reward_tv_i = -tv_diff
-        reward_tv_i *= float(inp.local_tv_velocity_norm)
         reward_tv_i /= max(1e-8, float(cfg.local_tv_normalizer))
         reward_tv_i *= float(cfg.local_tv_reward_scale)
         reward_tv_i = _signed_clip(reward_tv_i, cfg.local_tv_reward_max)
@@ -148,9 +144,9 @@ def compute_cpp_reward(inp: CPPRewardInput, cfg: CPPRewardConfig) -> CPPRewardBr
         else 0.0
     )
 
-    total = reward_area + reward_tv_i + reward_tv_g + reward_coll + reward_const
+    total = reward_cell + reward_tv_i + reward_tv_g + reward_coll + reward_const
     return CPPRewardBreakdown(
-        area=float(reward_area),
+        area=float(reward_cell),
         tv_local=float(reward_tv_i),
         tv_global=float(reward_tv_g),
         collision=float(reward_coll),
