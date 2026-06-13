@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
@@ -69,6 +69,7 @@ class OfflinePaperCPPDiscreteGymEnv(PaperCPPDiscreteGymEnv):
         metric_stagnation_threshold: int = 30,
         metric_loop_window: int = 12,
         grid_map_pool: Optional[Sequence[np.ndarray]] = None,
+        grid_map_metadata_pool: Optional[Sequence[Dict[str, Any]]] = None,
         episode_map_refresh: bool = False,
         map_refresh_mode: str = "cycle",
         map_refresh_seed: int = 0,
@@ -89,6 +90,7 @@ class OfflinePaperCPPDiscreteGymEnv(PaperCPPDiscreteGymEnv):
             metric_stagnation_threshold=metric_stagnation_threshold,
             metric_loop_window=metric_loop_window,
             grid_map_pool=grid_map_pool,
+            grid_map_metadata_pool=grid_map_metadata_pool,
             episode_map_refresh=episode_map_refresh,
             map_refresh_mode=map_refresh_mode,
             map_refresh_seed=map_refresh_seed,

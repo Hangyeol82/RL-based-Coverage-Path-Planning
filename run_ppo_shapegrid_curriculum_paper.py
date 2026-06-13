@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -514,6 +515,58 @@ def _count_by(rows: List[Dict], key: str) -> Dict[str, int]:
         val = str(row.get(key, ""))
         counts[val] = int(counts.get(val, 0) + 1)
     return counts
+
+
+def _rollout_group_summary(rows: List[Dict], kind: str) -> Dict[str, Dict[str, float]]:
+    prefix = f"{kind}_"
+    out: Dict[str, Dict[str, float]] = {}
+    metric_suffixes = (
+        "episode_final_coverage_ratio",
+        "episode_final_steps",
+        "episode_revisit_ratio",
+        "episode_overlap_ratio",
+        "episode_coverage_auc",
+        "success_90",
+        "success_95",
+        "success_99",
+        "step_to_90",
+        "step_to_95",
+        "step_to_99",
+    )
+    for row in rows:
+        group_counts: Dict[str, float] = {}
+        count_prefix = f"episode_count_{kind}_"
+        for key, val in row.items():
+            if key.startswith(count_prefix):
+                group_counts[key[len(count_prefix) :]] = float(val)
+        for key, val in row.items():
+            if key.startswith(count_prefix):
+                group = key[len(count_prefix) :]
+                out.setdefault(group, {})
+                out[group]["episode_count"] = out[group].get("episode_count", 0.0) + float(val)
+                continue
+            if not key.startswith(prefix):
+                continue
+            rest = key[len(prefix) :]
+            metric = next((suffix for suffix in metric_suffixes if rest.endswith("_" + suffix)), "")
+            if not metric:
+                continue
+            group = rest[: -(len(metric) + 1)]
+            weight = float(group_counts.get(group, 1.0))
+            out.setdefault(group, {}).setdefault(metric, 0.0)
+            count_key = f"__count_{metric}"
+            out[group][metric] += float(val) * weight
+            out[group][count_key] = out[group].get(count_key, 0.0) + weight
+    for group, metrics in out.items():
+        for key in list(metrics.keys()):
+            if key.startswith("__count_"):
+                continue
+            count = metrics.get(f"__count_{key}", 0.0)
+            if count > 0.0:
+                metrics[key] = float(metrics[key]) / float(count)
+        for key in [k for k in metrics if k.startswith("__count_")]:
+            metrics.pop(key, None)
+    return out
 
 
 def _allocate_weighted_counts(total: int, pairs: Sequence[Tuple[object, float]]) -> Dict[object, int]:
@@ -1130,6 +1183,10 @@ def main():
         with manifest_jsonl.open("a", encoding="utf-8") as f:
             for row in map_records:
                 f.write(json.dumps(_jsonable(row), ensure_ascii=False) + "\n")
+        pool_manifest_jsonl = map_pool_dir / "manifest.jsonl"
+        with pool_manifest_jsonl.open("w", encoding="utf-8") as f:
+            for row in map_records:
+                f.write(json.dumps(_jsonable(row), ensure_ascii=False) + "\n")
 
         save_model_base = models_dir / f"chunk{i+1:02d}"
         save_model_zip = save_model_base.with_suffix(".zip")
@@ -1193,20 +1250,24 @@ def main():
                 f.write(json.dumps(_jsonable(rec), ensure_ascii=False) + "\n")
             continue
 
+        train_t0 = perf_counter()
         try:
             subprocess.run(cmd, cwd=str(repo_root), check=True)
         except subprocess.CalledProcessError as e:
+            train_wall_time_sec = float(perf_counter() - train_t0)
             failed = True
             rec = {
                 "chunk": i + 1,
                 "status": "failed",
                 "returncode": int(e.returncode),
                 "steps_done": int(done_steps),
+                "chunk_wall_time_sec": float(train_wall_time_sec),
             }
             progress_rows.append(rec)
             if not args.continue_on_error:
                 break
             continue
+        train_wall_time_sec = float(perf_counter() - train_t0)
 
         if not save_model_zip.exists():
             failed = True
@@ -1242,6 +1303,8 @@ def main():
             "maps_per_chunk": int(maps_per_chunk),
             "episode_map_refresh": bool(maps_per_chunk > 1),
             "run_seed": int(run_seed),
+            "chunk_wall_time_sec": float(train_wall_time_sec),
+            "chunk_env_steps_per_sec": float(chunk_t) / float(max(train_wall_time_sec, 1e-9)),
             "map_file": str(map_txt),
             "map_obstacle_cells": int(round(float(obs_ratio) * float(args.map_size * args.map_size))),
             "map_obstacle_ratio": float(obs_ratio),
@@ -1266,6 +1329,7 @@ def main():
         rec["chunk_mean_episode_final_steps"] = _safe_mean_finite(rollouts, "episode_final_steps")
         rec["chunk_mean_episode_revisit_ratio"] = _safe_mean_finite(rollouts, "episode_revisit_ratio")
         rec["chunk_mean_episode_overlap_ratio"] = _safe_mean_finite(rollouts, "episode_overlap_ratio")
+        rec["chunk_mean_episode_coverage_auc"] = _safe_mean_finite(rollouts, "episode_coverage_auc")
         for suffix in ("90", "95", "99"):
             rec[f"chunk_mean_success_{suffix}"] = _safe_mean_finite(rollouts, f"success_{suffix}")
             rec[f"chunk_mean_step_to_{suffix}"] = _safe_mean_finite(rollouts, f"step_to_{suffix}")
@@ -1279,9 +1343,13 @@ def main():
         rec["cum_mean_episode_final_steps"] = _safe_mean_finite(all_rollouts, "episode_final_steps")
         rec["cum_mean_episode_revisit_ratio"] = _safe_mean_finite(all_rollouts, "episode_revisit_ratio")
         rec["cum_mean_episode_overlap_ratio"] = _safe_mean_finite(all_rollouts, "episode_overlap_ratio")
+        rec["cum_mean_episode_coverage_auc"] = _safe_mean_finite(all_rollouts, "episode_coverage_auc")
         for suffix in ("90", "95", "99"):
             rec[f"cum_mean_success_{suffix}"] = _safe_mean_finite(all_rollouts, f"success_{suffix}")
             rec[f"cum_mean_step_to_{suffix}"] = _safe_mean_finite(all_rollouts, f"step_to_{suffix}")
+        rec["chunk_episode_by_family"] = _rollout_group_summary(rollouts, "family")
+        rec["chunk_episode_by_generator"] = _rollout_group_summary(rollouts, "generator")
+        rec["chunk_episode_by_level"] = _rollout_group_summary(rollouts, "level")
         progress_rows.append(rec)
 
         print(

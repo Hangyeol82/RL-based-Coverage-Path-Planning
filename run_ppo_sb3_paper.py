@@ -1,8 +1,9 @@
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -478,15 +479,19 @@ def _build_map(args: argparse.Namespace) -> np.ndarray:
     return grid
 
 
-def _load_map_pool(args: argparse.Namespace, first_grid: np.ndarray) -> Tuple[np.ndarray, ...]:
+def _load_map_pool(
+    args: argparse.Namespace,
+    first_grid: np.ndarray,
+) -> Tuple[Tuple[np.ndarray, ...], Tuple[Dict[str, Any], ...]]:
     raw = str(args.map_pool_dir or "").strip()
     if not raw:
-        return (first_grid,)
+        return (first_grid,), ({"map_index": 0},)
     pool_dir = Path(raw)
     if not pool_dir.exists() or not pool_dir.is_dir():
         raise FileNotFoundError(f"Map pool directory not found: {pool_dir}")
     maps = []
-    for path in sorted(pool_dir.glob("*.txt")):
+    paths = sorted(pool_dir.glob("*.txt"))
+    for path in paths:
         grid = _parse_map_text(path.read_text(encoding="utf-8")).astype(np.int32)
         if grid[0, 0] == 1:
             grid[0, 0] = 0
@@ -498,7 +503,25 @@ def _load_map_pool(args: argparse.Namespace, first_grid: np.ndarray) -> Tuple[np
         maps.append(grid)
     if not maps:
         raise ValueError(f"Map pool directory contains no .txt maps: {pool_dir}")
-    return tuple(maps)
+
+    manifest_by_name: Dict[str, Dict[str, Any]] = {}
+    manifest_path = pool_dir / "manifest.jsonl"
+    if manifest_path.exists():
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            path_raw = str(row.get("path", ""))
+            key = Path(path_raw).name if path_raw else str(row.get("file", ""))
+            if key:
+                manifest_by_name[key] = dict(row)
+    metadata: List[Dict[str, Any]] = []
+    for idx, path in enumerate(paths):
+        row = dict(manifest_by_name.get(path.name, {}))
+        row.setdefault("map_index", int(idx))
+        row.setdefault("path", str(path))
+        metadata.append(row)
+    return tuple(maps), tuple(metadata)
 
 
 def _pick_start(grid: np.ndarray) -> GridPos:
@@ -640,7 +663,7 @@ def main():
             algo_name = "MaskablePPO"
 
     grid = _build_map(args)
-    grid_pool = _load_map_pool(args, grid)
+    grid_pool, grid_meta_pool = _load_map_pool(args, grid)
     episode_map_refresh = bool(args.episode_map_refresh) and len(grid_pool) > 1
     start = _pick_start(grid)
     local_blocks = _parse_local_blocks(args.local_blocks)
@@ -711,6 +734,7 @@ def main():
         metric_stagnation_threshold=int(args.metric_stagnation_threshold),
         metric_loop_window=int(args.metric_loop_window),
         grid_map_pool=grid_pool,
+        grid_map_metadata_pool=grid_meta_pool,
         episode_map_refresh=episode_map_refresh,
         map_refresh_mode=str(args.map_refresh_mode),
         map_refresh_seed=int(args.seed),
@@ -776,6 +800,7 @@ def main():
             metric_stagnation_threshold=int(args.metric_stagnation_threshold),
             metric_loop_window=int(args.metric_loop_window),
             grid_map_pool=grid_pool,
+            grid_map_metadata_pool=grid_meta_pool,
             episode_map_refresh=episode_map_refresh,
             map_refresh_mode=str(args.map_refresh_mode),
             map_refresh_seed=int(args.seed),

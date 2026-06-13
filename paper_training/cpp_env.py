@@ -35,6 +35,7 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         metric_stagnation_threshold: int = 30,
         metric_loop_window: int = 12,
         grid_map_pool: Optional[Sequence[np.ndarray]] = None,
+        grid_map_metadata_pool: Optional[Sequence[Dict[str, Any]]] = None,
         episode_map_refresh: bool = False,
         map_refresh_mode: str = "cycle",
         map_refresh_seed: int = 0,
@@ -51,6 +52,11 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         self._paper_map_cursor = 0
         self._paper_episode_map_index = 0
         self._paper_grid_map_pool = self._normalize_grid_pool(grid_map, grid_map_pool)
+        self._paper_grid_map_metadata_pool = self._normalize_metadata_pool(
+            grid_map_metadata_pool,
+            len(self._paper_grid_map_pool),
+        )
+        self._paper_episode_map_metadata = dict(self._paper_grid_map_metadata_pool[0])
         self.paper_include_hole_signals = bool(include_hole_signals)
         self.paper_hole_penalty_scale = max(0.0, float(hole_penalty_scale))
         self._paper_hole_enabled = self.paper_include_hole_signals or self.paper_hole_penalty_scale > 0.0
@@ -118,6 +124,26 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
             self._paper_map_cursor += 1
         return idx, self._paper_grid_map_pool[idx]
 
+    @staticmethod
+    def _normalize_metadata_pool(
+        grid_map_metadata_pool: Optional[Sequence[Dict[str, Any]]],
+        expected_len: int,
+    ) -> Tuple[Dict[str, Any], ...]:
+        n = max(1, int(expected_len))
+        if grid_map_metadata_pool is None or len(grid_map_metadata_pool) == 0:
+            return tuple({"map_index": int(i)} for i in range(n))
+        if len(grid_map_metadata_pool) != n:
+            raise ValueError(
+                "grid_map_metadata_pool length must match grid_map_pool length "
+                f"({len(grid_map_metadata_pool)} != {n})"
+            )
+        out = []
+        for i, meta in enumerate(grid_map_metadata_pool):
+            row = dict(meta or {})
+            row.setdefault("map_index", int(i))
+            out.append(row)
+        return tuple(out)
+
     def reseed_map_refresh(self, seed: Optional[int]) -> None:
         if seed is None:
             return
@@ -149,6 +175,7 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         self._paper_recent_positions = []
         self._paper_threshold_steps = {0.90: None, 0.95: None, 0.99: None}
         self._paper_last_coverage_cells = 0
+        self._paper_coverage_auc_sum = 0.0
 
     def _update_threshold_steps(self, coverage_ratio: float) -> None:
         for threshold in self._paper_threshold_steps:
@@ -189,6 +216,7 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
             if grid is not self.true_map:
                 self._replace_true_map(grid)
             self._paper_episode_map_index = int(map_idx)
+            self._paper_episode_map_metadata = dict(self._paper_grid_map_metadata_pool[int(map_idx)])
         self._paper_last_hole_risk = np.zeros(4, dtype=np.float32)
         self._paper_last_hole_stats = None
         self._reset_paper_metrics()
@@ -271,7 +299,9 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         self._paper_recent_positions.append(position)
         if len(self._paper_recent_positions) > self.paper_metric_loop_window:
             self._paper_recent_positions = self._paper_recent_positions[-self.paper_metric_loop_window :]
-        self._update_threshold_steps(float(info.get("coverage_ratio", 0.0)))
+        coverage_ratio_now = float(info.get("coverage_ratio", 0.0))
+        self._paper_coverage_auc_sum += coverage_ratio_now
+        self._update_threshold_steps(coverage_ratio_now)
 
         info["hole_risk_up"] = float(pre_risk[0])
         info["hole_risk_right"] = float(pre_risk[1])
@@ -306,6 +336,10 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
             info["hole_refresh_ms"] = float(self._paper_hole_calc.cache.refresh_ms)
             info["hole_risk_ms"] = float(self._paper_hole_calc.last_risk_ms)
         info["episode_map_index"] = float(getattr(self, "_paper_episode_map_index", 0))
+        map_meta = getattr(self, "_paper_episode_map_metadata", {})
+        info["map_family"] = str(map_meta.get("family", "unknown"))
+        info["map_generator"] = str(map_meta.get("generator", "unknown"))
+        info["map_level"] = str(map_meta.get("level", "unknown"))
         steps = max(1, int(self.steps))
         noncollision_steps = max(1, int(self._paper_noncollision_steps))
         info["turn_event"] = float(turn_event)
@@ -343,6 +377,7 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
             info["episode_loop_or_stagnation_ratio"] = (
                 float(self._paper_loop_or_stagnation_step_count) / float(final_steps)
             )
+            info["episode_coverage_auc"] = float(self._paper_coverage_auc_sum) / float(final_steps)
             for suffix, threshold in (("90", 0.90), ("95", 0.95), ("99", 0.99)):
                 step_hit = self._paper_threshold_steps[threshold]
                 success = step_hit is not None
@@ -372,6 +407,7 @@ class PaperCPPDiscreteGymEnv(gym.Env):
         metric_stagnation_threshold: int = 30,
         metric_loop_window: int = 12,
         grid_map_pool: Optional[Sequence[np.ndarray]] = None,
+        grid_map_metadata_pool: Optional[Sequence[Dict[str, Any]]] = None,
         episode_map_refresh: bool = False,
         map_refresh_mode: str = "cycle",
         map_refresh_seed: int = 0,
@@ -392,6 +428,7 @@ class PaperCPPDiscreteGymEnv(gym.Env):
             metric_stagnation_threshold=metric_stagnation_threshold,
             metric_loop_window=metric_loop_window,
             grid_map_pool=grid_map_pool,
+            grid_map_metadata_pool=grid_map_metadata_pool,
             episode_map_refresh=episode_map_refresh,
             map_refresh_mode=map_refresh_mode,
             map_refresh_seed=map_refresh_seed,
