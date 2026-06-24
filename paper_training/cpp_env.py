@@ -474,7 +474,12 @@ class PaperCPPDiscreteGymEnv(gym.Env):
     ):
         super().reset(seed=seed)
         opts = options or {}
-        start_pos = opts.get("start_pos", self._start_pos)
+        if "start_pos" in opts:
+            start_pos = opts["start_pos"]
+        elif self.core_env.paper_episode_map_refresh:
+            start_pos = None
+        else:
+            start_pos = self._start_pos
         self.core_env.reseed_map_refresh(seed)
         raw = self.core_env.reset(start_pos=start_pos)
         return self._convert_obs(raw), {}

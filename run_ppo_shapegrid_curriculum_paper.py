@@ -995,6 +995,18 @@ def main():
     num_chunks = int(math.ceil(total / float(chunk)))
     if args.dry_run:
         num_chunks = int(min(num_chunks, max(1, int(args.dry_run_chunks))))
+    rollout_quantum = max(1, int(args.num_envs) * int(args.n_steps))
+    actual_full_chunk_steps = int(math.ceil(chunk / float(rollout_quantum)) * rollout_quantum)
+    per_env_steps_per_full_chunk = actual_full_chunk_steps / float(max(1, int(args.num_envs)))
+    if int(args.max_episode_steps) > per_env_steps_per_full_chunk:
+        print(
+            "[WARN] max_episode_steps exceeds the rollout steps available to one environment "
+            f"inside a full chunk ({int(args.max_episode_steps)} > "
+            f"{per_env_steps_per_full_chunk:.0f}). Episodes that do not finish early will be "
+            "discarded at the chunk process boundary, so terminal episode metrics may be absent. "
+            "Increase --chunk-timesteps or lower --max-episode-steps.",
+            flush=True,
+        )
     progress_jsonl = report_dir / "progress.jsonl"
     manifest_jsonl = report_dir / "map_manifest.jsonl"
 
