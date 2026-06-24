@@ -54,31 +54,39 @@ flowchart LR
 - DTM-six 모델은 baseline보다 입력 채널만 소폭 증가하며, 전체 네트워크 구조와 PPO 설정은 동일하게 유지됩니다.
 - per-step BFS 기반 revisit-burden reward shaping도 실험했지만, 계산 비용 대비 효과가 작아 최종 논문 방향에서는 제외했습니다.
 
-## 논문용 학습 프로토콜
+## 학습 방법
 
-공정 비교를 위해 baseline과 DTM은 동일한 total timesteps, seed, curriculum, reward, PPO hyperparameter, model size를 사용합니다. DTM 실험에서는 `--include-dtm --dtm-output-mode six` 옵션만 추가합니다.
+논문용 실험은 baseline과 DTM-six 모델을 동일한 학습 조건에서 비교하는 paired experiment로 구성했습니다. 두 모델은 같은 map curriculum, reward, PPO hyperparameter, random seed, model size를 사용하며, DTM-six는 관측 채널에 directional traversability map만 추가합니다.
 
-Baseline:
+| 항목 | 설정 |
+|---|---|
+| 문제 유형 | Online coverage path planning |
+| 지도 크기 | 128 x 128 grid |
+| 센서 범위 | Chebyshev radius 3 |
+| 행동 공간 | 상, 하, 좌, 우 4방향 discrete action |
+| 총 학습량 | 50M environment steps |
+| Chunk 구성 | 1M steps/chunk, 총 50 chunks |
+| Train map pool | chunk당 12개 map 생성 |
+| Episode horizon | 최대 30,000 steps |
+| 병렬 환경 | 28개 SubprocVecEnv |
+| PPO rollout | `n_steps=256`, `batch_size=512`, `n_epochs=4` |
+| Discount / GAE | `gamma=0.99`, `gae_lambda=0.95` |
+| Optimizer 설정 | learning rate `3e-4`, entropy coefficient `0.01` |
+| Policy network | SGCNN xlarge encoder + actor-critic MLP |
+| Action constraint | invalid action masking 사용 |
 
-```bash
-PYTHONUNBUFFERED=1 python run_ppo_mixed_curriculum_paper.py \
-  --run-tag paper_mixed128_50m_baseline_seed101 \
-  --seed 101 \
-  --device cuda
-```
+학습 curriculum은 쉬운 map에서 시작해 점진적으로 복잡한 구조를 포함하도록 구성했습니다. 각 chunk마다 12개의 새로운 train map pool을 생성하고, episode가 끝날 때마다 현재 chunk의 map pool 안에서 다음 지도로 교체합니다.
 
-DTM-six:
+| 학습 구간 | Curriculum 구성 |
+|---|---|
+| 0-5M steps | L1 100% |
+| 5-15M steps | L1 20% + L2 80% |
+| 15-30M steps | L2 20% + L3 80% |
+| 30-50M steps | L3 20% + L4 80% |
 
-```bash
-PYTHONUNBUFFERED=1 python run_ppo_mixed_curriculum_paper.py \
-  --run-tag paper_mixed128_50m_dtm_six_seed101 \
-  --seed 101 \
-  --device cuda \
-  --include-dtm \
-  --dtm-output-mode six
-```
+각 chunk의 map pool은 `shape_grid`, `macro_detail`, `trail_grid`, `room_corridor` 계열 generator로 구성됩니다. 이를 통해 단순 장애물 배치부터 복도형 구조, trail형 구조, macro/detail obstacle이 섞인 구조까지 다양한 CPP 상황을 학습에 포함합니다.
 
-128x128 장기 학습에서는 episode terminal metric이 안정적으로 기록되도록 `--chunk-timesteps 1000000`, `--max-episode-steps 30000` 설정을 사용합니다.
+평가는 학습 중 rollout metric과 별도의 고정 test map set 평가를 구분합니다. 학습 로그에서는 coverage 증가 속도와 overlap/loop 경향을 확인하고, 최종 비교는 fixed test map에서 `final coverage`, `success_90/95/99`, `step_to_90/95/99` 같은 terminal metric으로 정리합니다.
 
 ## Repository 구조
 
@@ -99,4 +107,3 @@ PYTHONUNBUFFERED=1 python run_ppo_mixed_curriculum_paper.py \
 - xlarge model은 SGCNN conv channel `(64, 128)`, level embedding `256`, robot-state MLP `(256, 256)`, fusion MLP `(1024, 1024)`로 구성됩니다.
 - DTM-six는 baseline 대비 encoder parameter 증가가 매우 작기 때문에, 성능 차이는 주로 model capacity보다 observation representation 차이로 해석할 수 있습니다.
 - 학습 로그는 `reports/progress.jsonl` 및 chunk별 CSV/JSON 파일로 저장되어 후처리 분석에 사용됩니다.
-
