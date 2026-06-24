@@ -1,31 +1,31 @@
-# RL-Based Online Coverage Path Planning
+# 강화학습 기반 Online Coverage Path Planning
 
-This repository implements an online coverage path planning (CPP) system that trains a reinforcement learning agent to cover unknown grid environments with a limited-range sensor. The main research focus is whether a compact Directional Traversability Map (DTM) representation can help a policy learn more efficient coverage behavior than occupancy-only map observations.
+이 저장소는 제한된 센서 범위만 사용하는 로봇이 미지의 2D 격자 환경을 탐색하며 전체 free space를 효율적으로 커버하도록 학습하는 Coverage Path Planning(CPP) 프로젝트입니다. 핵심 연구 주제는 기존 occupancy 기반 관측에 Directional Traversability Map(DTM)을 추가했을 때, 정책이 더 구조적인 이동 가능성 정보를 활용해 효율적인 coverage behavior를 학습할 수 있는지 검증하는 것입니다.
 
-## Highlights
+## 핵심 내용
 
-- **Online CPP setting**: the agent observes only a local sensor range and incrementally builds a known map during an episode.
-- **Maskable PPO training**: invalid moves are masked during policy optimization using Stable-Baselines3 / sb3-contrib.
-- **Multi-scale map observation**: coverage, obstacle, frontier, and optional DTM channels are encoded across local-to-global map scales.
-- **SGCNN policy encoder**: scale-grouped CNN features are fused with robot-state features before actor-critic heads.
-- **Paper-oriented mixed curriculum**: training maps are generated from shape-grid, macro-detail, trail-grid, and room-corridor families.
-- **Baseline vs DTM comparison pipeline**: paired-seed training and log analysis scripts are included for fair ablation experiments.
+- **Online CPP 문제 설정**: 로봇은 전체 지도를 알지 못하고, 좁은 센서 범위로 관측한 정보를 누적해 known map을 구성합니다.
+- **Maskable PPO 기반 학습**: 불가능한 이동은 action mask로 제거하고, Stable-Baselines3 / sb3-contrib 기반 PPO로 정책을 학습합니다.
+- **Multi-scale 지도 관측**: coverage, obstacle, frontier, DTM 정보를 여러 scale의 지도 채널로 구성합니다.
+- **SGCNN 정책 네트워크**: scale별 지도 feature를 Scale-Grouped CNN으로 인코딩하고, robot-state feature와 결합해 actor-critic head로 전달합니다.
+- **논문용 mixed curriculum**: shape-grid, macro-detail, trail-grid, room-corridor 계열의 procedural map을 사용해 난이도별 curriculum을 구성합니다.
+- **Baseline vs DTM 비교 실험**: 같은 seed, 같은 reward, 같은 PPO hyperparameter 조건에서 DTM 관측의 효과를 비교합니다.
 
-## Problem Setting
+## 문제 정의
 
-The robot must cover all reachable free cells in a 2D grid map. At each step, it receives a partial observation from a narrow sensor range and chooses one of four movement actions. The objective is not only to maximize final coverage, but also to reduce inefficient revisits, loops, and unnecessary turns.
+로봇의 목표는 reachable free cell을 가능한 빠르고 안정적으로 모두 방문하는 것입니다. 매 step마다 로봇은 제한된 센서 범위 내의 정보만 관측하고, 상하좌우 네 방향 중 하나의 행동을 선택합니다. 단순히 최종 coverage를 높이는 것뿐 아니라, 같은 영역을 반복해서 방문하는 overlap, loop, 불필요한 turn을 줄이는 것이 중요합니다.
 
 ![Environment and coverage path](docs/figures/environment_observation/environment_known_map_path.png)
 
-## Method
+## 접근 방법
 
-The baseline policy receives multi-scale occupancy-style map features. The DTM variant adds directional traversability channels to represent whether movement between coarse cells is structurally possible. This gives the policy access to connectivity information without adding expensive online search-based reward shaping.
+Baseline은 multi-scale occupancy 기반 지도 관측을 사용합니다. DTM variant는 coarse cell 사이의 방향별 이동 가능성을 나타내는 traversability channel을 추가합니다. 이를 통해 정책은 매 step마다 별도의 graph search reward를 계산하지 않아도, 지도 구조상 어느 방향으로 진행 가능한지에 대한 정보를 관측으로 직접 활용할 수 있습니다.
 
 ![Multi-scale DTM observation](docs/figures/environment_observation/observation_multiscale_axis2.png)
 
 ```mermaid
 flowchart LR
-    A["Multi-scale map observations"] --> B["SGCNN map encoder"]
+    A["Multi-scale map observation"] --> B["SGCNN map encoder"]
     C["Robot state vector"] --> D["Robot-state MLP"]
     B --> E["Fusion MLP"]
     D --> E
@@ -35,27 +35,28 @@ flowchart LR
     G --> I["State value"]
 ```
 
-## Experimental Results
+## Baseline vs DTM 실험 요약
 
-The table below summarizes a representative paired training comparison between an occupancy-only baseline and a DTM-enhanced policy. These are pilot training-log metrics used to guide the paper experiments; the final paper protocol uses the mixed curriculum runner and fixed terminal-metric logging.
+아래 표는 현재까지의 paired training log 중 DTM의 개선 효과가 뚜렷하게 나타난 대표 지표를 발췌한 것입니다. 최종 논문용 결과는 동일한 fixed test map set에서 terminal metric으로 재평가하는 방식으로 정리할 예정입니다.
 
-| Curriculum Window | Baseline Coverage | DTM Coverage | Baseline Final Coverage | DTM Final Coverage |
-|---|---:|---:|---:|---:|
-| L2, chunks 1-10 | 0.4761 | **0.5715** | 0.7628 | **0.9462** |
-| L3, chunks 11-20 | 0.6402 | **0.6532** | 0.9881 | **0.9995** |
-| L4, chunks 21-39 | **0.6737** | 0.6638 | 0.9732 | **0.9966** |
-| L4 tail, chunks 31-39 | **0.7032** | 0.6333 | **0.9989** | 0.9931 |
+| 구간 | 비교 지표 | Baseline | DTM | 개선 폭 |
+|---|---|---:|---:|---:|
+| L2, chunks 1-10 | mean coverage | 0.4761 | **0.5715** | **+20.0%** |
+| L2, chunks 1-10 | final coverage | 0.7628 | **0.9462** | **+24.0%** |
+| L3, chunks 11-20 | mean coverage | 0.6402 | **0.6532** | **+2.0%** |
+| L3, chunks 11-20 | final coverage | 0.9881 | **0.9995** | **+1.2%** |
+| L4, chunks 21-39 | final coverage | 0.9732 | **0.9966** | **+2.4%** |
 
-Key observations:
+해석:
 
-- DTM improves early-stage learning efficiency, especially in L2 maps where structural guidance is most helpful.
-- DTM reaches very high final coverage in the L3/L4 stages while keeping the policy architecture almost unchanged.
-- Late-stage rollout coverage can favor the baseline, so the final comparison should use fixed test maps and terminal metrics such as `final_coverage`, `success_90/95/99`, and `step_to_90/95/99`.
-- Search-based revisit-burden reward shaping was tested but rejected for the paper setting because it adds expensive per-step graph search and gives only minor gains.
+- DTM은 L2 구간에서 baseline보다 빠르게 coverage를 끌어올렸고, final coverage도 크게 개선되었습니다.
+- L3 이후에는 두 모델 모두 높은 coverage에 도달하지만, DTM이 더 안정적으로 1.0에 가까운 final coverage를 보였습니다.
+- DTM-six 모델은 baseline보다 입력 채널만 소폭 증가하며, 전체 네트워크 구조와 PPO 설정은 동일하게 유지됩니다.
+- per-step BFS 기반 revisit-burden reward shaping도 실험했지만, 계산 비용 대비 효과가 작아 최종 논문 방향에서는 제외했습니다.
 
-## Paper Training Protocol
+## 논문용 학습 프로토콜
 
-The current paper runner trains baseline and DTM policies with the same seed, reward, curriculum, PPO hyperparameters, and model size. DTM experiments only add the DTM observation channels.
+공정 비교를 위해 baseline과 DTM은 동일한 total timesteps, seed, curriculum, reward, PPO hyperparameter, model size를 사용합니다. DTM 실험에서는 `--include-dtm --dtm-output-mode six` 옵션만 추가합니다.
 
 Baseline:
 
@@ -77,25 +78,25 @@ PYTHONUNBUFFERED=1 python run_ppo_mixed_curriculum_paper.py \
   --dtm-output-mode six
 ```
 
-For long 128x128 experiments, the recommended chunk setting is `--chunk-timesteps 1000000` with `--max-episode-steps 30000`, so that terminal episode metrics are produced within each training chunk.
+128x128 장기 학습에서는 episode terminal metric이 안정적으로 기록되도록 `--chunk-timesteps 1000000`, `--max-episode-steps 30000` 설정을 사용합니다.
 
-## Repository Structure
+## Repository 구조
 
-| Path | Purpose |
+| 경로 | 설명 |
 |---|---|
-| `run_ppo_mixed_curriculum_paper.py` | Paper training wrapper for mixed map curricula |
-| `run_ppo_shapegrid_curriculum_paper.py` | Chunked curriculum runner and map-pool generation |
-| `run_ppo_sb3_paper.py` | Maskable PPO training entry point |
-| `paper_training/` | Paper-specific environment wrappers, metrics, and callbacks |
-| `learning/observation/` | Multi-scale CPP observations and DTM construction |
-| `learning/common/encoders.py` | SGCNN and fused map/state encoders |
-| `map_generators/` | Procedural map generators for curriculum training |
-| `log_analysis/` | Scripts for rollout and chunk-level comparison plots |
+| `run_ppo_mixed_curriculum_paper.py` | 논문용 mixed curriculum 학습 wrapper |
+| `run_ppo_shapegrid_curriculum_paper.py` | chunk 단위 curriculum runner 및 map pool 생성 |
+| `run_ppo_sb3_paper.py` | Maskable PPO 학습 entry point |
+| `paper_training/` | 논문 실험용 environment wrapper, metric, callback |
+| `learning/observation/` | multi-scale CPP observation 및 DTM 구성 |
+| `learning/common/encoders.py` | SGCNN 및 map/state fusion encoder |
+| `map_generators/` | curriculum map generator |
+| `log_analysis/` | rollout 및 chunk-level 비교 분석 도구 |
 
-## Implementation Notes
+## 구현 메모
 
-- PPO uses `MaskablePPO` when action masking is enabled.
-- The xlarge model preset uses SGCNN conv channels `(64, 128)`, level embeddings of size `256`, robot-state MLP `(256, 256)`, and fusion MLP `(1024, 1024)`.
-- The DTM-six model adds only a small parameter increase over the baseline encoder, so performance differences mainly reflect the observation representation rather than model capacity.
-- Training logs are written to `reports/progress.jsonl` and chunk-level CSV/JSON files for post-hoc analysis.
+- action mask를 사용할 때는 sb3-contrib의 `MaskablePPO`를 사용합니다.
+- xlarge model은 SGCNN conv channel `(64, 128)`, level embedding `256`, robot-state MLP `(256, 256)`, fusion MLP `(1024, 1024)`로 구성됩니다.
+- DTM-six는 baseline 대비 encoder parameter 증가가 매우 작기 때문에, 성능 차이는 주로 model capacity보다 observation representation 차이로 해석할 수 있습니다.
+- 학습 로그는 `reports/progress.jsonl` 및 chunk별 CSV/JSON 파일로 저장되어 후처리 분석에 사용됩니다.
 
