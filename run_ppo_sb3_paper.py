@@ -810,18 +810,36 @@ def main():
         vec_env_kwargs=vec_kwargs,
     )
     if algo_name == "MaskablePPO" and bool(args.action_mask):
-        # sb3-contrib checks mask support at every rollout via VecEnv.has_attr().
-        # SubprocVecEnv's default has_attr() asks workers for the bound
-        # action_masks method, which pickles the whole env object. DTM envs carry
-        # large observation caches, so that support check can dominate runtime.
-        original_has_attr = vec_env.has_attr
+        # sb3-contrib checks mask support at every rollout. Some versions call
+        # VecEnv.has_attr(), and older versions call SubprocVecEnv.get_attr()
+        # directly. Both routes can ask workers for the bound action_masks
+        # method, which pickles the whole env object. DTM envs carry large
+        # observation caches, so that support check can dominate runtime.
+        original_has_attr = getattr(vec_env, "has_attr", None)
 
         def _has_attr_without_pickling_mask_method(attr_name: str) -> bool:
             if str(attr_name) == "action_masks":
                 return True
-            return bool(original_has_attr(attr_name))
+            if original_has_attr is not None:
+                return bool(original_has_attr(attr_name))
+            try:
+                vec_env.get_attr(attr_name)
+                return True
+            except AttributeError:
+                return False
 
         vec_env.has_attr = _has_attr_without_pickling_mask_method  # type: ignore[method-assign]
+        try:
+            import sb3_contrib.common.maskable.utils as mask_utils  # type: ignore
+            import sb3_contrib.ppo_mask.ppo_mask as ppo_mask_module  # type: ignore
+
+            def _fast_is_masking_supported(_env: Any) -> bool:
+                return True
+
+            mask_utils.is_masking_supported = _fast_is_masking_supported
+            ppo_mask_module.is_masking_supported = _fast_is_masking_supported
+        except Exception as patch_err:
+            print(f"[WARN] Could not patch MaskablePPO mask support check: {patch_err}", flush=True)
 
     policy_kwargs = dict(
         features_extractor_class=MAPSStateFeaturesExtractor,
