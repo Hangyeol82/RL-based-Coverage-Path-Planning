@@ -809,6 +809,19 @@ def main():
         vec_env_cls=vec_cls,
         vec_env_kwargs=vec_kwargs,
     )
+    if algo_name == "MaskablePPO" and bool(args.action_mask):
+        # sb3-contrib checks mask support at every rollout via VecEnv.has_attr().
+        # SubprocVecEnv's default has_attr() asks workers for the bound
+        # action_masks method, which pickles the whole env object. DTM envs carry
+        # large observation caches, so that support check can dominate runtime.
+        original_has_attr = vec_env.has_attr
+
+        def _has_attr_without_pickling_mask_method(attr_name: str) -> bool:
+            if str(attr_name) == "action_masks":
+                return True
+            return bool(original_has_attr(attr_name))
+
+        vec_env.has_attr = _has_attr_without_pickling_mask_method  # type: ignore[method-assign]
 
     policy_kwargs = dict(
         features_extractor_class=MAPSStateFeaturesExtractor,
