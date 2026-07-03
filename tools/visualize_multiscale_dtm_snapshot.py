@@ -548,7 +548,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description='Visualize multiscale DTM snapshot on a complex map.')
     p.add_argument('--map-file', type=str, default='map/indoor_seed101.txt')
     p.add_argument('--sensor-range', type=int, default=2)
-    p.add_argument('--dtm-output-mode', type=str, default='axis2km', choices=['axis2km', 'axis2', 'six', 'extent6', 'port12'])
+    p.add_argument('--dtm-output-mode', type=str, default='axis2km', choices=['axis2km', 'two', 'axis2', 'six', 'extent6', 'port12'])
     p.add_argument('--dtm-connectivity', type=int, default=4, choices=[4, 8])
     p.add_argument('--out-dir', type=str, default='log_analysis/logs/dtm_snapshot_indoor_20260311')
     args = p.parse_args()

@@ -106,7 +106,12 @@ def main() -> None:
     ap.add_argument("--sensor-range", type=int, default=2)
     ap.add_argument("--obstacle-prob", type=float, default=0.25)
     ap.add_argument("--seed", type=int, default=123)
-    ap.add_argument("--dtm-output-mode", type=str, default="extent6", choices=["six", "four", "extent6", "port12"])
+    ap.add_argument(
+        "--dtm-output-mode",
+        type=str,
+        default="extent6",
+        choices=["six", "four", "extent6", "two", "axis2", "axis2km", "port6", "port12"],
+    )
     ap.add_argument("--dtm-coarse-mode", type=str, default="bfs", choices=["bfs", "aggregate", "aggregate_transfer"])
     ap.add_argument("--dtm-patch-size", type=int, default=7)
     ap.add_argument("--dtm-connectivity", type=int, default=4, choices=[4, 8])

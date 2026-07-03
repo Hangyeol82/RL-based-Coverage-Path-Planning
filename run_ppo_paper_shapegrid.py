@@ -30,13 +30,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--variant",
         type=str,
-        default="dtm-axis2",
+        default="dtm-two",
         choices=[
             "baseline",
+            "dtm-two",
             "dtm-axis2",
             "dtm-six",
+            "dtm-two-hole-obs",
             "dtm-axis2-hole-obs",
+            "dtm-two-hole-reward",
             "dtm-axis2-hole-reward",
+            "dtm-two-hole-full",
             "dtm-axis2-hole-full",
             "dtm-six-hole-full",
         ],
@@ -110,19 +114,35 @@ def _build_cmd(args: argparse.Namespace) -> List[str]:
     if args.variant == "baseline":
         include_dtm = False
         dtm_output_mode = "axis2"
+    elif args.variant == "dtm-two":
+        include_dtm = True
+        dtm_output_mode = "two"
     elif args.variant == "dtm-axis2":
         include_dtm = True
         dtm_output_mode = "axis2"
     elif args.variant == "dtm-six":
         include_dtm = True
         dtm_output_mode = "six"
+    elif args.variant == "dtm-two-hole-obs":
+        include_dtm = True
+        dtm_output_mode = "two"
+        hole_signals = True
     elif args.variant == "dtm-axis2-hole-obs":
         include_dtm = True
         dtm_output_mode = "axis2"
         hole_signals = True
+    elif args.variant == "dtm-two-hole-reward":
+        include_dtm = True
+        dtm_output_mode = "two"
+        hole_penalty_scale = 0.1
     elif args.variant == "dtm-axis2-hole-reward":
         include_dtm = True
         dtm_output_mode = "axis2"
+        hole_penalty_scale = 0.1
+    elif args.variant == "dtm-two-hole-full":
+        include_dtm = True
+        dtm_output_mode = "two"
+        hole_signals = True
         hole_penalty_scale = 0.1
     elif args.variant == "dtm-axis2-hole-full":
         include_dtm = True

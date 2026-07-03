@@ -75,14 +75,14 @@ def _parse_args() -> argparse.Namespace:
         "--known-dtm-output-mode",
         type=str,
         default="axis2km",
-        choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
+        choices=["six", "extent6", "two", "axis2", "axis2km", "four", "port12"],
         help="DTM output mode for known-aware branch (default axis2km = pass+known).",
     )
     p.add_argument(
         "--no-known-dtm-output-mode",
         type=str,
         default="axis2",
-        choices=["six", "extent6", "axis2", "axis2km", "four", "port12"],
+        choices=["six", "extent6", "two", "axis2", "axis2km", "four", "port12"],
         help="DTM output mode for no-known branch (default axis2 = pass-only).",
     )
     p.add_argument(

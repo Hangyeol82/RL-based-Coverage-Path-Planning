@@ -417,9 +417,13 @@ class CPPDiscreteEnv:
         )
         self._obs_profile_totals = {}
 
-    def _dtm_channel_count(self) -> int:
+    def _dtm_output_mode(self) -> str:
         mode = str(self.config.observation.dtm_output_mode).strip().lower()
-        if mode in {"six", "extent6"}:
+        return "axis2" if mode == "two" else mode
+
+    def _dtm_channel_count(self) -> int:
+        mode = self._dtm_output_mode()
+        if mode in {"six", "extent6", "port6"}:
             return 6
         if mode == "axis2":
             return 2
@@ -436,15 +440,16 @@ class CPPDiscreteEnv:
         return int(c), int(c)
 
     def _exit_scores_from_dtm(self, dtm_values: np.ndarray) -> Tuple[float, float, float, float]:
-        mode = str(self.config.observation.dtm_output_mode).strip().lower()
+        mode = self._dtm_output_mode()
         vals = np.maximum(dtm_values.astype(np.float32), 0.0)
-        if mode in {"six", "extent6"}:
-            lr, ud, nw_se, se_nw, ne_sw, sw_ne = [float(v) for v in vals[:6]]
-            # Exit side can be reached if any transition path points to that side.
-            up = max(ud, se_nw, sw_ne)
-            right = max(lr, nw_se, sw_ne)
-            down = max(ud, nw_se, ne_sw)
-            left = max(lr, se_nw, ne_sw)
+        if mode in {"six", "extent6", "port6"}:
+            u_r, u_d, u_l, r_d, r_l, d_l = [float(v) for v in vals[:6]]
+            # six/port6 channel order:
+            # [U<->R, U<->D, U<->L, R<->D, R<->L, D<->L]
+            up = max(u_r, u_d, u_l)
+            right = max(u_r, r_d, r_l)
+            down = max(u_d, r_d, d_l)
+            left = max(u_l, r_l, d_l)
             return up, right, down, left
         if mode == "axis2":
             lr, ud = [float(v) for v in vals[:2]]
@@ -493,7 +498,7 @@ class CPPDiscreteEnv:
         raise ValueError(f"Unsupported dtm_output_mode: {self.config.observation.dtm_output_mode}")
 
     def _dtm_valid_flag(self, dtm_values: np.ndarray) -> float:
-        mode = str(self.config.observation.dtm_output_mode).strip().lower()
+        mode = self._dtm_output_mode()
         vals = dtm_values.astype(np.float32)
         if mode == "axis2km":
             # [lr_pass, ud_pass, lr_known, ud_known]

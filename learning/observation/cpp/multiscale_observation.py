@@ -131,7 +131,7 @@ class MultiScaleCPPObservationConfig:
     #   [U<->R, U<->D, U<->L, R<->D, R<->L, D<->L]
     # - extent6: six side-pair traversability extents in [0,1]
     #   with unknown as -1
-    # - axis2: LR, UD only
+    # - two/axis2: LR, UD only
     # - axis2km: LR/UD split into passable(0/1) + known(0/1)
     # - four: legacy projection to LR, UD, and two grouped turn channels
     # - port6: undirected side-to-side transitions
@@ -253,12 +253,13 @@ class MultiScaleCPPObservationBuilder:
             raise ValueError("dtm_coarse_mode must be one of {'bfs', 'aggregate', 'aggregate_transfer'}")
         if self.config.unknown_policy not in {"keep", "as_free", "as_obstacle"}:
             raise ValueError("unknown_policy must be one of {'keep', 'as_free', 'as_obstacle'}")
-        if self.config.dtm_output_mode not in {"six", "extent6", "axis2", "axis2km", "four", "port6", "port12"}:
+        output_mode = self._normalize_dtm_output_mode(self.config.dtm_output_mode)
+        if output_mode not in {"six", "extent6", "axis2", "axis2km", "four", "port6", "port12"}:
             raise ValueError(
-                "dtm_output_mode must be one of {'six', 'extent6', 'axis2', 'axis2km', 'four', 'port6', 'port12'}"
+                "dtm_output_mode must be one of {'six', 'extent6', 'two', 'axis2', 'axis2km', 'four', 'port6', 'port12'}"
             )
         if (
-            self.config.dtm_output_mode == "extent6"
+            output_mode == "extent6"
             and self.config.dtm_coarse_mode == "aggregate_transfer"
         ):
             raise ValueError(
@@ -300,16 +301,22 @@ class MultiScaleCPPObservationBuilder:
             return
         self._profile_totals[key] = float(self._profile_totals.get(key, 0.0)) + float(dt)
 
+    @staticmethod
+    def _normalize_dtm_output_mode(mode: str) -> str:
+        mode_s = str(mode).strip().lower()
+        return "axis2" if mode_s == "two" else mode_s
+
     def _native_dtm_mode(self) -> str:
         # For recursive coarse-cell composition, axis projections need full
         # side-to-side connectivity, not only LR/UD summaries.
-        if self.config.dtm_output_mode in {"axis2", "axis2km", "port12"}:
+        mode = self._normalize_dtm_output_mode(self.config.dtm_output_mode)
+        if mode in {"axis2", "axis2km", "port12"}:
             return "port12"
-        if self.config.dtm_output_mode == "port6":
+        if mode == "port6":
             return "port6"
-        if self.config.dtm_output_mode in {"six", "four"}:
+        if mode in {"six", "four"}:
             return "six"
-        if self.config.dtm_output_mode == "extent6":
+        if mode == "extent6":
             return "extent6"
         return "port6"
 
@@ -352,17 +359,18 @@ class MultiScaleCPPObservationBuilder:
 
     def _dtm_channel_names(self) -> Tuple[str, ...]:
         if self.include_dtm:
-            if self.config.dtm_output_mode == "six":
+            mode = self._normalize_dtm_output_mode(self.config.dtm_output_mode)
+            if mode == "six":
                 return self._DTM_CHANNELS_6
-            elif self.config.dtm_output_mode == "extent6":
+            elif mode == "extent6":
                 return self._DTM_CHANNELS_EXTENT6
-            elif self.config.dtm_output_mode == "axis2":
+            elif mode == "axis2":
                 return self._DTM_CHANNELS_2
-            elif self.config.dtm_output_mode == "axis2km":
+            elif mode == "axis2km":
                 return self._DTM_CHANNELS_4_AXIS2KM
-            elif self.config.dtm_output_mode == "four":
+            elif mode == "four":
                 return self._DTM_CHANNELS_4
-            elif self.config.dtm_output_mode == "port6":
+            elif mode == "port6":
                 return self._DTM_CHANNELS_PORT6
             else:
                 return self._DTM_CHANNELS_12
@@ -1179,37 +1187,34 @@ class MultiScaleCPPObservationBuilder:
     def _project_dtm_output(self, dtm_map: np.ndarray) -> np.ndarray:
         if dtm_map.ndim != 3:
             raise ValueError("dtm_map must be [C, H, W]")
+        mode = self._normalize_dtm_output_mode(self.config.dtm_output_mode)
         native_mode = self._native_dtm_mode()
         expected_ch = 12 if native_mode == "port12" else 6
         if dtm_map.shape[0] != expected_ch:
             raise ValueError(
                 f"{native_mode}-channel DTM expected with shape[0] == {expected_ch}"
             )
-        if self.config.dtm_output_mode == "port12":
+        if mode == "port12":
             return dtm_map
-        if self.config.dtm_output_mode == "port6":
+        if mode == "port6":
             return dtm_map
-        if self.config.dtm_output_mode == "extent6":
+        if mode == "extent6":
             return dtm_map
-        if self.config.dtm_output_mode == "six":
+        if mode == "six":
             return dtm_map
-        if self.config.dtm_output_mode == "axis2":
+        if mode == "axis2":
             if dtm_map.shape[0] == 12:
                 out = np.empty((2, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
                 out[0] = np.maximum(dtm_map[10], dtm_map[5])  # L->R or R->L
                 out[1] = np.maximum(dtm_map[1], dtm_map[6])   # U->D or D->U
                 return out
             if dtm_map.shape[0] != 6:
-                raise ValueError("axis2 projection expects six-, port6-, or port12-channel source DTM")
+                raise ValueError("two/axis2 projection expects six-, port6-, or port12-channel source DTM")
             out = np.empty((2, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
-            if native_mode == "port6":
-                out[0] = dtm_map[4]  # R<->L
-                out[1] = dtm_map[1]  # U<->D
-            else:
-                out[0] = dtm_map[0]  # LR
-                out[1] = dtm_map[1]  # UD
+            out[0] = dtm_map[4]  # R<->L
+            out[1] = dtm_map[1]  # U<->D
             return out
-        if self.config.dtm_output_mode == "axis2km":
+        if mode == "axis2km":
             if dtm_map.shape[0] == 12:
                 lr_fwd = dtm_map[10]  # L->R
                 lr_rev = dtm_map[5]   # R->L
@@ -1227,12 +1232,8 @@ class MultiScaleCPPObservationBuilder:
                 return out
             if dtm_map.shape[0] != 6:
                 raise ValueError("axis2km projection expects six-, port6-, or port12-channel source DTM")
-            if native_mode == "port6":
-                lr = dtm_map[4]
-                ud = dtm_map[1]
-            else:
-                lr = dtm_map[0]
-                ud = dtm_map[1]
+            lr = dtm_map[4]
+            ud = dtm_map[1]
             out = np.empty((4, dtm_map.shape[1], dtm_map.shape[2]), dtype=np.float32)
             out[0] = (lr > 0.0).astype(np.float32)   # lr_pass
             out[1] = (ud > 0.0).astype(np.float32)   # ud_pass

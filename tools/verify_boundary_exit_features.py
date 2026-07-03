@@ -24,8 +24,14 @@ def _make_map(rng: np.random.RandomState, size: int, obstacle_prob: float) -> np
 
 def _dtm_channels(mode: str) -> int:
     m = str(mode).strip().lower()
-    if m in {"six", "extent6"}:
+    if m == "two":
+        m = "axis2"
+    if m in {"six", "extent6", "port6"}:
         return 6
+    if m == "axis2":
+        return 2
+    if m == "axis2km":
+        return 4
     if m == "four":
         return 4
     if m == "port12":
@@ -35,13 +41,29 @@ def _dtm_channels(mode: str) -> int:
 
 def _exit_scores(mode: str, dtm_values: np.ndarray) -> Tuple[float, float, float, float]:
     m = str(mode).strip().lower()
+    if m == "two":
+        m = "axis2"
     vals = np.maximum(np.asarray(dtm_values, dtype=np.float32), 0.0)
-    if m in {"six", "extent6"}:
-        lr, ud, nw_se, se_nw, ne_sw, sw_ne = [float(v) for v in vals[:6]]
-        up = max(ud, se_nw, sw_ne)
-        right = max(lr, nw_se, sw_ne)
-        down = max(ud, nw_se, ne_sw)
-        left = max(lr, se_nw, ne_sw)
+    if m in {"six", "extent6", "port6"}:
+        u_r, u_d, u_l, r_d, r_l, d_l = [float(v) for v in vals[:6]]
+        up = max(u_r, u_d, u_l)
+        right = max(u_r, r_d, r_l)
+        down = max(u_d, r_d, d_l)
+        left = max(u_l, r_l, d_l)
+        return up, right, down, left
+    if m == "axis2":
+        lr, ud = [float(v) for v in vals[:2]]
+        up = ud
+        right = lr
+        down = ud
+        left = lr
+        return up, right, down, left
+    if m == "axis2km":
+        lr_pass, ud_pass = [float(v) for v in vals[:2]]
+        up = ud_pass
+        right = lr_pass
+        down = ud_pass
+        left = lr_pass
         return up, right, down, left
     if m == "four":
         lr, ud, d1, d2 = [float(v) for v in vals[:4]]
@@ -83,13 +105,9 @@ def _level_cell_index(
     rows: int,
     cols: int,
 ) -> GridPos:
-    if level_id < local_level_count:
-        c = int(local_window_size) // 2
-        return int(c), int(c)
-    rr, cc = robot_pos
-    gr = min(global_window_size - 1, max(0, int((float(rr) * float(global_window_size)) / float(max(1, rows)))))
-    gc = min(global_window_size - 1, max(0, int((float(cc) * float(global_window_size)) / float(max(1, cols)))))
-    return int(gr), int(gc)
+    _ = (level_id, local_level_count, global_window_size, robot_pos, rows, cols)
+    c = int(local_window_size) // 2
+    return int(c), int(c)
 
 
 def _expected_boundary_features(
@@ -120,7 +138,18 @@ def _expected_boundary_features(
             cols=int(cols),
         )
         dtm = arr[3 : 3 + dtm_ch, ri, ci]
-        valid = float(np.all(dtm >= 0.0))
+        if int(dtm.shape[0]) < int(dtm_ch):
+            out.extend([0.0, 0.0, 0.0, 0.0])
+            if include_valid:
+                out.append(0.0)
+            continue
+        mode_s = str(mode).strip().lower()
+        if mode_s == "two":
+            mode_s = "axis2"
+        if mode_s == "axis2km":
+            valid = float(np.all(dtm[2:4] >= 0.5))
+        else:
+            valid = float(np.all(dtm >= 0.0))
         up_s, right_s, down_s, left_s = _exit_scores(mode, dtm)
         if valid > 0.5:
             out.extend(
@@ -183,11 +212,11 @@ def verify(
 
         obs_a = env_a.reset()
         obs_b = env_b.reset()
-        base_dim = 9
+        boundary_dim = env_a.maps_builder.num_levels * (5 if cfg_a.boundary_exit_include_valid else 4)
 
         for _step in range(int(steps)):
-            extra_a = np.asarray(obs_a["robot_state"], dtype=np.float32)[base_dim:]
-            extra_b = np.asarray(obs_b["robot_state"], dtype=np.float32)[base_dim:]
+            extra_a = np.asarray(obs_a["robot_state"], dtype=np.float32)[-boundary_dim:]
+            extra_b = np.asarray(obs_b["robot_state"], dtype=np.float32)[-boundary_dim:]
 
             expected = _expected_boundary_features(
                 levels=obs_a["levels"],
@@ -227,7 +256,12 @@ def main() -> None:
     ap.add_argument("--map-size", type=int, default=32)
     ap.add_argument("--obstacle-prob", type=float, default=0.22)
     ap.add_argument("--sensor-range", type=int, default=2)
-    ap.add_argument("--dtm-output-mode", type=str, default="six", choices=["six", "extent6", "four", "port12"])
+    ap.add_argument(
+        "--dtm-output-mode",
+        type=str,
+        default="six",
+        choices=["six", "extent6", "two", "axis2", "axis2km", "four", "port6", "port12"],
+    )
     ap.add_argument("--boundary-exit-threshold", type=float, default=0.0)
     args = ap.parse_args()
 
