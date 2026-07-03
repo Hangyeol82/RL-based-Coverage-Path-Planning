@@ -29,7 +29,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 
 from evaluation.cpp_metrics import compute_cpp_path_metrics
-from learning.observation import MultiScaleCPPObservationConfig
+from learning.observation import MultiScaleCPPObservationConfig, RobotStateObservationConfig
 from learning.reinforcement.cpp_env import CPPDiscreteEnvConfig
 from learning.reinforcement.reward import CPPRewardConfig
 from learning.reinforcement.sb3_env import CPPDiscreteGymEnv
@@ -79,6 +79,9 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--out-dir", type=str, default="log_analysis/logs/shapegrid_l4_compare")
+    plot_group = p.add_mutually_exclusive_group()
+    plot_group.add_argument("--save-trajectory-plots", dest="save_trajectory_plots", action="store_true")
+    plot_group.add_argument("--no-save-trajectory-plots", dest="save_trajectory_plots", action="store_false")
     p.add_argument(
         "--shape-types",
         type=str,
@@ -95,10 +98,50 @@ def _parse_args() -> argparse.Namespace:
     mask_group.add_argument("--action-mask", dest="action_mask", action="store_true")
     mask_group.add_argument("--no-action-mask", dest="action_mask", action="store_false")
     p.set_defaults(action_mask=True)
+    heuristic_group = p.add_mutually_exclusive_group()
+    heuristic_group.add_argument("--heuristic-assist", dest="heuristic_assist", action="store_true")
+    heuristic_group.add_argument("--no-heuristic-assist", dest="heuristic_assist", action="store_false")
+    p.add_argument("--heuristic-no-progress-threshold", type=int, default=50)
+    p.add_argument("--heuristic-min-coverage", type=float, default=0.0)
+    p.add_argument("--heuristic-max-astar-expansions", type=int, default=0)
+    robot_pos_group = p.add_mutually_exclusive_group()
+    robot_pos_group.add_argument("--robot-state-position", dest="robot_state_position", action="store_true")
+    robot_pos_group.add_argument("--no-robot-state-position", dest="robot_state_position", action="store_false")
+    robot_hist_group = p.add_mutually_exclusive_group()
+    robot_hist_group.add_argument(
+        "--robot-state-action-history",
+        dest="robot_state_action_history",
+        action="store_true",
+    )
+    robot_hist_group.add_argument(
+        "--no-robot-state-action-history",
+        dest="robot_state_action_history",
+        action="store_false",
+    )
+    robot_prog_group = p.add_mutually_exclusive_group()
+    robot_prog_group.add_argument("--robot-state-progress", dest="robot_state_progress", action="store_true")
+    robot_prog_group.add_argument("--no-robot-state-progress", dest="robot_state_progress", action="store_false")
+    robot_stag_group = p.add_mutually_exclusive_group()
+    robot_stag_group.add_argument("--robot-state-stagnation", dest="robot_state_stagnation", action="store_true")
+    robot_stag_group.add_argument(
+        "--no-robot-state-stagnation",
+        dest="robot_state_stagnation",
+        action="store_false",
+    )
+    p.add_argument("--robot-state-action-history-len", type=int, default=5)
     det_group = p.add_mutually_exclusive_group()
     det_group.add_argument("--deterministic", dest="deterministic", action="store_true")
     det_group.add_argument("--stochastic", dest="deterministic", action="store_false")
-    p.set_defaults(deterministic=True, boundary_exit_features=False)
+    p.set_defaults(
+        deterministic=True,
+        boundary_exit_features=False,
+        heuristic_assist=False,
+        robot_state_position=False,
+        robot_state_action_history=True,
+        robot_state_progress=False,
+        robot_state_stagnation=False,
+        save_trajectory_plots=True,
+    )
     return p.parse_args()
 
 
@@ -263,6 +306,15 @@ def _evaluate_one_map(
     boundary_exit_features: bool,
     boundary_exit_threshold: float,
     action_mask: bool,
+    heuristic_assist: bool,
+    heuristic_no_progress_threshold: int,
+    heuristic_min_coverage: float,
+    heuristic_max_astar_expansions: int,
+    robot_state_position: bool,
+    robot_state_action_history: bool,
+    robot_state_progress: bool,
+    robot_state_stagnation: bool,
+    robot_state_action_history_len: int,
     dtm_output_mode: str,
     dtm_coarse_mode: str,
 ) -> Dict[str, object]:
@@ -290,7 +342,18 @@ def _evaluate_one_map(
             dtm_output_mode=str(dtm_output_mode),
             dtm_coarse_mode=str(dtm_coarse_mode),
         ),
+        robot_state=RobotStateObservationConfig(
+            action_history_len=int(robot_state_action_history_len),
+            include_position=bool(robot_state_position),
+            include_action_history=bool(robot_state_action_history),
+            include_progress=bool(robot_state_progress),
+            include_stagnation=bool(robot_state_stagnation),
+        ),
         use_action_mask=bool(action_mask),
+        heuristic_assist_enabled=bool(heuristic_assist),
+        heuristic_no_progress_threshold=int(heuristic_no_progress_threshold),
+        heuristic_min_coverage=float(heuristic_min_coverage),
+        heuristic_max_astar_expansions=int(heuristic_max_astar_expansions),
         reward=reward_cfg,
     )
     env = CPPDiscreteGymEnv(grid_map=grid, start_pos=start, config=env_cfg)
@@ -301,6 +364,9 @@ def _evaluate_one_map(
         total_reward = 0.0
         collision_count = 0
         action_overridden_count = 0
+        heuristic_active_count = 0
+        heuristic_selected_count = 0
+        heuristic_overridden_count = 0
         revisited_count = 0
         final_info: Dict[str, object] = {}
 
@@ -319,6 +385,12 @@ def _evaluate_one_map(
                 collision_count += 1
             if bool(info.get("action_overridden", False)):
                 action_overridden_count += 1
+            if bool(info.get("heuristic_active", False)):
+                heuristic_active_count += 1
+            if bool(info.get("heuristic_selected", False)):
+                heuristic_selected_count += 1
+            if bool(info.get("heuristic_overridden", False)):
+                heuristic_overridden_count += 1
             if bool(info.get("revisited_cell", False)):
                 revisited_count += 1
             pos = info.get("position", path[-1])
@@ -341,6 +413,13 @@ def _evaluate_one_map(
             "collision_rate": float(collision_count) / float(max(1, steps)),
             "action_overridden_count": int(action_overridden_count),
             "action_override_rate": float(action_overridden_count) / float(max(1, steps)),
+            "heuristic_assist_enabled": bool(heuristic_assist),
+            "heuristic_active_count": int(heuristic_active_count),
+            "heuristic_active_rate": float(heuristic_active_count) / float(max(1, steps)),
+            "heuristic_selected_count": int(heuristic_selected_count),
+            "heuristic_selected_rate": float(heuristic_selected_count) / float(max(1, steps)),
+            "heuristic_overridden_count": int(heuristic_overridden_count),
+            "heuristic_override_rate": float(heuristic_overridden_count) / float(max(1, steps)),
             "revisited_count": int(revisited_count),
             "revisit_ratio": float(overlap_rate),
             "overlap_count": int(revisited_count),
@@ -472,6 +551,15 @@ def main() -> None:
                 boundary_exit_features=bool(args.boundary_exit_features),
                 boundary_exit_threshold=float(args.boundary_exit_threshold),
                 action_mask=bool(args.action_mask),
+                heuristic_assist=bool(args.heuristic_assist),
+                heuristic_no_progress_threshold=int(args.heuristic_no_progress_threshold),
+                heuristic_min_coverage=float(args.heuristic_min_coverage),
+                heuristic_max_astar_expansions=int(args.heuristic_max_astar_expansions),
+                robot_state_position=bool(args.robot_state_position),
+                robot_state_action_history=bool(args.robot_state_action_history),
+                robot_state_progress=bool(args.robot_state_progress),
+                robot_state_stagnation=bool(args.robot_state_stagnation),
+                robot_state_action_history_len=int(args.robot_state_action_history_len),
                 dtm_output_mode=str(args.dtm_output_mode),
                 dtm_coarse_mode=str(args.dtm_coarse_mode),
             )
@@ -502,6 +590,13 @@ def main() -> None:
                 "success_99": bool(result["success_99"]),
                 "action_override_rate": float(result["action_override_rate"]),
                 "action_overridden_count": int(result["action_overridden_count"]),
+                "heuristic_assist_enabled": bool(result["heuristic_assist_enabled"]),
+                "heuristic_active_rate": float(result["heuristic_active_rate"]),
+                "heuristic_active_count": int(result["heuristic_active_count"]),
+                "heuristic_selected_rate": float(result["heuristic_selected_rate"]),
+                "heuristic_selected_count": int(result["heuristic_selected_count"]),
+                "heuristic_override_rate": float(result["heuristic_override_rate"]),
+                "heuristic_overridden_count": int(result["heuristic_overridden_count"]),
                 "unique_positions": int(result["unique_positions"]),
                 "path_length": int(result["path_length"]),
                 "total_reward_sum": float(result["total_reward_sum"]),
@@ -517,12 +612,13 @@ def main() -> None:
             payload = dict(row)
             payload["path"] = result["path"]
             path_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            _plot_trajectory_rainbow(
-                grid=grid,
-                path=np.asarray(result["path"], dtype=np.int32),
-                title=f"{mode} | {map_id}",
-                out_png=plot_png,
-            )
+            if bool(args.save_trajectory_plots):
+                _plot_trajectory_rainbow(
+                    grid=grid,
+                    path=np.asarray(result["path"], dtype=np.int32),
+                    title=f"{mode} | {map_id}",
+                    out_png=plot_png,
+                )
 
             if mode == "baseline":
                 baseline_by_seed[int(seed)] = row
@@ -565,6 +661,24 @@ def main() -> None:
             "dtm_step_to_95": d["step_to_95"],
             "baseline_step_to_99": b["step_to_99"],
             "dtm_step_to_99": d["step_to_99"],
+            "baseline_heuristic_active_rate": float(b["heuristic_active_rate"]),
+            "dtm_heuristic_active_rate": float(d["heuristic_active_rate"]),
+            "delta_heuristic_active_rate": _safe_delta(
+                float(b["heuristic_active_rate"]),
+                float(d["heuristic_active_rate"]),
+            ),
+            "baseline_heuristic_selected_rate": float(b["heuristic_selected_rate"]),
+            "dtm_heuristic_selected_rate": float(d["heuristic_selected_rate"]),
+            "delta_heuristic_selected_rate": _safe_delta(
+                float(b["heuristic_selected_rate"]),
+                float(d["heuristic_selected_rate"]),
+            ),
+            "baseline_heuristic_override_rate": float(b["heuristic_override_rate"]),
+            "dtm_heuristic_override_rate": float(d["heuristic_override_rate"]),
+            "delta_heuristic_override_rate": _safe_delta(
+                float(b["heuristic_override_rate"]),
+                float(d["heuristic_override_rate"]),
+            ),
         }
         per_map_compare_rows.append(cmp_row)
 
@@ -595,6 +709,13 @@ def main() -> None:
         "collision_count",
         "action_override_rate",
         "action_overridden_count",
+        "heuristic_assist_enabled",
+        "heuristic_active_rate",
+        "heuristic_active_count",
+        "heuristic_selected_rate",
+        "heuristic_selected_count",
+        "heuristic_override_rate",
+        "heuristic_overridden_count",
         "unique_positions",
         "path_length",
         "total_reward_sum",
@@ -629,6 +750,15 @@ def main() -> None:
         "dtm_step_to_95",
         "baseline_step_to_99",
         "dtm_step_to_99",
+        "baseline_heuristic_active_rate",
+        "dtm_heuristic_active_rate",
+        "delta_heuristic_active_rate",
+        "baseline_heuristic_selected_rate",
+        "dtm_heuristic_selected_rate",
+        "delta_heuristic_selected_rate",
+        "baseline_heuristic_override_rate",
+        "dtm_heuristic_override_rate",
+        "delta_heuristic_override_rate",
     ]
     _write_rows_csv(out_dir / "comparison_per_map.csv", per_map_compare_rows, cmp_fieldnames)
 
@@ -673,6 +803,17 @@ def main() -> None:
         "mean_dtm_step_to_95": _mean_optional(dtm_rows, "step_to_95"),
         "mean_baseline_step_to_99": _mean_optional(baseline_rows, "step_to_99"),
         "mean_dtm_step_to_99": _mean_optional(dtm_rows, "step_to_99"),
+        "heuristic_assist_enabled": bool(args.heuristic_assist),
+        "heuristic_no_progress_threshold": int(args.heuristic_no_progress_threshold),
+        "mean_baseline_heuristic_active_rate": _mean(baseline_rows, "heuristic_active_rate"),
+        "mean_dtm_heuristic_active_rate": _mean(dtm_rows, "heuristic_active_rate"),
+        "delta_heuristic_active_rate": _mean(dtm_rows, "heuristic_active_rate") - _mean(baseline_rows, "heuristic_active_rate"),
+        "mean_baseline_heuristic_selected_rate": _mean(baseline_rows, "heuristic_selected_rate"),
+        "mean_dtm_heuristic_selected_rate": _mean(dtm_rows, "heuristic_selected_rate"),
+        "delta_heuristic_selected_rate": _mean(dtm_rows, "heuristic_selected_rate") - _mean(baseline_rows, "heuristic_selected_rate"),
+        "mean_baseline_heuristic_override_rate": _mean(baseline_rows, "heuristic_override_rate"),
+        "mean_dtm_heuristic_override_rate": _mean(dtm_rows, "heuristic_override_rate"),
+        "delta_heuristic_override_rate": _mean(dtm_rows, "heuristic_override_rate") - _mean(baseline_rows, "heuristic_override_rate"),
     }
     (out_dir / "comparison_aggregate.json").write_text(
         json.dumps(aggregate, indent=2),
@@ -685,6 +826,12 @@ def main() -> None:
     print(f"  mean overlap : baseline={aggregate['mean_baseline_overlap_rate']:.4f}, dtm={aggregate['mean_dtm_overlap_rate']:.4f}, delta={aggregate['delta_overlap_rate']:+.4f}")
     print(f"  mean collision: baseline={aggregate['mean_baseline_collision_rate']:.4f}, dtm={aggregate['mean_dtm_collision_rate']:.4f}, delta={aggregate['delta_collision_rate']:+.4f}")
     print(f"  mean reward: baseline={aggregate['mean_baseline_reward_total']:.4f}, dtm={aggregate['mean_dtm_reward_total']:.4f}, delta={aggregate['delta_reward_total']:+.4f}")
+    print(
+        "  heuristic selected:"
+        f" baseline={aggregate['mean_baseline_heuristic_selected_rate']:.4f},"
+        f" dtm={aggregate['mean_dtm_heuristic_selected_rate']:.4f},"
+        f" delta={aggregate['delta_heuristic_selected_rate']:+.4f}"
+    )
 
 
 if __name__ == "__main__":

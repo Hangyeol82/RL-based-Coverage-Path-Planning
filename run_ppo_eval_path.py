@@ -25,7 +25,7 @@ if "MPLCONFIGDIR" not in os.environ:
 import matplotlib.pyplot as plt
 import numpy as np
 
-from learning.observation import MultiScaleCPPObservationConfig
+from learning.observation import MultiScaleCPPObservationConfig, RobotStateObservationConfig
 from learning.reinforcement.cpp_env import CPPDiscreteEnvConfig
 from learning.reinforcement.reward import CPPRewardConfig
 from learning.reinforcement.sb3_env import CPPDiscreteGymEnv
@@ -138,6 +138,50 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable action masking in eval.",
     )
+    heuristic_group = p.add_mutually_exclusive_group()
+    heuristic_group.add_argument(
+        "--heuristic-assist",
+        dest="heuristic_assist",
+        action="store_true",
+        help=(
+            "Test-time A* rescue: after repeated no-coverage steps, route to "
+            "the nearest observed uncovered known-free cell."
+        ),
+    )
+    heuristic_group.add_argument(
+        "--no-heuristic-assist",
+        dest="heuristic_assist",
+        action="store_false",
+        help="Disable test-time A* heuristic assist.",
+    )
+    p.add_argument("--heuristic-no-progress-threshold", type=int, default=50)
+    p.add_argument("--heuristic-min-coverage", type=float, default=0.0)
+    p.add_argument("--heuristic-max-astar-expansions", type=int, default=0)
+    robot_pos_group = p.add_mutually_exclusive_group()
+    robot_pos_group.add_argument("--robot-state-position", dest="robot_state_position", action="store_true")
+    robot_pos_group.add_argument("--no-robot-state-position", dest="robot_state_position", action="store_false")
+    robot_hist_group = p.add_mutually_exclusive_group()
+    robot_hist_group.add_argument(
+        "--robot-state-action-history",
+        dest="robot_state_action_history",
+        action="store_true",
+    )
+    robot_hist_group.add_argument(
+        "--no-robot-state-action-history",
+        dest="robot_state_action_history",
+        action="store_false",
+    )
+    robot_prog_group = p.add_mutually_exclusive_group()
+    robot_prog_group.add_argument("--robot-state-progress", dest="robot_state_progress", action="store_true")
+    robot_prog_group.add_argument("--no-robot-state-progress", dest="robot_state_progress", action="store_false")
+    robot_stag_group = p.add_mutually_exclusive_group()
+    robot_stag_group.add_argument("--robot-state-stagnation", dest="robot_state_stagnation", action="store_true")
+    robot_stag_group.add_argument(
+        "--no-robot-state-stagnation",
+        dest="robot_state_stagnation",
+        action="store_false",
+    )
+    p.add_argument("--robot-state-action-history-len", type=int, default=5)
     det_group = p.add_mutually_exclusive_group()
     det_group.add_argument(
         "--deterministic",
@@ -151,7 +195,15 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Sample actions from policy distribution.",
     )
-    p.set_defaults(action_mask=True, boundary_exit_features=False)
+    p.set_defaults(
+        action_mask=True,
+        boundary_exit_features=False,
+        heuristic_assist=False,
+        robot_state_position=False,
+        robot_state_action_history=True,
+        robot_state_progress=False,
+        robot_state_stagnation=False,
+    )
     p.set_defaults(deterministic=True)
 
     p.add_argument("--save-path-json", type=str, default="")
@@ -351,7 +403,18 @@ def main():
             dtm_coarse_mode=str(args.dtm_coarse_mode),
             dtm_connectivity=int(args.dtm_connectivity),
         ),
+        robot_state=RobotStateObservationConfig(
+            action_history_len=int(args.robot_state_action_history_len),
+            include_position=bool(args.robot_state_position),
+            include_action_history=bool(args.robot_state_action_history),
+            include_progress=bool(args.robot_state_progress),
+            include_stagnation=bool(args.robot_state_stagnation),
+        ),
         use_action_mask=bool(args.action_mask),
+        heuristic_assist_enabled=bool(args.heuristic_assist),
+        heuristic_no_progress_threshold=int(args.heuristic_no_progress_threshold),
+        heuristic_min_coverage=float(args.heuristic_min_coverage),
+        heuristic_max_astar_expansions=int(args.heuristic_max_astar_expansions),
         reward=reward_cfg,
     )
     env = CPPDiscreteGymEnv(grid_map=grid, start_pos=start, config=env_cfg)
@@ -378,6 +441,9 @@ def main():
         total_reward = 0.0
         collision_count = 0
         action_overridden_count = 0
+        heuristic_active_count = 0
+        heuristic_selected_count = 0
+        heuristic_overridden_count = 0
         final_info: Dict = {}
 
         for _ in range(int(args.max_episode_steps)):
@@ -395,6 +461,12 @@ def main():
                 collision_count += 1
             if bool(info.get("action_overridden", False)):
                 action_overridden_count += 1
+            if bool(info.get("heuristic_active", False)):
+                heuristic_active_count += 1
+            if bool(info.get("heuristic_selected", False)):
+                heuristic_selected_count += 1
+            if bool(info.get("heuristic_overridden", False)):
+                heuristic_overridden_count += 1
             pos = info.get("position", path[-1])
             path.append((int(pos[0]), int(pos[1])))
             final_info = info
@@ -408,6 +480,9 @@ def main():
         done_reason = str(final_info.get("done_reason", ""))
         collision_rate = float(collision_count) / float(max(1, steps))
         action_override_rate = float(action_overridden_count) / float(max(1, steps))
+        heuristic_active_rate = float(heuristic_active_count) / float(max(1, steps))
+        heuristic_selected_rate = float(heuristic_selected_count) / float(max(1, steps))
+        heuristic_override_rate = float(heuristic_overridden_count) / float(max(1, steps))
         unique_positions = int(len({(int(r), int(c)) for r, c in path}))
 
         print("[EVAL RESULT]")
@@ -418,6 +493,13 @@ def main():
         print(f"  coverage_ratio: {coverage_ratio:.6f}")
         print(f"  collision_rate: {collision_rate:.6f} ({collision_count}/{steps})")
         print(f"  action_override_rate: {action_override_rate:.6f} ({action_overridden_count}/{steps})")
+        print(
+            "  heuristic:"
+            f" enabled={bool(args.heuristic_assist)},"
+            f" active_rate={heuristic_active_rate:.6f} ({heuristic_active_count}/{steps}),"
+            f" selected_rate={heuristic_selected_rate:.6f} ({heuristic_selected_count}/{steps}),"
+            f" override_rate={heuristic_override_rate:.6f} ({heuristic_overridden_count}/{steps})"
+        )
         print(f"  collision(last): {collision_last:.6f}")
         print(f"  unique_positions: {unique_positions}")
         print(f"  total_reward(sum): {total_reward:.6f}")
@@ -439,6 +521,14 @@ def main():
                 "collision_rate": collision_rate,
                 "action_overridden_count": int(action_overridden_count),
                 "action_override_rate": action_override_rate,
+                "heuristic_assist_enabled": bool(args.heuristic_assist),
+                "heuristic_no_progress_threshold": int(args.heuristic_no_progress_threshold),
+                "heuristic_active_count": int(heuristic_active_count),
+                "heuristic_active_rate": heuristic_active_rate,
+                "heuristic_selected_count": int(heuristic_selected_count),
+                "heuristic_selected_rate": heuristic_selected_rate,
+                "heuristic_overridden_count": int(heuristic_overridden_count),
+                "heuristic_override_rate": heuristic_override_rate,
                 "unique_positions": unique_positions,
                 "total_reward_sum": total_reward,
                 "done_reason": done_reason,

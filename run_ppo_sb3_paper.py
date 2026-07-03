@@ -293,6 +293,40 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable action masking.",
     )
+    heuristic_group = p.add_mutually_exclusive_group()
+    heuristic_group.add_argument(
+        "--heuristic-assist",
+        dest="heuristic_assist",
+        action="store_true",
+        help=(
+            "After repeated no-coverage steps, override the policy with an "
+            "online-safe A* move toward the nearest observed uncovered free cell."
+        ),
+    )
+    heuristic_group.add_argument(
+        "--no-heuristic-assist",
+        dest="heuristic_assist",
+        action="store_false",
+        help="Disable A* heuristic action assist.",
+    )
+    p.add_argument(
+        "--heuristic-no-progress-threshold",
+        type=int,
+        default=50,
+        help="No-new-coverage steps before heuristic assist may activate.",
+    )
+    p.add_argument(
+        "--heuristic-min-coverage",
+        type=float,
+        default=0.0,
+        help="Minimum current coverage ratio before heuristic assist may activate.",
+    )
+    p.add_argument(
+        "--heuristic-max-astar-expansions",
+        type=int,
+        default=0,
+        help="Maximum A* node expansions per assist call. 0 uses the full map size.",
+    )
 
     p.add_argument("--map-source", type=str, default="random", choices=["random", "custom", "file"])
     p.add_argument("--map-size", type=int, default=32)
@@ -356,6 +390,7 @@ def _parse_args() -> argparse.Namespace:
         cell_phase_channels=True,
         hole_signals=False,
         revisit_burden_shaping=False,
+        heuristic_assist=False,
     )
     args = p.parse_args()
     args.robot_state_progress = False
@@ -714,6 +749,10 @@ def main():
         ),
         use_cell_phase_features=bool(args.cell_phase_channels),
         use_action_mask=bool(args.action_mask),
+        heuristic_assist_enabled=bool(args.heuristic_assist),
+        heuristic_no_progress_threshold=int(args.heuristic_no_progress_threshold),
+        heuristic_min_coverage=float(args.heuristic_min_coverage),
+        heuristic_max_astar_expansions=int(args.heuristic_max_astar_expansions),
         reward=reward_cfg,
     )
 
@@ -965,6 +1004,13 @@ def main():
         f" gamma={float(args.gamma):.4f},"
         f" normalizer={float(args.revisit_burden_normalizer):.1f},"
         f" unreachable_cost={float(args.revisit_burden_unreachable_cost):.1f}"
+    )
+    print(
+        "Heuristic assist:"
+        f" enabled={bool(args.heuristic_assist)},"
+        f" threshold={int(args.heuristic_no_progress_threshold)},"
+        f" min_coverage={float(args.heuristic_min_coverage):.3f},"
+        f" max_astar_expansions={int(args.heuristic_max_astar_expansions)}"
     )
     print(
         "Paper metrics:"

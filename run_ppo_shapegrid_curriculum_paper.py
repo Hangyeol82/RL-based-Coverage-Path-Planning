@@ -318,6 +318,12 @@ def _parse_args() -> argparse.Namespace:
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument("--action-mask", dest="action_mask", action="store_true")
     mask_group.add_argument("--no-action-mask", dest="action_mask", action="store_false")
+    heuristic_group = p.add_mutually_exclusive_group()
+    heuristic_group.add_argument("--heuristic-assist", dest="heuristic_assist", action="store_true")
+    heuristic_group.add_argument("--no-heuristic-assist", dest="heuristic_assist", action="store_false")
+    p.add_argument("--heuristic-no-progress-threshold", type=int, default=50)
+    p.add_argument("--heuristic-min-coverage", type=float, default=0.0)
+    p.add_argument("--heuristic-max-astar-expansions", type=int, default=0)
     p.set_defaults(
         action_mask=True,
         milestone_reward=False,
@@ -329,6 +335,7 @@ def _parse_args() -> argparse.Namespace:
         cell_phase_channels=True,
         hole_signals=False,
         revisit_burden_shaping=False,
+        heuristic_assist=False,
     )
 
     p.add_argument(
@@ -343,6 +350,27 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=str, default="")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--continue-on-error", action="store_true")
+    p.add_argument(
+        "--resume-from-model",
+        type=str,
+        default="",
+        help="Existing SB3 model zip to load before the first chunk of this run.",
+    )
+    p.add_argument(
+        "--start-chunk-index",
+        type=int,
+        default=0,
+        help=(
+            "Number of chunks already completed before this run. "
+            "Used for output chunk numbering, map seeds, and run seeds."
+        ),
+    )
+    p.add_argument(
+        "--start-timesteps",
+        type=int,
+        default=0,
+        help="Timesteps already completed before this run, used for curriculum phase accounting.",
+    )
     args = p.parse_args()
     args.robot_state_progress = False
     args.robot_state_stagnation = False
@@ -805,6 +833,12 @@ def _build_run_cmd(
         str(int(args.metric_stagnation_threshold)),
         "--metric-loop-window",
         str(int(args.metric_loop_window)),
+        "--heuristic-no-progress-threshold",
+        str(int(args.heuristic_no_progress_threshold)),
+        "--heuristic-min-coverage",
+        str(float(args.heuristic_min_coverage)),
+        "--heuristic-max-astar-expansions",
+        str(int(args.heuristic_max_astar_expansions)),
         "--boundary-exit-threshold",
         str(float(args.boundary_exit_threshold)),
         "--milestone-threshold-90",
@@ -861,6 +895,10 @@ def _build_run_cmd(
         cmd.append("--action-mask")
     else:
         cmd.append("--no-action-mask")
+    if args.heuristic_assist:
+        cmd.append("--heuristic-assist")
+    else:
+        cmd.append("--no-heuristic-assist")
     if args.robot_state_position:
         cmd.append("--robot-state-position")
     else:
@@ -932,6 +970,12 @@ def main():
         raise ValueError("--episode-success-threshold must be in (0, 1]")
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
+    if args.start_chunk_index < 0:
+        raise ValueError("--start-chunk-index must be non-negative")
+    if args.start_timesteps < 0:
+        raise ValueError("--start-timesteps must be non-negative")
+    if args.resume_from_model.strip() and args.init_from_bc.strip():
+        raise ValueError("--resume-from-model and --init-from-bc cannot be used together")
 
     phase_levels = _parse_int_list(args.phase_levels, name="phase-levels")
     phase_timesteps = _parse_int_list(args.phase_timesteps, name="phase-timesteps")
@@ -990,6 +1034,15 @@ def main():
             raise FileNotFoundError(f"BC checkpoint not found: {p}")
         bc_ckpt = str(p)
 
+    resume_model_zip = ""
+    if args.resume_from_model.strip():
+        p = Path(args.resume_from_model)
+        if not p.is_absolute():
+            p = repo_root / p
+        if not p.exists():
+            raise FileNotFoundError(f"Resume model not found: {p}")
+        resume_model_zip = str(p)
+
     total = int(args.total_timesteps)
     chunk = int(args.chunk_timesteps)
     num_chunks = int(math.ceil(total / float(chunk)))
@@ -1047,15 +1100,22 @@ def main():
     failed = False
     adaptive_stage_idx = 0
     adaptive_stage_chunks: List[Dict] = []
+    prev_model_zip = resume_model_zip
 
     for i in range(num_chunks):
-        chunk_start = done_steps
+        global_chunk_idx = int(args.start_chunk_index) + int(i)
+        display_chunk = int(global_chunk_idx + 1)
+        chunk_start = int(args.start_timesteps) + int(done_steps)
         chunk_t = int(min(chunk, total - done_steps))
         maps_per_chunk = max(1, int(args.maps_per_chunk))
-        map_seed = int(args.seed if args.map_seed_mode == "fixed" else (args.seed + i * maps_per_chunk))
-        run_seed = int(args.seed + i)
+        map_seed = int(
+            args.seed
+            if args.map_seed_mode == "fixed"
+            else (args.seed + global_chunk_idx * maps_per_chunk)
+        )
+        run_seed = int(args.seed + global_chunk_idx)
 
-        map_pool_dir = maps_dir / f"chunk{i+1:02d}_pool"
+        map_pool_dir = maps_dir / f"chunk{display_chunk:02d}_pool"
         map_pool_dir.mkdir(parents=True, exist_ok=True)
         for old_map in map_pool_dir.glob("*.txt"):
             old_map.unlink()
@@ -1089,7 +1149,7 @@ def main():
                     level=int(preset.level),
                 )
                 if maps_per_chunk == 1:
-                    map_txt = maps_dir / f"chunk{i+1:02d}_L{preset.level}_{preset.name}_seed{this_seed}.txt"
+                    map_txt = maps_dir / f"chunk{display_chunk:02d}_L{preset.level}_{preset.name}_seed{this_seed}.txt"
                 else:
                     map_txt = map_pool_dir / (
                         f"map{j+1:03d}_L{preset.level}_{preset.name}_seed{this_seed}.txt"
@@ -1102,6 +1162,7 @@ def main():
                 map_records.append(
                     {
                         "chunk": int(i + 1),
+                        "global_chunk": int(display_chunk),
                         "map_index": int(j + 1),
                         "family": "object_placement",
                         "generator": "shape_grid",
@@ -1155,7 +1216,7 @@ def main():
                     max_obstacle_ratio=float(args.mixed_max_obstacle_ratio),
                 )
                 stem = f"map{j+1:03d}_P{stage_idx+1}_L{level}_{generator}_seed{this_seed}"
-                map_txt = maps_dir / f"chunk{i+1:02d}_{stem}.txt" if maps_per_chunk == 1 else map_pool_dir / f"{stem}.txt"
+                map_txt = maps_dir / f"chunk{display_chunk:02d}_{stem}.txt" if maps_per_chunk == 1 else map_pool_dir / f"{stem}.txt"
                 _write_map_txt(map_txt, grid)
                 map_files.append(map_txt)
                 obs_ratios.append(float(stats.obstacle_ratio))
@@ -1164,6 +1225,7 @@ def main():
                 map_records.append(
                     {
                         "chunk": int(i + 1),
+                        "global_chunk": int(display_chunk),
                         "map_index": int(j + 1),
                         "family": str(family),
                         "generator": str(generator),
@@ -1200,13 +1262,13 @@ def main():
             for row in map_records:
                 f.write(json.dumps(_jsonable(row), ensure_ascii=False) + "\n")
 
-        save_model_base = models_dir / f"chunk{i+1:02d}"
+        save_model_base = models_dir / f"chunk{display_chunk:02d}"
         save_model_zip = save_model_base.with_suffix(".zip")
-        save_json = logs_dir / f"chunk{i+1:02d}.json"
-        save_csv = logs_dir / f"chunk{i+1:02d}.csv"
+        save_json = logs_dir / f"chunk{display_chunk:02d}.json"
+        save_csv = logs_dir / f"chunk{display_chunk:02d}.csv"
 
-        init_bc = bc_ckpt if i == 0 and bc_ckpt else ""
-        load_model = prev_model_zip if i > 0 else ""
+        init_bc = bc_ckpt if i == 0 and bc_ckpt and not resume_model_zip else ""
+        load_model = prev_model_zip if (i > 0 or resume_model_zip) else ""
         cmd = _build_run_cmd(
             args,
             runner=runner,
@@ -1222,7 +1284,7 @@ def main():
         )
 
         print(
-            f"\n[CHUNK {i+1}/{num_chunks}] steps={chunk_t} "
+            f"\n[CHUNK {display_chunk} local={i+1}/{num_chunks}] steps={chunk_t} "
             f"curriculum={curriculum_desc} map_seed={map_seed} "
             f"maps={maps_per_chunk} obs_ratio_mean={obs_ratio:.3f} "
             f"family_counts={family_counts} generator_counts={generator_counts} "
@@ -1234,9 +1296,10 @@ def main():
             done_steps += chunk_t
             rec = {
                 "chunk": i + 1,
+                "global_chunk": int(display_chunk),
                 "status": "dry_run",
                 "chunk_timesteps": int(chunk_t),
-                "timesteps_done": int(done_steps),
+                "timesteps_done": int(args.start_timesteps + done_steps),
                 "generator_curriculum": str(args.generator_curriculum),
                 "curriculum_mode": str(args.curriculum_mode),
                 "curriculum_stage_index": int(stage_idx),
@@ -1248,6 +1311,7 @@ def main():
                 "maps_per_chunk": int(maps_per_chunk),
                 "episode_map_refresh": bool(maps_per_chunk > 1),
                 "run_seed": int(run_seed),
+                "resume_from_model": str(resume_model_zip),
                 "map_file": str(map_txt),
                 "map_obstacle_ratio": float(obs_ratio),
                 "map_start_component_ratio_mean": float(
@@ -1270,9 +1334,10 @@ def main():
             failed = True
             rec = {
                 "chunk": i + 1,
+                "global_chunk": int(display_chunk),
                 "status": "failed",
                 "returncode": int(e.returncode),
-                "steps_done": int(done_steps),
+                "steps_done": int(args.start_timesteps + done_steps),
                 "chunk_wall_time_sec": float(train_wall_time_sec),
             }
             progress_rows.append(rec)
@@ -1285,8 +1350,9 @@ def main():
             failed = True
             rec = {
                 "chunk": i + 1,
+                "global_chunk": int(display_chunk),
                 "status": "failed_no_model",
-                "steps_done": int(done_steps),
+                "steps_done": int(args.start_timesteps + done_steps),
             }
             progress_rows.append(rec)
             if not args.continue_on_error:
@@ -1301,9 +1367,10 @@ def main():
 
         rec = {
             "chunk": i + 1,
+            "global_chunk": int(display_chunk),
             "status": "ok",
             "chunk_timesteps": int(chunk_t),
-            "timesteps_done": int(done_steps),
+            "timesteps_done": int(args.start_timesteps + done_steps),
             "generator_curriculum": str(args.generator_curriculum),
             "curriculum_mode": str(args.curriculum_mode),
             "curriculum_stage_index": int(stage_idx),
@@ -1315,6 +1382,7 @@ def main():
             "maps_per_chunk": int(maps_per_chunk),
             "episode_map_refresh": bool(maps_per_chunk > 1),
             "run_seed": int(run_seed),
+            "resume_from_model": str(resume_model_zip),
             "chunk_wall_time_sec": float(train_wall_time_sec),
             "chunk_env_steps_per_sec": float(chunk_t) / float(max(train_wall_time_sec, 1e-9)),
             "map_file": str(map_txt),

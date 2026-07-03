@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 from collections import deque
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -63,6 +64,13 @@ class CPPDiscreteEnvConfig:
     # Preserving occupancy-derived DTM caches avoids rebuilding full-map DTM
     # every time only coverage/explored state is reset.
     preserve_static_map_observation_cache_on_reset: bool = False
+    # Optional heuristic assist for training/evaluation. When the policy fails
+    # to add new coverage for N consecutive steps, an online-safe A* planner can
+    # temporarily route to the nearest observed but uncovered known-free cell.
+    heuristic_assist_enabled: bool = False
+    heuristic_no_progress_threshold: int = 50
+    heuristic_min_coverage: float = 0.0
+    heuristic_max_astar_expansions: int = 0
 
     observation: MultiScaleCPPObservationConfig = field(
         default_factory=MultiScaleCPPObservationConfig,
@@ -154,6 +162,7 @@ class CPPDiscreteEnv:
         self.recent_actions: Deque[int] = deque(
             maxlen=max(1, int(self.config.robot_state.action_history_len)),
         )
+        self._heuristic_no_progress_streak = 0
 
         self.reset()
 
@@ -577,6 +586,145 @@ class CPPDiscreteEnv:
                 best_action = action
         return best_action
 
+    def _heuristic_should_activate(self) -> bool:
+        if not bool(self.config.heuristic_assist_enabled):
+            return False
+        threshold = int(self.config.heuristic_no_progress_threshold)
+        if threshold <= 0:
+            return False
+        if int(self._heuristic_no_progress_streak) < threshold:
+            return False
+        min_cov = float(self.config.heuristic_min_coverage)
+        if min_cov > 0.0 and self._coverage_ratio() < min_cov:
+            return False
+        return True
+
+    def _action_leads_to_known_uncovered_free(self, action: int) -> bool:
+        dr, dc = ACTION_TO_DELTA[int(action)]
+        cr, cc = self.current_pos
+        nr, nc = cr + dr, cc + dc
+        if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+            return False
+        return bool(self.known_map[nr, nc] == 0 and not self.explored[nr, nc])
+
+    def _manhattan_distance_to_targets(self, target_mask: np.ndarray) -> np.ndarray:
+        inf = int(self.rows + self.cols + 1)
+        dist = np.full((self.rows, self.cols), inf, dtype=np.int32)
+        dist[target_mask] = 0
+        for r in range(self.rows):
+            for c in range(self.cols):
+                best = int(dist[r, c])
+                if r > 0:
+                    best = min(best, int(dist[r - 1, c]) + 1)
+                if c > 0:
+                    best = min(best, int(dist[r, c - 1]) + 1)
+                dist[r, c] = best
+        for r in range(self.rows - 1, -1, -1):
+            for c in range(self.cols - 1, -1, -1):
+                best = int(dist[r, c])
+                if r + 1 < self.rows:
+                    best = min(best, int(dist[r + 1, c]) + 1)
+                if c + 1 < self.cols:
+                    best = min(best, int(dist[r, c + 1]) + 1)
+                dist[r, c] = best
+        return dist
+
+    def _nearest_known_uncovered_astar_action(self) -> Tuple[Optional[int], Dict[str, float]]:
+        target_mask = (self.known_map == 0) & (~self.explored)
+        target_count = int(np.count_nonzero(target_mask))
+        stats: Dict[str, float] = {
+            "path_found": 0.0,
+            "target_count": float(target_count),
+            "path_length": 0.0,
+            "astar_expansions": 0.0,
+            "target_row": -1.0,
+            "target_col": -1.0,
+        }
+        if target_count <= 0:
+            return None, stats
+
+        start = self.current_pos
+        sr, sc = start
+        passable = self.known_map == 0
+        if not bool(passable[sr, sc]):
+            return None, stats
+
+        heuristic = self._manhattan_distance_to_targets(target_mask)
+        max_expansions = int(self.config.heuristic_max_astar_expansions)
+        if max_expansions <= 0:
+            max_expansions = int(self.rows * self.cols)
+
+        inf = int(self.rows * self.cols + 1)
+        g_score = np.full((self.rows, self.cols), inf, dtype=np.int32)
+        g_score[sr, sc] = 0
+        closed = np.zeros((self.rows, self.cols), dtype=bool)
+        parent: Dict[GridPos, GridPos] = {}
+        heap: List[Tuple[int, int, int, int]] = []
+        push_count = 0
+        heapq.heappush(heap, (int(heuristic[sr, sc]), 0, sr, sc))
+
+        found: Optional[GridPos] = None
+        expansions = 0
+        while heap and expansions < max_expansions:
+            _, cur_g, r, c = heapq.heappop(heap)
+            if closed[r, c]:
+                continue
+            if cur_g != int(g_score[r, c]):
+                continue
+            closed[r, c] = True
+            expansions += 1
+            if bool(target_mask[r, c]):
+                found = (int(r), int(c))
+                break
+
+            for _, (dr, dc) in ACTION_TO_DELTA.items():
+                nr, nc = r + dr, c + dc
+                if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                    continue
+                if closed[nr, nc] or (not bool(passable[nr, nc])):
+                    continue
+                next_g = cur_g + 1
+                if next_g >= int(g_score[nr, nc]):
+                    continue
+                g_score[nr, nc] = int(next_g)
+                parent[(int(nr), int(nc))] = (int(r), int(c))
+                push_count += 1
+                heapq.heappush(
+                    heap,
+                    (int(next_g + int(heuristic[nr, nc])), push_count, int(nr), int(nc)),
+                )
+
+        stats["astar_expansions"] = float(expansions)
+        if found is None:
+            return None, stats
+
+        path: List[GridPos] = [found]
+        cur = found
+        while cur != start:
+            cur = parent.get(cur, start)
+            path.append(cur)
+            if cur == start:
+                break
+        path.reverse()
+        if len(path) <= 1:
+            return None, stats
+
+        nr, nc = path[1]
+        dr, dc = int(nr - sr), int(nc - sc)
+        action = None
+        for a, delta in ACTION_TO_DELTA.items():
+            if delta == (dr, dc):
+                action = int(a)
+                break
+        if action is None:
+            return None, stats
+
+        stats["path_found"] = 1.0
+        stats["path_length"] = float(len(path) - 1)
+        stats["target_row"] = float(found[0])
+        stats["target_col"] = float(found[1])
+        return int(action), stats
+
     def reset(self, *, start_pos: Optional[GridPos] = None) -> Dict[str, object]:
         self.current_pos = self._resolve_start(start_pos) if start_pos is not None else self._default_start
         self.prev_pos = None
@@ -590,6 +738,7 @@ class CPPDiscreteEnv:
         self.recent_actions.clear()
         self._milestone_hit_90 = False
         self._milestone_hit_99 = False
+        self._heuristic_no_progress_streak = 0
 
         self.known_map.fill(-1)
         self.explored.fill(False)
@@ -627,6 +776,27 @@ class CPPDiscreteEnv:
             if fallback is not None:
                 executed_action = int(fallback)
                 action_overridden = True
+
+        heuristic_streak_before = int(self._heuristic_no_progress_streak)
+        heuristic_active = self._heuristic_should_activate()
+        heuristic_selected = False
+        heuristic_overridden = False
+        heuristic_stats: Dict[str, float] = {
+            "path_found": 0.0,
+            "target_count": 0.0,
+            "path_length": 0.0,
+            "astar_expansions": 0.0,
+            "target_row": -1.0,
+            "target_col": -1.0,
+        }
+        if heuristic_active:
+            heuristic_action, heuristic_stats = self._nearest_known_uncovered_astar_action()
+            if heuristic_action is not None and not self._action_leads_to_known_uncovered_free(executed_action):
+                previous_executed_action = int(executed_action)
+                executed_action = int(heuristic_action)
+                heuristic_selected = True
+                heuristic_overridden = int(executed_action) != previous_executed_action
+                action_overridden = bool(action_overridden or heuristic_overridden)
 
         cr, cc = self.current_pos
         prev_action = self.prev_action
@@ -715,6 +885,10 @@ class CPPDiscreteEnv:
             total=total_reward,
         )
         self.recent_new_coverage.append(float(newly_visited))
+        if (not collided) and float(newly_visited) > 0.0:
+            self._heuristic_no_progress_streak = 0
+        else:
+            self._heuristic_no_progress_streak += 1
 
         self.steps += 1
         self.path.append(self.current_pos)
@@ -747,6 +921,18 @@ class CPPDiscreteEnv:
             "action_requested": int(requested_action),
             "action_executed": int(executed_action),
             "action_overridden": bool(action_overridden),
+            "heuristic_assist_enabled": bool(self.config.heuristic_assist_enabled),
+            "heuristic_active": bool(heuristic_active),
+            "heuristic_selected": bool(heuristic_selected),
+            "heuristic_overridden": bool(heuristic_overridden),
+            "heuristic_path_found": bool(float(heuristic_stats.get("path_found", 0.0)) > 0.5),
+            "heuristic_no_progress_streak_before": int(heuristic_streak_before),
+            "heuristic_no_progress_streak": int(self._heuristic_no_progress_streak),
+            "heuristic_known_uncovered_count": int(heuristic_stats.get("target_count", 0.0)),
+            "heuristic_path_length": float(heuristic_stats.get("path_length", 0.0)),
+            "heuristic_astar_expansions": int(heuristic_stats.get("astar_expansions", 0.0)),
+            "heuristic_target_row": int(heuristic_stats.get("target_row", -1.0)),
+            "heuristic_target_col": int(heuristic_stats.get("target_col", -1.0)),
             "forced_turn": bool(forced_turn),
             "action_mask_valid_count": int(np.count_nonzero(action_mask)),
             "action_mask": [int(v) for v in action_mask.astype(np.int8)],
