@@ -44,6 +44,18 @@ class FusedMAPSStateEncoderConfig:
     fusion_hidden_dims: Tuple[int, ...] = (256, 256)
 
 
+@dataclass(frozen=True)
+class HybridLocalGlobalEncoderConfig:
+    local_in_channels: int = 5
+    global_in_channels: Union[int, Tuple[int, ...]] = 3
+    global_sizes: Tuple[int, ...] = (64, 32, 16)
+    conv_channels: Tuple[int, ...] = (16, 32)
+    local_embed_dim: int = 64
+    global_embed_dim: int = 64
+    robot_state: RobotStateEncoderConfig = field(default_factory=RobotStateEncoderConfig)
+    fusion_hidden_dims: Tuple[int, ...] = (256, 256)
+
+
 class _LevelCNNBranch(nn.Module):
     def __init__(self, in_channels: int, conv_channels: Sequence[int], out_dim: int):
         super().__init__()
@@ -317,4 +329,82 @@ class FusedMAPSStateEncoder(nn.Module):
         maps_feat = self.maps_encoder(levels)
         state_feat = self.state_encoder(robot_state)
         fused = torch.cat([maps_feat, state_feat], dim=1)
+        return self.fusion(fused)
+
+
+class HybridLocalGlobalEncoder(nn.Module):
+    """
+    Encoder for hybrid CPP observation:
+    - high-resolution local crop CNN
+    - full-map coarse global CNN
+    - robot-state MLP
+    - fusion MLP
+    """
+
+    def __init__(self, config: Optional[HybridLocalGlobalEncoderConfig] = None):
+        super().__init__()
+        self.config = config or HybridLocalGlobalEncoderConfig()
+        if int(self.config.local_in_channels) <= 0:
+            raise ValueError("local_in_channels must be positive")
+        self.global_sizes = tuple(int(s) for s in self.config.global_sizes)
+        if len(self.global_sizes) == 0:
+            raise ValueError("global_sizes must not be empty")
+        if any(s <= 0 for s in self.global_sizes):
+            raise ValueError("global_sizes values must be positive")
+        self.global_in_channels = _normalize_level_channels(
+            self.config.global_in_channels,
+            len(self.global_sizes),
+        )
+        self.local_encoder = _LevelCNNBranch(
+            in_channels=int(self.config.local_in_channels),
+            conv_channels=self.config.conv_channels,
+            out_dim=int(self.config.local_embed_dim),
+        )
+        self.global_encoders = nn.ModuleDict(
+            {
+                str(size): _LevelCNNBranch(
+                    in_channels=int(channels),
+                    conv_channels=self.config.conv_channels,
+                    out_dim=int(self.config.global_embed_dim),
+                )
+                for size, channels in zip(self.global_sizes, self.global_in_channels)
+            }
+        )
+        self.state_encoder = RobotStateEncoder(self.config.robot_state)
+        if len(self.config.fusion_hidden_dims) == 0:
+            raise ValueError("fusion_hidden_dims must not be empty")
+        fusion_in = (
+            int(self.config.local_embed_dim)
+            + len(self.global_sizes) * int(self.config.global_embed_dim)
+            + int(self.state_encoder.output_dim)
+        )
+        fusion_dims = (fusion_in, *self.config.fusion_hidden_dims)
+        self.fusion = _make_mlp(fusion_dims, last_activation=True)
+        self.output_dim = self.config.fusion_hidden_dims[-1]
+
+    def forward(
+        self,
+        local_map: torch.Tensor,
+        global_maps: Mapping[int, torch.Tensor],
+        robot_state: torch.Tensor,
+    ) -> torch.Tensor:
+        if local_map.ndim != 4:
+            raise ValueError(f"local_map must be 4D [B,C,H,W], got shape={tuple(local_map.shape)}")
+        local_feat = self.local_encoder(local_map)
+        global_feats = []
+        for size, expected_c in zip(self.global_sizes, self.global_in_channels):
+            if size not in global_maps:
+                raise KeyError(f"Missing global map size {size}")
+            global_map = global_maps[size]
+            if global_map.ndim != 4:
+                raise ValueError(
+                    f"global_map_{size} must be 4D [B,C,H,W], got shape={tuple(global_map.shape)}"
+                )
+            if int(global_map.shape[1]) != int(expected_c):
+                raise ValueError(
+                    f"global_map_{size} expected C={int(expected_c)}, got C={int(global_map.shape[1])}"
+                )
+            global_feats.append(self.global_encoders[str(size)](global_map))
+        state_feat = self.state_encoder(robot_state)
+        fused = torch.cat([local_feat, *global_feats, state_feat], dim=1)
         return self.fusion(fused)

@@ -1,6 +1,8 @@
 from .encoders import (
     FusedMAPSStateEncoder,
     FusedMAPSStateEncoderConfig,
+    HybridLocalGlobalEncoder,
+    HybridLocalGlobalEncoderConfig,
     MultiLevelMAPSEncoder,
     MultiLevelMAPSEncoderConfig,
     RobotStateEncoder,
@@ -10,6 +12,8 @@ from .encoders import (
 __all__ = [
     "FusedMAPSStateEncoder",
     "FusedMAPSStateEncoderConfig",
+    "HybridLocalGlobalEncoder",
+    "HybridLocalGlobalEncoderConfig",
     "MultiLevelMAPSEncoder",
     "MultiLevelMAPSEncoderConfig",
     "RobotStateEncoder",

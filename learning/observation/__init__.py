@@ -16,6 +16,8 @@ from .robot_state_observation import (
     RobotStateObservationConfig,
 )
 from .cpp import (
+    HybridLocalGlobalCPPObservationBuilder,
+    HybridLocalGlobalCPPObservationConfig,
     MultiScaleCPPObservationBuilder,
     MultiScaleCPPObservationConfig,
     compute_directional_traversability,
@@ -26,6 +28,8 @@ __all__ = [
     "MAPSObservationConfig",
     "RobotStateObservationBuilder",
     "RobotStateObservationConfig",
+    "HybridLocalGlobalCPPObservationBuilder",
+    "HybridLocalGlobalCPPObservationConfig",
     "MultiScaleCPPObservationBuilder",
     "MultiScaleCPPObservationConfig",
     "compute_directional_traversability",

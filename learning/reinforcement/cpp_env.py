@@ -8,6 +8,8 @@ from typing import Deque, Dict, List, Optional, Tuple
 import numpy as np
 
 from learning.observation import (
+    HybridLocalGlobalCPPObservationBuilder,
+    HybridLocalGlobalCPPObservationConfig,
     MultiScaleCPPObservationBuilder,
     MultiScaleCPPObservationConfig,
     RobotStateObservationBuilder,
@@ -71,8 +73,12 @@ class CPPDiscreteEnvConfig:
     heuristic_min_coverage: float = 0.0
     heuristic_max_astar_expansions: int = 0
 
+    maps_observation_mode: str = "multiscale"
     observation: MultiScaleCPPObservationConfig = field(
         default_factory=MultiScaleCPPObservationConfig,
+    )
+    hybrid_observation: HybridLocalGlobalCPPObservationConfig = field(
+        default_factory=HybridLocalGlobalCPPObservationConfig,
     )
     robot_state: RobotStateObservationConfig = field(
         default_factory=RobotStateObservationConfig,
@@ -105,6 +111,9 @@ class CPPDiscreteEnv:
             raise ValueError("grid_map must be 2D")
         if not np.isin(grid, [0, 1]).all():
             raise ValueError("grid_map must contain only 0(free) and 1(obstacle)")
+        mode = str(cfg.maps_observation_mode).strip().lower()
+        if mode not in {"multiscale", "hybrid_local_global"}:
+            raise ValueError("maps_observation_mode must be one of {'multiscale', 'hybrid_local_global'}")
 
         self.true_map = grid
         self.rows, self.cols = grid.shape
@@ -117,6 +126,15 @@ class CPPDiscreteEnv:
             self.config.observation,
             include_dtm=self.config.include_dtm,
             profile_enabled=bool(self.config.profile_observation),
+        )
+        self.hybrid_maps_builder = (
+            HybridLocalGlobalCPPObservationBuilder(
+                self.config.hybrid_observation,
+                include_dtm=self.config.include_dtm,
+                profile_enabled=bool(self.config.profile_observation),
+            )
+            if mode == "hybrid_local_global"
+            else None
         )
         self._boundary_maps_builder: Optional[MultiScaleCPPObservationBuilder] = None
         if bool(self.config.use_boundary_exit_features) and (not bool(self.config.include_dtm)):
@@ -300,18 +318,43 @@ class CPPDiscreteEnv:
     def _build_observation(self) -> Dict[str, object]:
         t_total = perf_counter() if self._profile_observation else 0.0
         t0 = perf_counter() if self._profile_observation else 0.0
-        levels = self.maps_builder.build_levels(
-            self.known_map,
-            robot_pos=self.current_pos,
-            explored=self.explored,
-        )
+        use_hybrid_maps = str(self.config.maps_observation_mode).strip().lower() == "hybrid_local_global"
+        levels: Optional[Dict[int, np.ndarray]] = None
+        hybrid_maps: Optional[Dict[str, np.ndarray]] = None
+        if use_hybrid_maps:
+            if self.hybrid_maps_builder is None:
+                raise RuntimeError("hybrid_maps_builder is not initialized")
+            hybrid_maps = self.hybrid_maps_builder.build(
+                self.known_map,
+                robot_pos=self.current_pos,
+                explored=self.explored,
+            )
+        else:
+            levels = self.maps_builder.build_levels(
+                self.known_map,
+                robot_pos=self.current_pos,
+                explored=self.explored,
+            )
         if self._profile_observation:
-            self._profile_add("env_build_levels", perf_counter() - t0)
-            self._merge_builder_profile(self.maps_builder.profile_snapshot(reset=True), prefix="maps")
+            self._profile_add(
+                "env_build_hybrid_maps" if use_hybrid_maps else "env_build_levels",
+                perf_counter() - t0,
+            )
+            if use_hybrid_maps:
+                self._merge_builder_profile(
+                    self.hybrid_maps_builder.profile_snapshot(reset=True),  # type: ignore[union-attr]
+                    prefix="hybrid_maps",
+                )
+            else:
+                self._merge_builder_profile(self.maps_builder.profile_snapshot(reset=True), prefix="maps")
         boundary_exit_features: Optional[np.ndarray] = None
         if self.config.use_boundary_exit_features:
+            if use_hybrid_maps:
+                raise RuntimeError("boundary_exit_features are not supported with hybrid_local_global maps")
             t0 = perf_counter() if self._profile_observation else 0.0
             if self.config.include_dtm:
+                if levels is None:
+                    raise RuntimeError("levels are required for boundary exit features")
                 boundary_levels = levels
                 boundary_maps_builder = self.maps_builder
             else:
@@ -364,10 +407,16 @@ class CPPDiscreteEnv:
             self._profile_add("observation_total", perf_counter() - t_total)
             self._obs_profile_calls += 1
             self._maybe_report_observation_profile()
-        return {
-            "levels": levels,
-            "robot_state": robot_state.astype(np.float32),
-        }
+        obs: Dict[str, object] = {"robot_state": robot_state.astype(np.float32)}
+        if use_hybrid_maps:
+            if hybrid_maps is None:
+                raise RuntimeError("hybrid_maps were not built")
+            obs["hybrid_maps"] = hybrid_maps
+        else:
+            if levels is None:
+                raise RuntimeError("levels were not built")
+            obs["levels"] = levels
+        return obs
 
     def _profile_add(self, key: str, dt: float):
         if not self._profile_observation:
@@ -810,6 +859,10 @@ class CPPDiscreteEnv:
         self.explored.fill(False)
         preserve_static_map_cache = bool(self.config.preserve_static_map_observation_cache_on_reset)
         self.maps_builder.reset_incremental_state(preserve_static_map=preserve_static_map_cache)
+        if self.hybrid_maps_builder is not None:
+            self.hybrid_maps_builder.reset_incremental_state(
+                preserve_static_map=preserve_static_map_cache,
+            )
         if self._boundary_maps_builder is not None:
             self._boundary_maps_builder.reset_incremental_state(
                 preserve_static_map=preserve_static_map_cache,
@@ -984,6 +1037,7 @@ class CPPDiscreteEnv:
         self.done = done
         obs = self._build_observation()
 
+        heuristic_target_kind = str(heuristic_stats.get("target_kind", "none"))
         info = {
             **self.last_reward.as_dict(),
             "collision": bool(collided),
@@ -1002,7 +1056,12 @@ class CPPDiscreteEnv:
             "heuristic_astar_expansions": int(heuristic_stats.get("astar_expansions", 0.0)),
             "heuristic_target_row": int(heuristic_stats.get("target_row", -1.0)),
             "heuristic_target_col": int(heuristic_stats.get("target_col", -1.0)),
-            "heuristic_target_kind": str(heuristic_stats.get("target_kind", "none")),
+            "heuristic_target_kind": heuristic_target_kind,
+            "heuristic_target_known_uncovered": bool(
+                heuristic_selected and heuristic_target_kind == "known_uncovered"
+            ),
+            "heuristic_target_frontier": bool(heuristic_selected and heuristic_target_kind == "frontier"),
+            "heuristic_target_cached": bool(heuristic_selected and heuristic_target_kind == "cached"),
             "forced_turn": bool(forced_turn),
             "action_mask_valid_count": int(np.count_nonzero(action_mask)),
             "action_mask": [int(v) for v in action_mask.astype(np.int8)],

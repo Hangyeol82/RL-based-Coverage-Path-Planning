@@ -99,19 +99,32 @@ class OfflinePaperCPPDiscreteGymEnv(PaperCPPDiscreteGymEnv):
         self._start_pos = start_pos
 
         sample = self.core_env.reset(start_pos=start_pos)
-        self._level_ids = tuple(sorted(sample["levels"].keys()))
+        self._use_hybrid_maps = "hybrid_maps" in sample
+        self._level_ids = tuple(sorted(sample["levels"].keys())) if not self._use_hybrid_maps else ()
 
         from gymnasium import spaces
 
         obs_spaces: Dict[str, spaces.Space] = {}
-        for lv in self._level_ids:
-            x = np.asarray(sample["levels"][lv], dtype=np.float32)
-            obs_spaces[f"level_{lv}"] = spaces.Box(
-                low=-1.0,
-                high=1.0,
-                shape=x.shape,
-                dtype=np.float32,
-            )
+        if self._use_hybrid_maps:
+            hybrid_maps = sample["hybrid_maps"]
+            for key in hybrid_maps.keys():
+                obs_key = self._hybrid_obs_key(str(key))
+                x = np.asarray(hybrid_maps[key], dtype=np.float32)
+                obs_spaces[obs_key] = spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=x.shape,
+                    dtype=np.float32,
+                )
+        else:
+            for lv in self._level_ids:
+                x = np.asarray(sample["levels"][lv], dtype=np.float32)
+                obs_spaces[f"level_{lv}"] = spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=x.shape,
+                    dtype=np.float32,
+                )
         rs = np.asarray(sample["robot_state"], dtype=np.float32)
         obs_spaces["robot_state"] = spaces.Box(
             low=0.0,

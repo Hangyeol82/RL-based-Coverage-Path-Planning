@@ -15,10 +15,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from learning.common import (
     FusedMAPSStateEncoderConfig,
+    HybridLocalGlobalEncoderConfig,
     MultiLevelMAPSEncoderConfig,
     RobotStateEncoderConfig,
 )
-from learning.observation import MultiScaleCPPObservationConfig
+from learning.observation import (
+    HybridLocalGlobalCPPObservationConfig,
+    MultiScaleCPPObservationConfig,
+)
 from paper_training.robot_state_observation import (
     RobotStateObservationBuilder,
     RobotStateObservationConfig,
@@ -28,7 +32,10 @@ import learning.reinforcement.cpp_env as cpp_env_module
 cpp_env_module.RobotStateObservationBuilder = RobotStateObservationBuilder
 from learning.reinforcement.cpp_env import CPPDiscreteEnvConfig
 from learning.reinforcement.reward import CPPRewardConfig
-from learning.reinforcement.sb3_policy import MAPSStateFeaturesExtractor
+from learning.reinforcement.sb3_policy import (
+    HybridLocalGlobalFeaturesExtractor,
+    MAPSStateFeaturesExtractor,
+)
 from paper_training.callbacks import PaperMetricsCallback
 from paper_training.cpp_env import PaperCPPDiscreteEnv, PaperCPPDiscreteGymEnv
 from paper_training.offline_cpp_env import OfflinePaperCPPDiscreteEnv, OfflinePaperCPPDiscreteGymEnv
@@ -37,6 +44,14 @@ from run_cstar_custom_map import CUSTOM_MAP_TEXT, parse_custom_map
 
 
 GridPos = Tuple[int, int]
+
+
+def _argv_has_flag(*flags: str) -> bool:
+    return any(
+        arg == flag or arg.startswith(flag + "=")
+        for arg in sys.argv[1:]
+        for flag in flags
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -269,7 +284,15 @@ def _parse_args() -> argparse.Namespace:
         choices=[4, 8],
         help="Connectivity used inside DTM connectivity checks. 4 matches the environment action space.",
     )
-    p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
+    p.add_argument(
+        "--maps-encoder-mode",
+        type=str,
+        default="sgcnn",
+        choices=["sgcnn", "independent", "hybrid_local_global"],
+    )
+    p.add_argument("--local-crop-size", type=int, default=41)
+    p.add_argument("--global-coarse-size", type=int, default=16, help="Deprecated; use --global-coarse-sizes.")
+    p.add_argument("--global-coarse-sizes", type=str, default="64,32,16")
     p.add_argument(
         "--model-size",
         type=str,
@@ -395,6 +418,11 @@ def _parse_args() -> argparse.Namespace:
     args = p.parse_args()
     args.robot_state_progress = False
     args.robot_state_stagnation = False
+    if (
+        str(args.maps_encoder_mode).strip().lower() == "hybrid_local_global"
+        and not _argv_has_flag("--cell-phase-channels", "--no-cell-phase-channels")
+    ):
+        args.cell_phase_channels = False
     return args
 
 
@@ -423,6 +451,20 @@ def _parse_local_blocks(raw: str) -> Optional[Tuple[int, ...]]:
         raise ValueError("--local-blocks must be in increasing order")
     if len(set(vals)) != len(vals):
         raise ValueError("--local-blocks must not contain duplicates")
+    return tuple(vals)
+
+
+def _parse_global_coarse_sizes(raw: str) -> Tuple[int, ...]:
+    vals = []
+    for tok in str(raw).split(","):
+        t = tok.strip()
+        if not t:
+            continue
+        vals.append(int(t))
+    if not vals:
+        raise ValueError("--global-coarse-sizes must contain at least one size")
+    if any(v <= 0 for v in vals):
+        raise ValueError("--global-coarse-sizes values must be positive")
     return tuple(vals)
 
 
@@ -702,6 +744,7 @@ def main():
     episode_map_refresh = bool(args.episode_map_refresh) and len(grid_pool) > 1
     start = _pick_start(grid)
     local_blocks = _parse_local_blocks(args.local_blocks)
+    global_coarse_sizes = _parse_global_coarse_sizes(args.global_coarse_sizes)
 
     reward_cfg = CPPRewardConfig(
         new_cell_reward=0.7,
@@ -730,6 +773,11 @@ def main():
         collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
+        maps_observation_mode=(
+            "hybrid_local_global"
+            if str(args.maps_encoder_mode).strip().lower() == "hybrid_local_global"
+            else "multiscale"
+        ),
         use_boundary_exit_features=bool(args.boundary_exit_features),
         boundary_exit_threshold=float(args.boundary_exit_threshold),
         observation=MultiScaleCPPObservationConfig(
@@ -739,6 +787,20 @@ def main():
             dtm_output_mode=str(args.dtm_output_mode),
             dtm_connectivity=int(args.dtm_connectivity),
             include_cell_phase_channels=False,
+        ),
+        hybrid_observation=HybridLocalGlobalCPPObservationConfig(
+            local_crop_size=int(args.local_crop_size),
+            global_coarse_size=int(args.global_coarse_size),
+            global_coarse_sizes=global_coarse_sizes,
+            unknown_policy=str(args.obs_unknown_policy),
+            dtm_patch_size=7,
+            dtm_connectivity=int(args.dtm_connectivity),
+            dtm_require_fully_known_patch=False,
+            dtm_min_known_ratio=0.6,
+            dtm_patch_min_known_ratio=0.6,
+            dtm_uncertain_fill=-1.0,
+            dtm_unknown_fill=-1.0,
+            dtm_output_mode=str(args.dtm_output_mode),
         ),
         robot_state=RobotStateObservationConfig(
             action_history_len=int(args.robot_state_action_history_len),
@@ -781,24 +843,54 @@ def main():
     )
     probe_obs = probe.reset()
     robot_state_dim = int(np.asarray(probe_obs["robot_state"], dtype=np.float32).shape[0])
-    level_ids = tuple(sorted(probe_obs["levels"].keys()))
-    level_channels = tuple(
-        int(np.asarray(probe_obs["levels"][lv], dtype=np.float32).shape[0])
-        for lv in level_ids
-    )
     model_cfg = _model_preset(str(args.model_size))
-    maps_cfg = MultiLevelMAPSEncoderConfig(
-        num_levels=probe.maps_builder.num_levels,
-        in_channels_per_level=level_channels,
-        conv_channels=model_cfg["conv_channels"],
-        level_embed_dim=int(model_cfg["level_embed_dim"]),
-        mode=args.maps_encoder_mode,
-    )
-    encoder_cfg = FusedMAPSStateEncoderConfig(
-        maps=maps_cfg,
-        robot_state=RobotStateEncoderConfig(input_dim=robot_state_dim, hidden_dims=model_cfg["state_hidden_dims"]),
-        fusion_hidden_dims=model_cfg["fusion_hidden_dims"],
-    )
+    use_hybrid_maps = "hybrid_maps" in probe_obs
+    level_channels: Tuple[int, ...] = ()
+    local_channels = 0
+    global_channels: Tuple[int, ...] = ()
+    if use_hybrid_maps:
+        hybrid_obs = probe_obs["hybrid_maps"]
+        local_channels = int(np.asarray(hybrid_obs["local"], dtype=np.float32).shape[0])
+        global_channels = tuple(
+            int(np.asarray(hybrid_obs[f"global_{size}"], dtype=np.float32).shape[0])
+            for size in global_coarse_sizes
+        )
+        encoder_cfg = HybridLocalGlobalEncoderConfig(
+            local_in_channels=local_channels,
+            global_in_channels=global_channels,
+            global_sizes=global_coarse_sizes,
+            conv_channels=model_cfg["conv_channels"],
+            local_embed_dim=int(model_cfg["level_embed_dim"]),
+            global_embed_dim=int(model_cfg["level_embed_dim"]),
+            robot_state=RobotStateEncoderConfig(
+                input_dim=robot_state_dim,
+                hidden_dims=model_cfg["state_hidden_dims"],
+            ),
+            fusion_hidden_dims=model_cfg["fusion_hidden_dims"],
+        )
+        features_extractor_class = HybridLocalGlobalFeaturesExtractor
+    else:
+        level_ids = tuple(sorted(probe_obs["levels"].keys()))
+        level_channels = tuple(
+            int(np.asarray(probe_obs["levels"][lv], dtype=np.float32).shape[0])
+            for lv in level_ids
+        )
+        maps_cfg = MultiLevelMAPSEncoderConfig(
+            num_levels=probe.maps_builder.num_levels,
+            in_channels_per_level=level_channels,
+            conv_channels=model_cfg["conv_channels"],
+            level_embed_dim=int(model_cfg["level_embed_dim"]),
+            mode=args.maps_encoder_mode,
+        )
+        encoder_cfg = FusedMAPSStateEncoderConfig(
+            maps=maps_cfg,
+            robot_state=RobotStateEncoderConfig(
+                input_dim=robot_state_dim,
+                hidden_dims=model_cfg["state_hidden_dims"],
+            ),
+            fusion_hidden_dims=model_cfg["fusion_hidden_dims"],
+        )
+        features_extractor_class = MAPSStateFeaturesExtractor
 
     if args.vec_env == "auto":
         vec_env_mode = "dummy" if args.num_envs == 1 else "subproc"
@@ -881,7 +973,7 @@ def main():
             print(f"[WARN] Could not patch MaskablePPO mask support check: {patch_err}", flush=True)
 
     policy_kwargs = dict(
-        features_extractor_class=MAPSStateFeaturesExtractor,
+        features_extractor_class=features_extractor_class,
         features_extractor_kwargs=dict(encoder_config=encoder_cfg),
         net_arch=dict(pi=[128, 128], vf=[128, 128]),
     )
@@ -933,7 +1025,18 @@ def main():
 
     print(f"Device: {device}")
     print(f"Map: source={args.map_source}, shape={grid.shape}, include_dtm={args.include_dtm}")
-    print(f"Map observation channels by level: {level_channels}")
+    if use_hybrid_maps:
+        global_desc = ", ".join(
+            f"{size}x{size}:C{channels}"
+            for size, channels in zip(global_coarse_sizes, global_channels)
+        )
+        print(
+            "Hybrid observation:"
+            f" local_channels={local_channels}, local_crop={int(args.local_crop_size)}x{int(args.local_crop_size)},"
+            f" global_scales=[{global_desc}]"
+        )
+    else:
+        print(f"Map observation channels by level: {level_channels}")
     print(
         "Observation setting:"
         f" {'offline_full_map' if bool(args.full_map_observation) else 'online_partial'},"

@@ -149,6 +149,29 @@ class MultiScaleCPPObservationConfig:
     exclude_dtm_level0: bool = True
 
 
+@dataclass(frozen=True)
+class HybridLocalGlobalCPPObservationConfig:
+    # Robot-centered high-resolution crop. Must be odd so the robot stays at
+    # the center pixel.
+    local_crop_size: int = 41
+    # Deprecated single-scale option kept for old callers. New hybrid
+    # experiments use global_coarse_sizes.
+    global_coarse_size: int = 16
+    # Full-map multi-scale summary resolutions.
+    global_coarse_sizes: Tuple[int, ...] = (64, 32, 16)
+    unknown_value: int = -1
+    obstacle_value: int = 1
+    unknown_policy: str = "keep"
+    dtm_patch_size: int = 7
+    dtm_connectivity: int = 4
+    dtm_require_fully_known_patch: bool = False
+    dtm_min_known_ratio: float = 0.6
+    dtm_patch_min_known_ratio: float = 0.6
+    dtm_uncertain_fill: float = -1.0
+    dtm_unknown_fill: float = -1.0
+    dtm_output_mode: str = "six"
+
+
 class MultiScaleCPPObservationBuilder:
     """
     Build multi-scale observations for CPP ablation experiments.
@@ -2233,3 +2256,443 @@ class MultiScaleCPPObservationBuilder:
             self._profile_add("build_levels_total", perf_counter() - t_total)
             self._profile_calls += 1
         return levels
+
+
+class HybridLocalGlobalCPPObservationBuilder:
+    """
+    Hybrid observation for performance-oriented CPP experiments.
+
+    Output
+    ------
+    {
+        "local":  [5, local_crop_size, local_crop_size],
+        "global_64": [3 + dtm_channels, 64, 64],
+        "global_32": [3 + dtm_channels, 32, 32],
+        "global_16": [3 + dtm_channels, 16, 16],
+    }
+
+    Local channels keep high-resolution online geometry around the robot:
+    known_free, obstacle, unknown, explored, frontier.
+
+    Global channels follow the paper multiscale baseline convention:
+    coverage, obstacle, frontier. Optional DTM channels are appended only to
+    each global tensor.
+    """
+
+    _LOCAL_CHANNELS = (
+        "known_free",
+        "obstacle",
+        "unknown",
+        "explored",
+        "frontier",
+    )
+    _GLOBAL_BASE_CHANNELS = (
+        "coverage",
+        "obstacle_ratio",
+        "frontier",
+    )
+    _DTM_CHANNELS_6 = MultiScaleCPPObservationBuilder._DTM_CHANNELS_6
+    _DTM_CHANNELS_2 = MultiScaleCPPObservationBuilder._DTM_CHANNELS_2
+
+    def __init__(
+        self,
+        config: Optional[HybridLocalGlobalCPPObservationConfig] = None,
+        *,
+        include_dtm: bool = False,
+        profile_enabled: bool = False,
+    ):
+        self.config = config or HybridLocalGlobalCPPObservationConfig()
+        self.include_dtm = bool(include_dtm)
+        self._profile_enabled = bool(profile_enabled)
+        self._profile_totals: Dict[str, float] = {}
+        self._profile_calls = 0
+        if int(self.config.local_crop_size) <= 0 or int(self.config.local_crop_size) % 2 == 0:
+            raise ValueError("local_crop_size must be a positive odd integer")
+        self.global_sizes = tuple(int(s) for s in self.config.global_coarse_sizes)
+        if len(self.global_sizes) == 0:
+            raise ValueError("global_coarse_sizes must not be empty")
+        if any(s <= 0 for s in self.global_sizes):
+            raise ValueError("global_coarse_sizes values must be positive")
+        if self.config.unknown_policy not in {"keep", "as_free", "as_obstacle"}:
+            raise ValueError("unknown_policy must be one of {'keep', 'as_free', 'as_obstacle'}")
+        mode = self._normalize_dtm_output_mode(self.config.dtm_output_mode)
+        if mode not in {"six", "axis2"}:
+            raise ValueError("hybrid DTM supports dtm_output_mode in {'six', 'two', 'axis2'}")
+        self._global_dtm_cache: Dict[int, np.ndarray] = {}
+        self._dtm_builder = MultiScaleCPPObservationBuilder(
+            MultiScaleCPPObservationConfig(
+                local_blocks=(1,),
+                local_window_size=1,
+                global_window_size=max(self.global_sizes),
+                unknown_value=int(self.config.unknown_value),
+                obstacle_value=int(self.config.obstacle_value),
+                unknown_policy=str(self.config.unknown_policy),
+                dtm_patch_size=int(self.config.dtm_patch_size),
+                dtm_connectivity=int(self.config.dtm_connectivity),
+                dtm_require_fully_known_patch=bool(self.config.dtm_require_fully_known_patch),
+                dtm_min_known_ratio=float(self.config.dtm_min_known_ratio),
+                dtm_patch_min_known_ratio=float(self.config.dtm_patch_min_known_ratio),
+                dtm_uncertain_fill=float(self.config.dtm_uncertain_fill),
+                dtm_unknown_fill=float(self.config.dtm_unknown_fill),
+                dtm_coarse_mode="bfs",
+                dtm_output_mode=str(self.config.dtm_output_mode),
+                include_cell_phase_channels=False,
+                exclude_dtm_level0=False,
+            ),
+            include_dtm=bool(include_dtm),
+            profile_enabled=bool(profile_enabled),
+        )
+
+    @staticmethod
+    def _normalize_dtm_output_mode(mode: str) -> str:
+        mode_s = str(mode).strip().lower()
+        return "axis2" if mode_s == "two" else mode_s
+
+    @property
+    def local_channel_names(self) -> Tuple[str, ...]:
+        return self._LOCAL_CHANNELS
+
+    @property
+    def global_channel_names(self) -> Tuple[str, ...]:
+        names = self._GLOBAL_BASE_CHANNELS
+        if self.include_dtm:
+            mode = self._normalize_dtm_output_mode(self.config.dtm_output_mode)
+            if mode == "axis2":
+                names = names + self._DTM_CHANNELS_2
+            else:
+                names = names + self._DTM_CHANNELS_6
+        return names
+
+    def enable_profiling(self, enabled: bool = True):
+        self._profile_enabled = bool(enabled)
+        self._dtm_builder.enable_profiling(enabled)
+        if not enabled:
+            self.reset_profile()
+
+    def reset_profile(self):
+        self._profile_totals = {}
+        self._profile_calls = 0
+        self._dtm_builder.reset_profile()
+
+    def reset_incremental_state(self, *, preserve_static_map: bool = False):
+        self._global_dtm_cache = {}
+        self._dtm_builder.reset_incremental_state(preserve_static_map=preserve_static_map)
+
+    def profile_snapshot(self, *, reset: bool = False) -> Dict[str, float]:
+        snap: Dict[str, float] = {"calls": float(self._profile_calls)}
+        snap.update(self._profile_totals)
+        dtm_snap = self._dtm_builder.profile_snapshot(reset=reset)
+        for key, value in dtm_snap.items():
+            snap[f"dtm_{key}"] = float(value)
+        if reset:
+            self.reset_profile()
+        return snap
+
+    def _profile_add(self, key: str, dt: float):
+        if not self._profile_enabled:
+            return
+        self._profile_totals[key] = float(self._profile_totals.get(key, 0.0)) + float(dt)
+
+    def _pad_value_for(self, channel: str) -> float:
+        policy = str(self.config.unknown_policy)
+        if channel == "known_free":
+            return 1.0 if policy == "as_free" else 0.0
+        if channel == "obstacle":
+            return 1.0 if policy == "as_obstacle" else 0.0
+        if channel == "unknown":
+            return 0.0 if policy in {"as_free", "as_obstacle"} else 1.0
+        return 0.0
+
+    def _apply_unknown_policy(self, occupancy: np.ndarray) -> np.ndarray:
+        if self.config.unknown_policy == "keep":
+            return occupancy
+        out = occupancy.copy()
+        unknown_mask = out == int(self.config.unknown_value)
+        if self.config.unknown_policy == "as_free":
+            out[unknown_mask] = 0
+        else:
+            out[unknown_mask] = int(self.config.obstacle_value)
+        return out
+
+    def _build_local(
+        self,
+        *,
+        known_free: np.ndarray,
+        known_obstacle: np.ndarray,
+        unknown: np.ndarray,
+        explored: np.ndarray,
+        frontier: np.ndarray,
+        robot_pos: GridPos,
+    ) -> np.ndarray:
+        size = int(self.config.local_crop_size)
+        explored_known = np.asarray(explored, dtype=bool) & np.asarray(known_free, dtype=bool)
+        source = {
+            "known_free": np.asarray(known_free, dtype=np.float32),
+            "obstacle": np.asarray(known_obstacle, dtype=np.float32),
+            "unknown": np.asarray(unknown, dtype=np.float32),
+            "explored": explored_known.astype(np.float32),
+            "frontier": np.asarray(frontier, dtype=np.float32),
+        }
+        channels = [
+            center_crop_with_pad(
+                source[name],
+                robot_pos,
+                size,
+                size,
+                pad_value=self._pad_value_for(name),
+            )
+            for name in self._LOCAL_CHANNELS
+        ]
+        return np.stack(channels, axis=0).astype(np.float32)
+
+    def _build_global_base(
+        self,
+        *,
+        size: int,
+        known_free: np.ndarray,
+        known_obstacle: np.ndarray,
+        explored: np.ndarray,
+        frontier: np.ndarray,
+    ) -> np.ndarray:
+        explored_known = np.asarray(explored, dtype=bool) & np.asarray(known_free, dtype=bool)
+        channels = [
+            global_reduce_mean(explored_known.astype(np.float32), size, size),
+            global_reduce_mean(np.asarray(known_obstacle, dtype=np.float32), size, size),
+            global_reduce_max(np.asarray(frontier, dtype=np.float32), size, size),
+        ]
+        return np.stack(channels, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _build_state_fine(
+        *,
+        occupancy_shape: Tuple[int, int],
+        known_free: np.ndarray,
+        unknown: np.ndarray,
+    ) -> np.ndarray:
+        state_fine = np.full(occupancy_shape, BLOCKED_STATE, dtype=np.int8)
+        state_fine[np.asarray(unknown, dtype=bool)] = UNKNOWN_STATE
+        state_fine[np.asarray(known_free, dtype=bool)] = FREE_STATE
+        return state_fine
+
+    def _global_power_for_size(self, *, map_shape: Tuple[int, int], size: int) -> Optional[int]:
+        h, w = int(map_shape[0]), int(map_shape[1])
+        size = int(size)
+        if size <= 0 or h <= 0 or w <= 0:
+            return None
+        if h % size != 0 or w % size != 0:
+            return None
+        block_h = h // size
+        block_w = w // size
+        if block_h != block_w:
+            return None
+        return self._dtm_builder._power_of_two_exp(block_h)
+
+    def _build_boundary_dtm_pyramid(
+        self,
+        *,
+        occupancy_obs: np.ndarray,
+        known_free: np.ndarray,
+        unknown: np.ndarray,
+    ) -> Tuple[Dict[int, int], Dict[int, np.ndarray]]:
+        state_fine = self._build_state_fine(
+            occupancy_shape=occupancy_obs.shape,
+            known_free=known_free,
+            unknown=unknown,
+        )
+        occupancy_changed = self._dtm_builder._compute_changed_mask(occupancy_obs)
+        power_by_size: Dict[int, int] = {}
+        for size in self.global_sizes:
+            power = self._global_power_for_size(map_shape=occupancy_obs.shape, size=int(size))
+            if power is not None:
+                power_by_size[int(size)] = int(power)
+        if not power_by_size:
+            return {}, {}
+        dirty_by_power = self._dtm_builder._update_boundary_summary_pyramid(
+            state_fine,
+            changed_mask=occupancy_changed,
+            max_power=max(power_by_size.values()),
+        )
+        return power_by_size, dirty_by_power
+
+    def _build_global_dtm_from_boundary(
+        self,
+        *,
+        size: int,
+        power_by_size: Dict[int, int],
+        dirty_by_power: Dict[int, np.ndarray],
+    ) -> np.ndarray:
+        power = int(power_by_size[int(size)])
+        native = self._dtm_builder._dtm_from_boundary_summary_level(
+            level_id=10_000 + int(size),
+            power=power,
+            dirty_mask=dirty_by_power.get(power),
+        )
+        return self._dtm_builder._project_dtm_output(native).astype(np.float32)
+
+    def _build_dtm_fine(
+        self,
+        *,
+        occupancy_obs: np.ndarray,
+        known_free: np.ndarray,
+        unknown: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        state_fine = self._build_state_fine(
+            occupancy_shape=occupancy_obs.shape,
+            known_free=known_free,
+            unknown=unknown,
+        )
+
+        occupancy_changed = self._dtm_builder._compute_changed_mask(occupancy_obs)
+        known_ratio_fine = (~np.asarray(unknown, dtype=bool)).astype(np.float32)
+        dtm_fine = self._dtm_builder._update_dtm_level(
+            level_id=0,
+            state_map=state_fine,
+            known_ratio_map=known_ratio_fine,
+            changed_mask=occupancy_changed,
+        )
+        return dtm_fine, state_fine, occupancy_changed
+
+    def _build_global_dtm_from_fine(
+        self,
+        *,
+        size: int,
+        dtm_fine: np.ndarray,
+        state_fine: np.ndarray,
+        occupancy_changed: np.ndarray,
+        known_free: np.ndarray,
+        unknown: np.ndarray,
+    ) -> np.ndarray:
+        known_ratio = global_reduce_mean((~np.asarray(unknown, dtype=bool)).astype(np.float32), size, size)
+        h, w = known_free.shape
+        row_edges = self._dtm_builder._global_edges(h, size)
+        col_edges = self._dtm_builder._global_edges(w, size)
+        dirty_global = self._dtm_builder._dirty_global_from_changed(occupancy_changed, size, size)
+        expected_ch = self._dtm_builder._native_dtm_channels()
+        out = self._global_dtm_cache.get(int(size))
+        if out is None or out.shape != (expected_ch, size, size):
+            out = None
+        native = self._dtm_builder._compose_dtm_partition_from_children(
+            dtm_child=dtm_fine,
+            state_child=state_fine,
+            known_ratio_parent=known_ratio,
+            row_edges=row_edges,
+            col_edges=col_edges,
+            out=out,
+            dirty_mask=dirty_global,
+        )
+        self._global_dtm_cache[int(size)] = native
+        return self._dtm_builder._project_dtm_output(native).astype(np.float32)
+
+    def build(
+        self,
+        occupancy: np.ndarray,
+        *,
+        robot_pos: GridPos,
+        explored: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        t_total = perf_counter() if self._profile_enabled else 0.0
+        if occupancy.ndim != 2:
+            raise ValueError("occupancy must be 2D")
+        if explored.shape != occupancy.shape:
+            raise ValueError("explored shape must match occupancy shape")
+        h, w = occupancy.shape
+        rr, cc = robot_pos
+        if not (0 <= rr < h and 0 <= cc < w):
+            raise ValueError(f"robot_pos {robot_pos} is out of bounds {(h, w)}")
+
+        t0 = perf_counter() if self._profile_enabled else 0.0
+        occupancy_obs = self._apply_unknown_policy(np.asarray(occupancy, dtype=np.int32))
+        known_free, known_obstacle, unknown = extract_known_masks(
+            occupancy_obs,
+            unknown_value=int(self.config.unknown_value),
+            obstacle_value=int(self.config.obstacle_value),
+        )
+        covered = np.asarray(explored, dtype=bool) & known_free
+        frontier = compute_frontier_map(covered, known_obstacle)
+        if self._profile_enabled:
+            self._profile_add("prep_masks_frontier", perf_counter() - t0)
+
+        t0 = perf_counter() if self._profile_enabled else 0.0
+        local = self._build_local(
+            known_free=known_free,
+            known_obstacle=known_obstacle,
+            unknown=unknown,
+            explored=explored,
+            frontier=frontier,
+            robot_pos=robot_pos,
+        )
+        if self._profile_enabled:
+            self._profile_add("local_pack", perf_counter() - t0)
+
+        dtm_fine = None
+        state_fine = None
+        occupancy_changed = None
+        boundary_power_by_size: Dict[int, int] = {}
+        boundary_dirty_by_power: Dict[int, np.ndarray] = {}
+        if self.include_dtm:
+            candidate_power_by_size = {
+                int(size): self._global_power_for_size(map_shape=occupancy_obs.shape, size=int(size))
+                for size in self.global_sizes
+            }
+            use_boundary_summary = (
+                self._dtm_builder._native_dtm_mode() in {"port12", "six"}
+                and all(power is not None for power in candidate_power_by_size.values())
+            )
+            t0 = perf_counter() if self._profile_enabled else 0.0
+            if use_boundary_summary:
+                boundary_power_by_size, boundary_dirty_by_power = self._build_boundary_dtm_pyramid(
+                    occupancy_obs=occupancy_obs,
+                    known_free=known_free,
+                    unknown=unknown,
+                )
+                if self._profile_enabled:
+                    self._profile_add("dtm_boundary_pyramid", perf_counter() - t0)
+            else:
+                dtm_fine, state_fine, occupancy_changed = self._build_dtm_fine(
+                    occupancy_obs=occupancy_obs,
+                    known_free=known_free,
+                    unknown=unknown,
+                )
+                if self._profile_enabled:
+                    self._profile_add("dtm_fine", perf_counter() - t0)
+
+        t0 = perf_counter() if self._profile_enabled else 0.0
+        out: Dict[str, np.ndarray] = {"local": local.astype(np.float32)}
+        for size in self.global_sizes:
+            global_base = self._build_global_base(
+                size=int(size),
+                known_free=known_free,
+                known_obstacle=known_obstacle,
+                explored=explored,
+                frontier=frontier,
+            )
+            global_channels = [global_base]
+            if self.include_dtm:
+                if int(size) in boundary_power_by_size:
+                    global_channels.append(
+                        self._build_global_dtm_from_boundary(
+                            size=int(size),
+                            power_by_size=boundary_power_by_size,
+                            dirty_by_power=boundary_dirty_by_power,
+                        )
+                    )
+                elif dtm_fine is None or state_fine is None or occupancy_changed is None:
+                    raise RuntimeError("DTM fine state was not initialized")
+                else:
+                    global_channels.append(
+                        self._build_global_dtm_from_fine(
+                            size=int(size),
+                            dtm_fine=dtm_fine,
+                            state_fine=state_fine,
+                            occupancy_changed=occupancy_changed,
+                            known_free=known_free,
+                            unknown=unknown,
+                        )
+                    )
+            out[f"global_{int(size)}"] = np.concatenate(global_channels, axis=0).astype(np.float32)
+        if self._profile_enabled:
+            self._profile_add("global_pack", perf_counter() - t0)
+            self._profile_add("build_hybrid_total", perf_counter() - t_total)
+            self._profile_calls += 1
+
+        return out

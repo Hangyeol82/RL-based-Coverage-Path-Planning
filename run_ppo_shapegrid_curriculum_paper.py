@@ -45,6 +45,14 @@ def _parse_float_list(raw: str, *, name: str) -> List[float]:
     return vals
 
 
+def _argv_has_flag(*flags: str) -> bool:
+    return any(
+        arg == flag or arg.startswith(flag + "=")
+        for arg in sys.argv[1:]
+        for flag in flags
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -251,7 +259,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--milestone-threshold-99", type=float, default=0.99)
     p.add_argument("--milestone-lambda-90", type=float, default=0.2)
     p.add_argument("--milestone-lambda-99", type=float, default=4.0)
-    p.add_argument("--maps-encoder-mode", type=str, default="sgcnn", choices=["sgcnn", "independent"])
+    p.add_argument(
+        "--maps-encoder-mode",
+        type=str,
+        default="sgcnn",
+        choices=["sgcnn", "independent", "hybrid_local_global"],
+    )
+    p.add_argument("--local-crop-size", type=int, default=41)
+    p.add_argument("--global-coarse-size", type=int, default=16, help="Deprecated; use --global-coarse-sizes.")
+    p.add_argument("--global-coarse-sizes", type=str, default="64,32,16")
     p.add_argument(
         "--model-size",
         type=str,
@@ -374,6 +390,11 @@ def _parse_args() -> argparse.Namespace:
     args = p.parse_args()
     args.robot_state_progress = False
     args.robot_state_stagnation = False
+    if (
+        str(args.maps_encoder_mode).strip().lower() == "hybrid_local_global"
+        and not _argv_has_flag("--cell-phase-channels", "--no-cell-phase-channels")
+    ):
+        args.cell_phase_channels = False
     return args
 
 
@@ -851,6 +872,12 @@ def _build_run_cmd(
         str(float(args.milestone_lambda_99)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
+        "--local-crop-size",
+        str(int(args.local_crop_size)),
+        "--global-coarse-size",
+        str(int(args.global_coarse_size)),
+        "--global-coarse-sizes",
+        str(args.global_coarse_sizes),
         "--model-size",
         args.model_size,
         "--dtm-coarse-mode",
@@ -1410,6 +1437,16 @@ def main():
         rec["chunk_mean_episode_revisit_ratio"] = _safe_mean_finite(rollouts, "episode_revisit_ratio")
         rec["chunk_mean_episode_overlap_ratio"] = _safe_mean_finite(rollouts, "episode_overlap_ratio")
         rec["chunk_mean_episode_coverage_auc"] = _safe_mean_finite(rollouts, "episode_coverage_auc")
+        for key in (
+            "heuristic_active",
+            "heuristic_selected",
+            "heuristic_overridden",
+            "heuristic_target_known_uncovered",
+            "heuristic_target_frontier",
+            "heuristic_target_cached",
+        ):
+            rec[f"chunk_mean_{key}"] = _safe_mean_finite(rollouts, key)
+            rec[f"cum_mean_{key}"] = _safe_mean_finite(all_rollouts, key)
         for suffix in ("90", "95", "99"):
             rec[f"chunk_mean_success_{suffix}"] = _safe_mean_finite(rollouts, f"success_{suffix}")
             rec[f"chunk_mean_step_to_{suffix}"] = _safe_mean_finite(rollouts, f"step_to_{suffix}")
