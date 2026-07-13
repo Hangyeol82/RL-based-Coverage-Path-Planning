@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import heapq
 from collections import deque
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -65,7 +64,7 @@ class CPPDiscreteEnvConfig:
     # every time only coverage/explored state is reset.
     preserve_static_map_observation_cache_on_reset: bool = False
     # Optional heuristic assist for training/evaluation. When the policy fails
-    # to add new coverage for N consecutive steps, an online-safe A* planner can
+    # to add new coverage for N consecutive steps, an online-safe graph search can
     # temporarily route to the nearest observed but uncovered known-free cell.
     heuristic_assist_enabled: bool = False
     heuristic_no_progress_threshold: int = 50
@@ -653,29 +652,7 @@ class CPPDiscreteEnv:
                 best_action = int(action)
         return best_action
 
-    def _manhattan_distance_to_targets(self, target_mask: np.ndarray) -> np.ndarray:
-        inf = int(self.rows + self.cols + 1)
-        dist = np.full((self.rows, self.cols), inf, dtype=np.int32)
-        dist[target_mask] = 0
-        for r in range(self.rows):
-            for c in range(self.cols):
-                best = int(dist[r, c])
-                if r > 0:
-                    best = min(best, int(dist[r - 1, c]) + 1)
-                if c > 0:
-                    best = min(best, int(dist[r, c - 1]) + 1)
-                dist[r, c] = best
-        for r in range(self.rows - 1, -1, -1):
-            for c in range(self.cols - 1, -1, -1):
-                best = int(dist[r, c])
-                if r + 1 < self.rows:
-                    best = min(best, int(dist[r + 1, c]) + 1)
-                if c + 1 < self.cols:
-                    best = min(best, int(dist[r, c + 1]) + 1)
-                dist[r, c] = best
-        return dist
-
-    def _astar_action_to_target_mask(
+    def _bfs_action_to_target_mask(
         self,
         target_mask: np.ndarray,
         *,
@@ -690,6 +667,7 @@ class CPPDiscreteEnv:
             "target_row": -1.0,
             "target_col": -1.0,
             "target_kind": str(target_kind),
+            "search_method": "bfs",
         }
         if target_count <= 0:
             return None, stats
@@ -710,31 +688,21 @@ class CPPDiscreteEnv:
         if not bool(passable[sr, sc]):
             return None, stats
 
-        heuristic = self._manhattan_distance_to_targets(target_mask)
         max_expansions = int(self.config.heuristic_max_astar_expansions)
         if max_expansions <= 0:
             max_expansions = int(self.rows * self.cols)
 
-        inf = int(self.rows * self.cols + 1)
-        g_score = np.full((self.rows, self.cols), inf, dtype=np.int32)
-        g_score[sr, sc] = 0
-        closed = np.zeros((self.rows, self.cols), dtype=bool)
+        seen = np.zeros((self.rows, self.cols), dtype=bool)
+        seen[sr, sc] = True
         parent: Dict[GridPos, GridPos] = {}
-        heap: List[Tuple[int, int, int, int]] = []
-        push_count = 0
-        heapq.heappush(heap, (int(heuristic[sr, sc]), 0, sr, sc))
+        queue: Deque[GridPos] = deque([(int(sr), int(sc))])
 
         found: Optional[GridPos] = None
         expansions = 0
-        while heap and expansions < max_expansions:
-            _, cur_g, r, c = heapq.heappop(heap)
-            if closed[r, c]:
-                continue
-            if cur_g != int(g_score[r, c]):
-                continue
-            closed[r, c] = True
+        while queue and expansions < max_expansions:
+            r, c = queue.popleft()
             expansions += 1
-            if bool(target_mask[r, c]):
+            if (r, c) != (sr, sc) and bool(target_mask[r, c]):
                 found = (int(r), int(c))
                 break
 
@@ -742,18 +710,11 @@ class CPPDiscreteEnv:
                 nr, nc = r + dr, c + dc
                 if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
                     continue
-                if closed[nr, nc] or (not bool(passable[nr, nc])):
+                if bool(seen[nr, nc]) or (not bool(passable[nr, nc])):
                     continue
-                next_g = cur_g + 1
-                if next_g >= int(g_score[nr, nc]):
-                    continue
-                g_score[nr, nc] = int(next_g)
+                seen[nr, nc] = True
                 parent[(int(nr), int(nc))] = (int(r), int(c))
-                push_count += 1
-                heapq.heappush(
-                    heap,
-                    (int(next_g + int(heuristic[nr, nc])), push_count, int(nr), int(nc)),
-                )
+                queue.append((int(nr), int(nc)))
 
         stats["astar_expansions"] = float(expansions)
         if found is None:
@@ -811,7 +772,7 @@ class CPPDiscreteEnv:
         self._heuristic_cached_target = None
 
         known_uncovered = (self.known_map == 0) & (~self.explored)
-        action, stats = self._astar_action_to_target_mask(
+        action, stats = self._bfs_action_to_target_mask(
             known_uncovered,
             target_kind="known_uncovered",
         )
@@ -819,7 +780,7 @@ class CPPDiscreteEnv:
             return action, stats
 
         frontier = self._frontier_mask()
-        frontier_action, frontier_stats = self._astar_action_to_target_mask(
+        frontier_action, frontier_stats = self._bfs_action_to_target_mask(
             frontier,
             target_kind="frontier",
         )
@@ -842,6 +803,8 @@ class CPPDiscreteEnv:
         self._milestone_hit_90 = False
         self._milestone_hit_99 = False
         self._heuristic_no_progress_streak = 0
+        self._heuristic_cached_actions.clear()
+        self._heuristic_cached_target = None
 
         self.known_map.fill(-1)
         self.explored.fill(False)
