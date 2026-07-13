@@ -163,6 +163,8 @@ class CPPDiscreteEnv:
             maxlen=max(1, int(self.config.robot_state.action_history_len)),
         )
         self._heuristic_no_progress_streak = 0
+        self._heuristic_cached_actions: Deque[int] = deque()
+        self._heuristic_cached_target: Optional[GridPos] = None
 
         self.reset()
 
@@ -612,6 +614,45 @@ class CPPDiscreteEnv:
             return False
         return bool(self.known_map[nr, nc] == 0 and not self.explored[nr, nc])
 
+    def _action_leads_to_known_free(self, action: int) -> bool:
+        dr, dc = ACTION_TO_DELTA[int(action)]
+        cr, cc = self.current_pos
+        nr, nc = cr + dr, cc + dc
+        if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+            return False
+        return bool(self.known_map[nr, nc] == 0)
+
+    def _frontier_mask(self) -> np.ndarray:
+        unknown = self.known_map == -1
+        adjacent_unknown = np.zeros_like(unknown, dtype=bool)
+        adjacent_unknown[1:, :] |= unknown[:-1, :]
+        adjacent_unknown[:-1, :] |= unknown[1:, :]
+        adjacent_unknown[:, 1:] |= unknown[:, :-1]
+        adjacent_unknown[:, :-1] |= unknown[:, 1:]
+        return (self.known_map == 0) & adjacent_unknown
+
+    def _unknown_neighbor_action(self) -> Optional[int]:
+        cr, cc = self.current_pos
+        best_key: Optional[Tuple[int, int, int]] = None
+        best_action: Optional[int] = None
+        for action, (dr, dc) in ACTION_TO_DELTA.items():
+            nr, nc = cr + dr, cc + dc
+            if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                continue
+            if self.known_map[nr, nc] != -1:
+                continue
+            unknown_gain = 0
+            for _, (ndr, ndc) in ACTION_TO_DELTA.items():
+                rr, cc2 = nr + ndr, nc + ndc
+                if 0 <= rr < self.rows and 0 <= cc2 < self.cols and self.known_map[rr, cc2] == -1:
+                    unknown_gain += 1
+            turn_cost = 0 if self.prev_action is None else int(action != int(self.prev_action))
+            key = (int(unknown_gain), -turn_cost, -int(action))
+            if best_key is None or key > best_key:
+                best_key = key
+                best_action = int(action)
+        return best_action
+
     def _manhattan_distance_to_targets(self, target_mask: np.ndarray) -> np.ndarray:
         inf = int(self.rows + self.cols + 1)
         dist = np.full((self.rows, self.cols), inf, dtype=np.int32)
@@ -634,22 +675,37 @@ class CPPDiscreteEnv:
                 dist[r, c] = best
         return dist
 
-    def _nearest_known_uncovered_astar_action(self) -> Tuple[Optional[int], Dict[str, float]]:
-        target_mask = (self.known_map == 0) & (~self.explored)
+    def _astar_action_to_target_mask(
+        self,
+        target_mask: np.ndarray,
+        *,
+        target_kind: str,
+    ) -> Tuple[Optional[int], Dict[str, object]]:
         target_count = int(np.count_nonzero(target_mask))
-        stats: Dict[str, float] = {
+        stats: Dict[str, object] = {
             "path_found": 0.0,
             "target_count": float(target_count),
             "path_length": 0.0,
             "astar_expansions": 0.0,
             "target_row": -1.0,
             "target_col": -1.0,
+            "target_kind": str(target_kind),
         }
         if target_count <= 0:
             return None, stats
 
         start = self.current_pos
         sr, sc = start
+        if bool(target_mask[sr, sc]) and str(target_kind) == "frontier":
+            action = self._unknown_neighbor_action()
+            if action is None:
+                return None, stats
+            stats["path_found"] = 1.0
+            stats["path_length"] = 1.0
+            stats["target_row"] = float(sr)
+            stats["target_col"] = float(sc)
+            return int(action), stats
+
         passable = self.known_map == 0
         if not bool(passable[sr, sc]):
             return None, stats
@@ -714,21 +770,63 @@ class CPPDiscreteEnv:
         if len(path) <= 1:
             return None, stats
 
-        nr, nc = path[1]
-        dr, dc = int(nr - sr), int(nc - sc)
-        action = None
-        for a, delta in ACTION_TO_DELTA.items():
-            if delta == (dr, dc):
-                action = int(a)
+        actions: List[int] = []
+        for src, dst in zip(path[:-1], path[1:]):
+            dr, dc = int(dst[0] - src[0]), int(dst[1] - src[1])
+            action = None
+            for a, delta in ACTION_TO_DELTA.items():
+                if delta == (dr, dc):
+                    action = int(a)
+                    break
+            if action is None:
+                actions = []
                 break
-        if action is None:
+            actions.append(int(action))
+        if not actions:
             return None, stats
+        action = int(actions[0])
+        self._heuristic_cached_actions = deque(int(a) for a in actions[1:])
+        self._heuristic_cached_target = found
 
         stats["path_found"] = 1.0
         stats["path_length"] = float(len(path) - 1)
         stats["target_row"] = float(found[0])
         stats["target_col"] = float(found[1])
         return int(action), stats
+
+    def _nearest_known_uncovered_astar_action(self) -> Tuple[Optional[int], Dict[str, object]]:
+        while self._heuristic_cached_actions:
+            cached_action = int(self._heuristic_cached_actions.popleft())
+            if self._action_leads_to_known_free(cached_action):
+                target_count = int(np.count_nonzero((self.known_map == 0) & (~self.explored)))
+                return cached_action, {
+                    "path_found": 1.0,
+                    "target_count": float(target_count),
+                    "path_length": float(len(self._heuristic_cached_actions) + 1),
+                    "astar_expansions": 0.0,
+                    "target_row": float(self._heuristic_cached_target[0]) if self._heuristic_cached_target else -1.0,
+                    "target_col": float(self._heuristic_cached_target[1]) if self._heuristic_cached_target else -1.0,
+                    "target_kind": "cached",
+                }
+        self._heuristic_cached_target = None
+
+        known_uncovered = (self.known_map == 0) & (~self.explored)
+        action, stats = self._astar_action_to_target_mask(
+            known_uncovered,
+            target_kind="known_uncovered",
+        )
+        if action is not None:
+            return action, stats
+
+        frontier = self._frontier_mask()
+        frontier_action, frontier_stats = self._astar_action_to_target_mask(
+            frontier,
+            target_kind="frontier",
+        )
+        if frontier_action is not None:
+            return frontier_action, frontier_stats
+
+        return None, stats if int(float(stats.get("target_count", 0.0))) > 0 else frontier_stats
 
     def reset(self, *, start_pos: Optional[GridPos] = None) -> Dict[str, object]:
         self.current_pos = self._resolve_start(start_pos) if start_pos is not None else self._default_start
@@ -786,17 +884,18 @@ class CPPDiscreteEnv:
         heuristic_active = self._heuristic_should_activate()
         heuristic_selected = False
         heuristic_overridden = False
-        heuristic_stats: Dict[str, float] = {
+        heuristic_stats: Dict[str, object] = {
             "path_found": 0.0,
             "target_count": 0.0,
             "path_length": 0.0,
             "astar_expansions": 0.0,
             "target_row": -1.0,
             "target_col": -1.0,
+            "target_kind": "none",
         }
         if heuristic_active:
             heuristic_action, heuristic_stats = self._nearest_known_uncovered_astar_action()
-            if heuristic_action is not None and not self._action_leads_to_known_uncovered_free(executed_action):
+            if heuristic_action is not None:
                 previous_executed_action = int(executed_action)
                 executed_action = int(heuristic_action)
                 heuristic_selected = True
@@ -892,6 +991,8 @@ class CPPDiscreteEnv:
         self.recent_new_coverage.append(float(newly_visited))
         if (not collided) and float(newly_visited) > 0.0:
             self._heuristic_no_progress_streak = 0
+            self._heuristic_cached_actions.clear()
+            self._heuristic_cached_target = None
         else:
             self._heuristic_no_progress_streak += 1
 
@@ -938,6 +1039,7 @@ class CPPDiscreteEnv:
             "heuristic_astar_expansions": int(heuristic_stats.get("astar_expansions", 0.0)),
             "heuristic_target_row": int(heuristic_stats.get("target_row", -1.0)),
             "heuristic_target_col": int(heuristic_stats.get("target_col", -1.0)),
+            "heuristic_target_kind": str(heuristic_stats.get("target_kind", "none")),
             "forced_turn": bool(forced_turn),
             "action_mask_valid_count": int(np.count_nonzero(action_mask)),
             "action_mask": [int(v) for v in action_mask.astype(np.int8)],

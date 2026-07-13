@@ -367,6 +367,9 @@ def _evaluate_one_map(
         heuristic_active_count = 0
         heuristic_selected_count = 0
         heuristic_overridden_count = 0
+        heuristic_frontier_selected_count = 0
+        heuristic_known_uncovered_selected_count = 0
+        heuristic_cached_selected_count = 0
         revisited_count = 0
         final_info: Dict[str, object] = {}
 
@@ -389,6 +392,13 @@ def _evaluate_one_map(
                 heuristic_active_count += 1
             if bool(info.get("heuristic_selected", False)):
                 heuristic_selected_count += 1
+                target_kind = str(info.get("heuristic_target_kind", "none"))
+                if target_kind == "frontier":
+                    heuristic_frontier_selected_count += 1
+                elif target_kind == "known_uncovered":
+                    heuristic_known_uncovered_selected_count += 1
+                elif target_kind == "cached":
+                    heuristic_cached_selected_count += 1
             if bool(info.get("heuristic_overridden", False)):
                 heuristic_overridden_count += 1
             if bool(info.get("revisited_cell", False)):
@@ -418,6 +428,12 @@ def _evaluate_one_map(
             "heuristic_active_rate": float(heuristic_active_count) / float(max(1, steps)),
             "heuristic_selected_count": int(heuristic_selected_count),
             "heuristic_selected_rate": float(heuristic_selected_count) / float(max(1, steps)),
+            "heuristic_frontier_selected_count": int(heuristic_frontier_selected_count),
+            "heuristic_frontier_selected_rate": float(heuristic_frontier_selected_count) / float(max(1, steps)),
+            "heuristic_known_uncovered_selected_count": int(heuristic_known_uncovered_selected_count),
+            "heuristic_known_uncovered_selected_rate": float(heuristic_known_uncovered_selected_count) / float(max(1, steps)),
+            "heuristic_cached_selected_count": int(heuristic_cached_selected_count),
+            "heuristic_cached_selected_rate": float(heuristic_cached_selected_count) / float(max(1, steps)),
             "heuristic_overridden_count": int(heuristic_overridden_count),
             "heuristic_override_rate": float(heuristic_overridden_count) / float(max(1, steps)),
             "revisited_count": int(revisited_count),

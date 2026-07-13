@@ -18,6 +18,7 @@ import numpy as np
 
 from CStarOnlineCPP import CStarOnlineCPP
 from EStarOlineCpp import EpsilonStarCPP
+from classical_cpp_heuristics import run_online_heuristic
 from evaluation.cpp_metrics import compute_cpp_path_metrics
 from map_generators.shape_grid_presets import build_validated_shape_grid_map, get_paper_shape_grid_preset
 from map_generators.validation import analyze_grid_map, parse_map_txt
@@ -54,7 +55,15 @@ def _parse_args() -> argparse.Namespace:
         "--algorithm",
         type=str,
         default="epsilon_star",
-        choices=["epsilon_star", "cstar", "offline_sweep"],
+        choices=[
+            "epsilon_star",
+            "cstar",
+            "offline_sweep",
+            "nearest_unvisited",
+            "frontier_greedy",
+            "wall_follow",
+            "spiral_stc",
+        ],
     )
     p.add_argument("--map-files", type=str, default="", help="Comma-separated txt map files.")
     p.add_argument("--seeds", type=str, default="1001,1002,1003,1004,1005")
@@ -159,6 +168,16 @@ def _run_algorithm(args: argparse.Namespace, grid: np.ndarray, start: GridPos) -
         )
         path = planner.run(max_steps=int(args.max_steps))
         return [(int(r), int(c)) for r, c in path], planner.rcg_stats()
+
+    if args.algorithm in {"nearest_unvisited", "frontier_greedy", "wall_follow", "spiral_stc"}:
+        result = run_online_heuristic(
+            str(args.algorithm),
+            grid,
+            start=start,
+            sensor_range=int(args.sensor_range),
+            max_steps=int(args.max_steps),
+        )
+        return result.path, result.stats
 
     path = _offline_sweep_path(grid, start, int(args.max_steps))
     return path, {"known_map": "full"}
