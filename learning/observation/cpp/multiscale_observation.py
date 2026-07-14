@@ -2266,17 +2266,17 @@ class HybridLocalGlobalCPPObservationBuilder:
     ------
     {
         "local":  [5, local_crop_size, local_crop_size],
-        "global_64": [3 + dtm_channels, 64, 64],
-        "global_32": [3 + dtm_channels, 32, 32],
-        "global_16": [3 + dtm_channels, 16, 16],
+        "global_64": [4 + dtm_channels, 64, 64],
+        "global_32": [4 + dtm_channels, 32, 32],
+        "global_16": [4 + dtm_channels, 16, 16],
     }
 
     Local channels keep high-resolution online geometry around the robot:
     known_free, obstacle, unknown, explored, frontier.
 
     Global channels follow the paper multiscale baseline convention:
-    coverage, obstacle, frontier. Optional DTM channels are appended only to
-    each global tensor.
+    coverage, obstacle, frontier, robot_marker. Optional DTM channels are
+    appended only to each global tensor.
     """
 
     _LOCAL_CHANNELS = (
@@ -2290,6 +2290,7 @@ class HybridLocalGlobalCPPObservationBuilder:
         "coverage",
         "obstacle_ratio",
         "frontier",
+        "robot_marker",
     )
     _DTM_CHANNELS_6 = MultiScaleCPPObservationBuilder._DTM_CHANNELS_6
     _DTM_CHANNELS_2 = MultiScaleCPPObservationBuilder._DTM_CHANNELS_2
@@ -2453,12 +2454,20 @@ class HybridLocalGlobalCPPObservationBuilder:
         known_obstacle: np.ndarray,
         explored: np.ndarray,
         frontier: np.ndarray,
+        robot_pos: GridPos,
     ) -> np.ndarray:
         explored_known = np.asarray(explored, dtype=bool) & np.asarray(known_free, dtype=bool)
+        marker = np.zeros((int(size), int(size)), dtype=np.float32)
+        h, w = known_free.shape
+        rr, cc = robot_pos
+        mr = min(int(size) - 1, max(0, (int(rr) * int(size)) // max(1, int(h))))
+        mc = min(int(size) - 1, max(0, (int(cc) * int(size)) // max(1, int(w))))
+        marker[mr, mc] = 1.0
         channels = [
             global_reduce_mean(explored_known.astype(np.float32), size, size),
             global_reduce_mean(np.asarray(known_obstacle, dtype=np.float32), size, size),
             global_reduce_max(np.asarray(frontier, dtype=np.float32), size, size),
+            marker,
         ]
         return np.stack(channels, axis=0).astype(np.float32)
 
@@ -2665,6 +2674,7 @@ class HybridLocalGlobalCPPObservationBuilder:
                 known_obstacle=known_obstacle,
                 explored=explored,
                 frontier=frontier,
+                robot_pos=robot_pos,
             )
             global_channels = [global_base]
             if self.include_dtm:
