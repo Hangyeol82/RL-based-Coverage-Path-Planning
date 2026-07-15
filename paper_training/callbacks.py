@@ -120,7 +120,8 @@ class PaperMetricsCallback(BaseCallback):
         if _SB3_IMPORT_ERROR is not None:
             raise ImportError("stable_baselines3 is required for PaperMetricsCallback") from _SB3_IMPORT_ERROR
         super().__init__(verbose=verbose)
-        self._cur: DefaultDict[str, List[float]] = defaultdict(list)
+        self._step_sums: DefaultDict[str, float] = defaultdict(float)
+        self._step_counts: DefaultDict[str, int] = defaultdict(int)
         self._episode: DefaultDict[str, List[float]] = defaultdict(list)
         self._step_count = 0
         self._override_step_count = 0
@@ -161,7 +162,8 @@ class PaperMetricsCallback(BaseCallback):
                 self._override_step_count += 1
             for key in self.STEP_MEAN_KEYS:
                 if key in info:
-                    self._cur[key].append(float(info[key]))
+                    self._step_sums[key] += float(info[key])
+                    self._step_counts[key] += 1
 
             if str(info.get("done_reason", "")):
                 episode_vals: Dict[str, float] = {}
@@ -239,9 +241,9 @@ class PaperMetricsCallback(BaseCallback):
             "timesteps": float(self.num_timesteps),
         }
         for key in self.STEP_MEAN_KEYS:
-            vals = self._cur.get(key, [])
-            if vals:
-                rec[key] = self._mean(vals)
+            count = int(self._step_counts.get(key, 0))
+            if count > 0:
+                rec[key] = float(self._step_sums.get(key, 0.0)) / float(count)
                 self.logger.record(f"paper_metrics/{key}", rec[key])
 
         if self._step_count > 0:
@@ -294,7 +296,8 @@ class PaperMetricsCallback(BaseCallback):
                 self.logger.record(f"paper_metrics/{std_key}", rec[std_key])
 
         self.history.append(rec)
-        self._cur.clear()
+        self._step_sums.clear()
+        self._step_counts.clear()
         self._episode.clear()
         self._episode_group = {
             "family": {},
