@@ -330,6 +330,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--verbose",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        help="Stable-Baselines3 verbosity forwarded to each PPO chunk.",
+    )
 
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument("--action-mask", dest="action_mask", action="store_true")
@@ -835,7 +842,7 @@ def _build_run_cmd(
         "--lr",
         str(float(args.lr)),
         "--verbose",
-        "0",
+        str(int(args.verbose)),
         "--sensor-range",
         str(int(args.sensor_range)),
         "--max-episode-steps",
