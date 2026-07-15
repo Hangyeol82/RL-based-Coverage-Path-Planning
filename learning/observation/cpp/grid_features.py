@@ -225,12 +225,21 @@ def global_reduce_mean(arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     if arr.ndim != 2:
         raise ValueError("arr must be 2D")
     h, w = arr.shape
-    row_edges = _global_edges(h, out_h)
-    col_edges = _global_edges(w, out_w)
     out = np.zeros((out_h, out_w), dtype=np.float32)
     if h == 0 or w == 0:
         return out
+    if out_h > 0 and out_w > 0 and h % out_h == 0 and w % out_w == 0:
+        block_h = h // out_h
+        block_w = w // out_w
+        return (
+            np.asarray(arr)
+            .reshape(out_h, block_h, out_w, block_w)
+            .mean(axis=(1, 3), dtype=np.float32)
+            .astype(np.float32, copy=False)
+        )
 
+    row_edges = _global_edges(h, out_h)
+    col_edges = _global_edges(w, out_w)
     for r in range(out_h):
         rs, re = _safe_slice(row_edges[r], row_edges[r + 1], h)
         for c in range(out_w):
@@ -243,12 +252,21 @@ def global_reduce_max(arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     if arr.ndim != 2:
         raise ValueError("arr must be 2D")
     h, w = arr.shape
-    row_edges = _global_edges(h, out_h)
-    col_edges = _global_edges(w, out_w)
     out = np.zeros((out_h, out_w), dtype=np.float32)
     if h == 0 or w == 0:
         return out
+    if out_h > 0 and out_w > 0 and h % out_h == 0 and w % out_w == 0:
+        block_h = h // out_h
+        block_w = w // out_w
+        return (
+            np.asarray(arr)
+            .reshape(out_h, block_h, out_w, block_w)
+            .max(axis=(1, 3))
+            .astype(np.float32, copy=False)
+        )
 
+    row_edges = _global_edges(h, out_h)
+    col_edges = _global_edges(w, out_w)
     for r in range(out_h):
         rs, re = _safe_slice(row_edges[r], row_edges[r + 1], h)
         for c in range(out_w):
