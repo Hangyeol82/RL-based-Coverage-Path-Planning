@@ -276,13 +276,11 @@ class PaperMetricsCallback(BaseCallback):
                     count = float(len(metrics.get("episode_count", [])))
                     count_key = f"episode_count_{kind}_{token}"
                     rec[count_key] = count
-                    self.logger.record(f"paper_metrics/{count_key}", count)
                     for metric_key, vals in sorted(metrics.items()):
                         if metric_key == "episode_count" or not vals:
                             continue
                         out_key = f"{kind}_{token}_{metric_key}"
                         rec[out_key] = self._mean(vals)
-                        self.logger.record(f"paper_metrics/{out_key}", rec[out_key])
 
         rows = [*self.history, rec]
         for key in self.TREND_KEYS:
@@ -292,8 +290,6 @@ class PaperMetricsCallback(BaseCallback):
                 std_key = f"trend{self.TREND_WINDOW}_{key}_std"
                 rec[slope_key] = self._slope(vals)
                 rec[std_key] = self._std(vals)
-                self.logger.record(f"paper_metrics/{slope_key}", rec[slope_key])
-                self.logger.record(f"paper_metrics/{std_key}", rec[std_key])
 
         self.history.append(rec)
         self._step_sums.clear()
