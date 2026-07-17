@@ -159,6 +159,15 @@ class HybridLocalGlobalCPPObservationConfig:
     global_coarse_size: int = 16
     # Full-map multi-scale summary resolutions.
     global_coarse_sizes: Tuple[int, ...] = (64, 32, 16)
+    # - full: each global tensor summarizes the whole known map.
+    # - centered: each global tensor summarizes a robot-centered window whose
+    #   original-map span is set by global_window_sizes; out-of-map cells are
+    #   padded.
+    # - viewport: each tensor uses the same window spans but shifts the window
+    #   inside map bounds near edges; robot_marker carries the robot's position
+    #   within that window.
+    global_view_mode: str = "full"
+    global_window_sizes: Tuple[int, ...] = ()
     unknown_value: int = -1
     obstacle_value: int = 1
     unknown_policy: str = "keep"
@@ -2275,8 +2284,10 @@ class HybridLocalGlobalCPPObservationBuilder:
     known_free, obstacle, unknown, explored, frontier.
 
     Global channels follow the paper multiscale baseline convention:
-    coverage, obstacle, frontier, robot_marker. Optional DTM channels are
-    appended only to each global tensor.
+    coverage, obstacle, frontier, robot_marker. In full mode each global
+    tensor covers the whole map. In centered/viewport modes the tensors cover
+    local-to-global windows with increasing original-map spans. Optional DTM
+    channels are appended only to each global tensor.
     """
 
     _LOCAL_CHANNELS = (
@@ -2314,10 +2325,31 @@ class HybridLocalGlobalCPPObservationBuilder:
             raise ValueError("global_coarse_sizes must not be empty")
         if any(s <= 0 for s in self.global_sizes):
             raise ValueError("global_coarse_sizes values must be positive")
+        mode = str(self.config.global_view_mode).strip().lower()
+        mode = "centered" if mode in {"robot_centered", "centered_pyramid", "compact"} else mode
+        mode = "viewport" if mode in {"clamped", "clamped_centered", "shifted"} else mode
+        if mode not in {"full", "centered", "viewport"}:
+            raise ValueError("global_view_mode must be one of {'full', 'centered', 'viewport'}")
+        self.global_view_mode = mode
+        self.global_window_sizes = tuple(int(s) for s in self.config.global_window_sizes)
+        if self.global_view_mode in {"centered", "viewport"}:
+            if len(self.global_window_sizes) != len(self.global_sizes):
+                raise ValueError(
+                    "global_window_sizes must contain one original-map span per "
+                    "global_coarse_sizes entry when global_view_mode is centered/viewport"
+                )
+            if any(s <= 0 for s in self.global_window_sizes):
+                raise ValueError("global_window_sizes values must be positive")
+            for out_size, window_size in zip(self.global_sizes, self.global_window_sizes):
+                if int(window_size) < int(out_size):
+                    raise ValueError(
+                        "global_window_sizes values must be >= their paired "
+                        "global_coarse_sizes values"
+                    )
         if self.config.unknown_policy not in {"keep", "as_free", "as_obstacle"}:
             raise ValueError("unknown_policy must be one of {'keep', 'as_free', 'as_obstacle'}")
-        mode = self._normalize_dtm_output_mode(self.config.dtm_output_mode)
-        if mode not in {"six", "axis2"}:
+        dtm_mode = self._normalize_dtm_output_mode(self.config.dtm_output_mode)
+        if dtm_mode not in {"six", "axis2"}:
             raise ValueError("hybrid DTM supports dtm_output_mode in {'six', 'two', 'axis2'}")
         self._global_dtm_cache: Dict[int, np.ndarray] = {}
         self._dtm_builder = MultiScaleCPPObservationBuilder(
@@ -2472,6 +2504,159 @@ class HybridLocalGlobalCPPObservationBuilder:
         return np.stack(channels, axis=0).astype(np.float32)
 
     @staticmethod
+    def _aligned_view_start(
+        *,
+        coord: int,
+        dim: int,
+        window_size: int,
+        align: int = 1,
+    ) -> int:
+        dim = int(dim)
+        window_size = int(window_size)
+        align = max(1, int(align))
+        if dim <= 0 or window_size <= 0 or window_size >= dim:
+            return 0
+        max_start = max(0, dim - window_size)
+        raw = min(max(0, int(coord) - (window_size // 2)), max_start)
+        aligned = int(round(float(raw) / float(align))) * align
+        return int(min(max(0, aligned), max_start))
+
+    @staticmethod
+    def _crop_window_with_pad(
+        arr: np.ndarray,
+        *,
+        top: int,
+        left: int,
+        window_size: int,
+        pad_value: float,
+    ) -> np.ndarray:
+        if arr.ndim != 2:
+            raise ValueError("arr must be 2D")
+        window_size = int(window_size)
+        out = np.full((window_size, window_size), pad_value, dtype=np.float32)
+        h, w = arr.shape
+        if h <= 0 or w <= 0:
+            return out
+        r0 = int(top)
+        c0 = int(left)
+        src_r0 = max(0, r0)
+        src_c0 = max(0, c0)
+        src_r1 = min(h, r0 + window_size)
+        src_c1 = min(w, c0 + window_size)
+        if src_r0 >= src_r1 or src_c0 >= src_c1:
+            return out
+        dst_r0 = src_r0 - r0
+        dst_c0 = src_c0 - c0
+        out[dst_r0 : dst_r0 + (src_r1 - src_r0), dst_c0 : dst_c0 + (src_c1 - src_c0)] = np.asarray(
+            arr[src_r0:src_r1, src_c0:src_c1],
+            dtype=np.float32,
+        )
+        return out
+
+    def _build_window_global_base(
+        self,
+        *,
+        size: int,
+        window_size: int,
+        view_mode: str,
+        known_free: np.ndarray,
+        known_obstacle: np.ndarray,
+        unknown: np.ndarray,
+        explored: np.ndarray,
+        frontier: np.ndarray,
+        robot_pos: GridPos,
+        block_align: int = 1,
+    ) -> np.ndarray:
+        window_size = int(window_size)
+        if str(view_mode) == "viewport":
+            h, w = known_free.shape
+            top = self._aligned_view_start(
+                coord=int(robot_pos[0]),
+                dim=int(h),
+                window_size=window_size,
+                align=int(block_align),
+            )
+            left = self._aligned_view_start(
+                coord=int(robot_pos[1]),
+                dim=int(w),
+                window_size=window_size,
+                align=int(block_align),
+            )
+            local_r = min(window_size - 1, max(0, int(robot_pos[0]) - top))
+            local_c = min(window_size - 1, max(0, int(robot_pos[1]) - left))
+            known_free_crop = self._crop_window_with_pad(
+                np.asarray(known_free, dtype=np.float32),
+                top=top,
+                left=left,
+                window_size=window_size,
+                pad_value=0.0,
+            ).astype(bool)
+            known_obstacle_crop = self._crop_window_with_pad(
+                np.asarray(known_obstacle, dtype=np.float32),
+                top=top,
+                left=left,
+                window_size=window_size,
+                pad_value=0.0,
+            ).astype(bool)
+            explored_crop = self._crop_window_with_pad(
+                np.asarray(explored, dtype=np.float32),
+                top=top,
+                left=left,
+                window_size=window_size,
+                pad_value=0.0,
+            ).astype(bool)
+            frontier_crop = self._crop_window_with_pad(
+                np.asarray(frontier, dtype=np.float32),
+                top=top,
+                left=left,
+                window_size=window_size,
+                pad_value=0.0,
+            )
+        else:
+            local_r = window_size // 2
+            local_c = window_size // 2
+            known_free_crop = center_crop_with_pad(
+                np.asarray(known_free, dtype=np.float32),
+                robot_pos,
+                window_size,
+                window_size,
+                pad_value=0.0,
+            ).astype(bool)
+            known_obstacle_crop = center_crop_with_pad(
+                np.asarray(known_obstacle, dtype=np.float32),
+                robot_pos,
+                window_size,
+                window_size,
+                pad_value=0.0,
+            ).astype(bool)
+            explored_crop = center_crop_with_pad(
+                np.asarray(explored, dtype=np.float32),
+                robot_pos,
+                window_size,
+                window_size,
+                pad_value=0.0,
+            ).astype(bool)
+            frontier_crop = center_crop_with_pad(
+                np.asarray(frontier, dtype=np.float32),
+                robot_pos,
+                window_size,
+                window_size,
+                pad_value=0.0,
+            )
+        explored_known = explored_crop & known_free_crop
+        marker = np.zeros((int(size), int(size)), dtype=np.float32)
+        mr = min(int(size) - 1, max(0, (int(local_r) * int(size)) // max(1, window_size)))
+        mc = min(int(size) - 1, max(0, (int(local_c) * int(size)) // max(1, window_size)))
+        marker[mr, mc] = 1.0
+        channels = [
+            global_reduce_mean(explored_known.astype(np.float32), size, size),
+            global_reduce_mean(known_obstacle_crop.astype(np.float32), size, size),
+            global_reduce_max(np.asarray(frontier_crop, dtype=np.float32), size, size),
+            marker,
+        ]
+        return np.stack(channels, axis=0).astype(np.float32)
+
+    @staticmethod
     def _build_state_fine(
         *,
         occupancy_shape: Tuple[int, int],
@@ -2495,6 +2680,35 @@ class HybridLocalGlobalCPPObservationBuilder:
         if block_h != block_w:
             return None
         return self._dtm_builder._power_of_two_exp(block_h)
+
+    def _centered_power_for_scale(self, *, size: int, window_size: int) -> Optional[int]:
+        size = int(size)
+        window_size = int(window_size)
+        if size <= 0 or window_size <= 0:
+            return None
+        if window_size % size != 0:
+            return None
+        return self._dtm_builder._power_of_two_exp(window_size // size)
+
+    def _build_boundary_dtm_pyramid_to_power(
+        self,
+        *,
+        occupancy_obs: np.ndarray,
+        known_free: np.ndarray,
+        unknown: np.ndarray,
+        max_power: int,
+    ) -> Dict[int, np.ndarray]:
+        state_fine = self._build_state_fine(
+            occupancy_shape=occupancy_obs.shape,
+            known_free=known_free,
+            unknown=unknown,
+        )
+        occupancy_changed = self._dtm_builder._compute_changed_mask(occupancy_obs)
+        return self._dtm_builder._update_boundary_summary_pyramid(
+            state_fine,
+            changed_mask=occupancy_changed,
+            max_power=int(max_power),
+        )
 
     def _build_boundary_dtm_pyramid(
         self,
@@ -2537,6 +2751,61 @@ class HybridLocalGlobalCPPObservationBuilder:
             dirty_mask=dirty_by_power.get(power),
         )
         return self._dtm_builder._project_dtm_output(native).astype(np.float32)
+
+    def _build_window_global_dtm_from_boundary(
+        self,
+        *,
+        size: int,
+        window_size: int,
+        view_mode: str,
+        power: int,
+        dirty_by_power: Dict[int, np.ndarray],
+        robot_pos: GridPos,
+        map_shape: Tuple[int, int],
+    ) -> np.ndarray:
+        block = max(1, int(window_size) // max(1, int(size)))
+        native = self._dtm_builder._dtm_from_boundary_summary_level(
+            level_id=20_000 + int(power),
+            power=int(power),
+            dirty_mask=dirty_by_power.get(int(power)),
+        )
+        projected = self._dtm_builder._project_dtm_output(native)
+        if str(view_mode) == "viewport":
+            top = self._aligned_view_start(
+                coord=int(robot_pos[0]),
+                dim=int(map_shape[0]),
+                window_size=int(window_size),
+                align=block,
+            )
+            left = self._aligned_view_start(
+                coord=int(robot_pos[1]),
+                dim=int(map_shape[1]),
+                window_size=int(window_size),
+                align=block,
+            )
+            channels = [
+                self._crop_window_with_pad(
+                    projected[k],
+                    top=int(top) // block,
+                    left=int(left) // block,
+                    window_size=int(size),
+                    pad_value=float(self.config.dtm_unknown_fill),
+                )
+                for k in range(int(projected.shape[0]))
+            ]
+        else:
+            center_coarse = (int(robot_pos[0]) // block, int(robot_pos[1]) // block)
+            channels = [
+                center_crop_with_pad(
+                    projected[k],
+                    center_coarse,
+                    int(size),
+                    int(size),
+                    pad_value=float(self.config.dtm_unknown_fill),
+                )
+                for k in range(int(projected.shape[0]))
+            ]
+        return np.stack(channels, axis=0).astype(np.float32)
 
     def _build_dtm_fine(
         self,
@@ -2592,6 +2861,99 @@ class HybridLocalGlobalCPPObservationBuilder:
         self._global_dtm_cache[int(size)] = native
         return self._dtm_builder._project_dtm_output(native).astype(np.float32)
 
+    def _build_window_global_dtm_from_fine(
+        self,
+        *,
+        size: int,
+        window_size: int,
+        view_mode: str,
+        dtm_fine: np.ndarray,
+        state_fine: np.ndarray,
+        unknown: np.ndarray,
+        robot_pos: GridPos,
+        block_align: int = 1,
+    ) -> np.ndarray:
+        window_size = int(window_size)
+        if str(view_mode) == "viewport":
+            top = self._aligned_view_start(
+                coord=int(robot_pos[0]),
+                dim=int(state_fine.shape[0]),
+                window_size=window_size,
+                align=int(block_align),
+            )
+            left = self._aligned_view_start(
+                coord=int(robot_pos[1]),
+                dim=int(state_fine.shape[1]),
+                window_size=window_size,
+                align=int(block_align),
+            )
+            dtm_child = np.stack(
+                [
+                    self._crop_window_with_pad(
+                        dtm_fine[k],
+                        top=top,
+                        left=left,
+                        window_size=window_size,
+                        pad_value=float(self.config.dtm_unknown_fill),
+                    )
+                    for k in range(int(dtm_fine.shape[0]))
+                ],
+                axis=0,
+            ).astype(np.float32)
+            state_child = self._crop_window_with_pad(
+                state_fine.astype(np.float32),
+                top=top,
+                left=left,
+                window_size=window_size,
+                pad_value=float(UNKNOWN_STATE),
+            ).astype(np.int8)
+            unknown_crop = self._crop_window_with_pad(
+                np.asarray(unknown, dtype=np.float32),
+                top=top,
+                left=left,
+                window_size=window_size,
+                pad_value=1.0,
+            ).astype(bool)
+        else:
+            dtm_child = np.stack(
+                [
+                    center_crop_with_pad(
+                        dtm_fine[k],
+                        robot_pos,
+                        window_size,
+                        window_size,
+                        pad_value=float(self.config.dtm_unknown_fill),
+                    )
+                    for k in range(int(dtm_fine.shape[0]))
+                ],
+                axis=0,
+            ).astype(np.float32)
+            state_child = center_crop_with_pad(
+                state_fine.astype(np.float32),
+                robot_pos,
+                window_size,
+                window_size,
+                pad_value=float(UNKNOWN_STATE),
+            ).astype(np.int8)
+            unknown_crop = center_crop_with_pad(
+                np.asarray(unknown, dtype=np.float32),
+                robot_pos,
+                window_size,
+                window_size,
+                pad_value=1.0,
+            ).astype(bool)
+        known_ratio = global_reduce_mean((~unknown_crop).astype(np.float32), size, size)
+        row_edges = self._dtm_builder._global_edges(window_size, size)
+        col_edges = self._dtm_builder._global_edges(window_size, size)
+        native = self._dtm_builder._compose_dtm_partition_from_children(
+            dtm_child=dtm_child,
+            state_child=state_child,
+            known_ratio_parent=known_ratio,
+            row_edges=row_edges,
+            col_edges=col_edges,
+        )
+        return self._dtm_builder._project_dtm_output(native).astype(np.float32)
+
     def build(
         self,
         occupancy: np.ndarray,
@@ -2638,22 +3000,49 @@ class HybridLocalGlobalCPPObservationBuilder:
         occupancy_changed = None
         boundary_power_by_size: Dict[int, int] = {}
         boundary_dirty_by_power: Dict[int, np.ndarray] = {}
+        centered_power_by_index: Dict[int, int] = {}
         if self.include_dtm:
-            candidate_power_by_size = {
-                int(size): self._global_power_for_size(map_shape=occupancy_obs.shape, size=int(size))
-                for size in self.global_sizes
-            }
-            use_boundary_summary = (
-                self._dtm_builder._native_dtm_mode() in {"port12", "six"}
-                and all(power is not None for power in candidate_power_by_size.values())
-            )
+            use_boundary_summary = False
+            if self._dtm_builder._native_dtm_mode() in {"port12", "six"}:
+                if self.global_view_mode == "full":
+                    candidate_power_by_size = {
+                        int(size): self._global_power_for_size(map_shape=occupancy_obs.shape, size=int(size))
+                        for size in self.global_sizes
+                    }
+                    use_boundary_summary = all(power is not None for power in candidate_power_by_size.values())
+                else:
+                    centered_candidate_power_by_index = {
+                        int(idx): self._centered_power_for_scale(
+                            size=int(size),
+                            window_size=int(self.global_window_sizes[int(idx)]),
+                        )
+                        for idx, size in enumerate(self.global_sizes)
+                    }
+                    use_boundary_summary = all(
+                        power is not None for power in centered_candidate_power_by_index.values()
+                    )
             t0 = perf_counter() if self._profile_enabled else 0.0
             if use_boundary_summary:
-                boundary_power_by_size, boundary_dirty_by_power = self._build_boundary_dtm_pyramid(
-                    occupancy_obs=occupancy_obs,
-                    known_free=known_free,
-                    unknown=unknown,
-                )
+                if self.global_view_mode == "full":
+                    boundary_power_by_size, boundary_dirty_by_power = self._build_boundary_dtm_pyramid(
+                        occupancy_obs=occupancy_obs,
+                        known_free=known_free,
+                        unknown=unknown,
+                    )
+                else:
+                    centered_power_by_index = {
+                        int(idx): int(self._centered_power_for_scale(
+                            size=int(size),
+                            window_size=int(self.global_window_sizes[int(idx)]),
+                        ))
+                        for idx, size in enumerate(self.global_sizes)
+                    }
+                    boundary_dirty_by_power = self._build_boundary_dtm_pyramid_to_power(
+                        occupancy_obs=occupancy_obs,
+                        known_free=known_free,
+                        unknown=unknown,
+                        max_power=max(centered_power_by_index.values()),
+                    )
                 if self._profile_enabled:
                     self._profile_add("dtm_boundary_pyramid", perf_counter() - t0)
             else:
@@ -2667,18 +3056,63 @@ class HybridLocalGlobalCPPObservationBuilder:
 
         t0 = perf_counter() if self._profile_enabled else 0.0
         out: Dict[str, np.ndarray] = {"local": local.astype(np.float32)}
-        for size in self.global_sizes:
-            global_base = self._build_global_base(
-                size=int(size),
-                known_free=known_free,
-                known_obstacle=known_obstacle,
-                explored=explored,
-                frontier=frontier,
-                robot_pos=robot_pos,
-            )
+        for idx, size in enumerate(self.global_sizes):
+            if self.global_view_mode in {"centered", "viewport"}:
+                window_size = int(self.global_window_sizes[idx])
+                block_align = max(1, window_size // max(1, int(size)))
+                global_base = self._build_window_global_base(
+                    size=int(size),
+                    window_size=window_size,
+                    view_mode=self.global_view_mode,
+                    known_free=known_free,
+                    known_obstacle=known_obstacle,
+                    unknown=unknown,
+                    explored=explored,
+                    frontier=frontier,
+                    robot_pos=robot_pos,
+                    block_align=block_align,
+                )
+            else:
+                window_size = 0
+                block_align = 1
+                global_base = self._build_global_base(
+                    size=int(size),
+                    known_free=known_free,
+                    known_obstacle=known_obstacle,
+                    explored=explored,
+                    frontier=frontier,
+                    robot_pos=robot_pos,
+                )
             global_channels = [global_base]
             if self.include_dtm:
-                if int(size) in boundary_power_by_size:
+                if self.global_view_mode in {"centered", "viewport"} and int(idx) in centered_power_by_index:
+                    global_channels.append(
+                        self._build_window_global_dtm_from_boundary(
+                            size=int(size),
+                            window_size=window_size,
+                            view_mode=self.global_view_mode,
+                            power=centered_power_by_index[int(idx)],
+                            dirty_by_power=boundary_dirty_by_power,
+                            robot_pos=robot_pos,
+                            map_shape=occupancy_obs.shape,
+                        )
+                    )
+                elif self.global_view_mode in {"centered", "viewport"}:
+                    if dtm_fine is None or state_fine is None:
+                        raise RuntimeError("DTM fine state was not initialized")
+                    global_channels.append(
+                        self._build_window_global_dtm_from_fine(
+                            size=int(size),
+                            window_size=window_size,
+                            view_mode=self.global_view_mode,
+                            dtm_fine=dtm_fine,
+                            state_fine=state_fine,
+                            unknown=unknown,
+                            robot_pos=robot_pos,
+                            block_align=block_align,
+                        )
+                    )
+                elif int(size) in boundary_power_by_size:
                     global_channels.append(
                         self._build_global_dtm_from_boundary(
                             size=int(size),

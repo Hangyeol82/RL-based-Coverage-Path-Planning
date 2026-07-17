@@ -269,6 +269,29 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--global-coarse-size", type=int, default=16, help="Deprecated; use --global-coarse-sizes.")
     p.add_argument("--global-coarse-sizes", type=str, default="64,32,16")
     p.add_argument(
+        "--global-view-mode",
+        type=str,
+        default="full",
+        choices=[
+            "full",
+            "centered",
+            "viewport",
+            "clamped",
+            "clamped_centered",
+            "shifted",
+            "robot_centered",
+            "centered_pyramid",
+            "compact",
+        ],
+        help="Hybrid global map mode forwarded to run_ppo_sb3_paper.py.",
+    )
+    p.add_argument(
+        "--global-window-sizes",
+        type=str,
+        default="",
+        help="Centered hybrid global original-map window spans, e.g. 64,96,128.",
+    )
+    p.add_argument(
         "--model-size",
         type=str,
         default="xlarge",
@@ -885,6 +908,10 @@ def _build_run_cmd(
         str(int(args.global_coarse_size)),
         "--global-coarse-sizes",
         str(args.global_coarse_sizes),
+        "--global-view-mode",
+        str(args.global_view_mode),
+        "--global-window-sizes",
+        str(args.global_window_sizes),
         "--model-size",
         args.model_size,
         "--dtm-coarse-mode",

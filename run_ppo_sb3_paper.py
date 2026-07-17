@@ -303,6 +303,36 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--global-coarse-size", type=int, default=16, help="Deprecated; use --global-coarse-sizes.")
     p.add_argument("--global-coarse-sizes", type=str, default="64,32,16")
     p.add_argument(
+        "--global-view-mode",
+        type=str,
+        default="full",
+        choices=[
+            "full",
+            "centered",
+            "viewport",
+            "clamped",
+            "clamped_centered",
+            "shifted",
+            "robot_centered",
+            "centered_pyramid",
+            "compact",
+        ],
+        help=(
+            "Hybrid global map mode. full summarizes the whole known map at each "
+            "scale; centered summarizes robot-centered windows set by "
+            "--global-window-sizes."
+        ),
+    )
+    p.add_argument(
+        "--global-window-sizes",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated original-map window spans for centered hybrid globals, "
+            "one per --global-coarse-sizes entry, e.g. 64,96,128."
+        ),
+    )
+    p.add_argument(
         "--model-size",
         type=str,
         default="xlarge",
@@ -474,6 +504,29 @@ def _parse_global_coarse_sizes(raw: str) -> Tuple[int, ...]:
         raise ValueError("--global-coarse-sizes must contain at least one size")
     if any(v <= 0 for v in vals):
         raise ValueError("--global-coarse-sizes values must be positive")
+    return tuple(vals)
+
+
+def _parse_global_window_sizes(raw: str, *, global_sizes: Tuple[int, ...]) -> Tuple[int, ...]:
+    s = str(raw).strip()
+    if not s:
+        return ()
+    vals = []
+    for tok in s.split(","):
+        t = tok.strip()
+        if not t:
+            continue
+        vals.append(int(t))
+    if len(vals) != len(global_sizes):
+        raise ValueError(
+            "--global-window-sizes must contain one value per --global-coarse-sizes entry "
+            f"(expected {len(global_sizes)}, got {len(vals)})"
+        )
+    if any(v <= 0 for v in vals):
+        raise ValueError("--global-window-sizes values must be positive")
+    for out_size, window_size in zip(global_sizes, vals):
+        if int(window_size) < int(out_size):
+            raise ValueError("--global-window-sizes values must be >= paired --global-coarse-sizes")
     return tuple(vals)
 
 
@@ -754,6 +807,15 @@ def main():
     start = _pick_start(grid)
     local_blocks = _parse_local_blocks(args.local_blocks)
     global_coarse_sizes = _parse_global_coarse_sizes(args.global_coarse_sizes)
+    global_view_mode = str(args.global_view_mode).strip().lower()
+    global_view_mode = "centered" if global_view_mode in {"robot_centered", "centered_pyramid", "compact"} else global_view_mode
+    global_view_mode = "viewport" if global_view_mode in {"clamped", "clamped_centered", "shifted"} else global_view_mode
+    global_window_sizes = _parse_global_window_sizes(
+        args.global_window_sizes,
+        global_sizes=global_coarse_sizes,
+    )
+    if global_view_mode in {"centered", "viewport"} and not global_window_sizes:
+        raise ValueError("--global-window-sizes is required when --global-view-mode is centered/viewport")
 
     reward_cfg = CPPRewardConfig(
         new_cell_reward=0.7,
@@ -801,6 +863,8 @@ def main():
             local_crop_size=int(args.local_crop_size),
             global_coarse_size=int(args.global_coarse_size),
             global_coarse_sizes=global_coarse_sizes,
+            global_view_mode=global_view_mode,
+            global_window_sizes=global_window_sizes,
             unknown_policy=str(args.obs_unknown_policy),
             dtm_patch_size=7,
             dtm_connectivity=int(args.dtm_connectivity),
@@ -1042,7 +1106,8 @@ def main():
         print(
             "Hybrid observation:"
             f" local_channels={local_channels}, local_crop={int(args.local_crop_size)}x{int(args.local_crop_size)},"
-            f" global_scales=[{global_desc}]"
+            f" global_view={global_view_mode}, global_scales=[{global_desc}]"
+            + (f", global_windows={global_window_sizes}" if global_window_sizes else "")
         )
     else:
         print(f"Map observation channels by level: {level_channels}")
