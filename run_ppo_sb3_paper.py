@@ -333,6 +333,38 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--hybrid-global-encoder-mode",
+        type=str,
+        default="independent",
+        choices=["independent", "sgcnn"],
+        help=(
+            "Global encoder used when --maps-encoder-mode=hybrid_local_global. "
+            "independent keeps one CNN per global scale; sgcnn applies scale-grouped CNN."
+        ),
+    )
+    p.add_argument(
+        "--hybrid-sgcnn-target-size",
+        type=int,
+        default=16,
+        help="Target H/W used when --hybrid-global-encoder-mode=sgcnn.",
+    )
+    p.add_argument(
+        "--hybrid-dtm-embed-mode",
+        type=str,
+        default="concat",
+        choices=["concat", "conv1x1"],
+        help=(
+            "How DTM channels are fed to the hybrid global encoder. concat uses raw "
+            "DTM channels; conv1x1 projects only DTM channels before concatenation."
+        ),
+    )
+    p.add_argument(
+        "--hybrid-dtm-embed-channels",
+        type=int,
+        default=3,
+        help="Number of projected DTM channels for --hybrid-dtm-embed-mode=conv1x1.",
+    )
+    p.add_argument(
         "--model-size",
         type=str,
         default="xlarge",
@@ -528,6 +560,20 @@ def _parse_global_window_sizes(raw: str, *, global_sizes: Tuple[int, ...]) -> Tu
         if int(window_size) < int(out_size):
             raise ValueError("--global-window-sizes values must be >= paired --global-coarse-sizes")
     return tuple(vals)
+
+
+def _dtm_output_channel_count(mode: str) -> int:
+    mode_s = str(mode).strip().lower()
+    mode_s = "axis2" if mode_s == "two" else mode_s
+    if mode_s in {"six", "extent6", "port6"}:
+        return 6
+    if mode_s == "axis2":
+        return 2
+    if mode_s in {"axis2km", "four"}:
+        return 4
+    if mode_s == "port12":
+        return 12
+    raise ValueError(f"Unsupported dtm_output_mode for channel count: {mode}")
 
 
 def _model_preset(model_size: str) -> Dict[str, object]:
@@ -928,6 +974,7 @@ def main():
             int(np.asarray(hybrid_obs[f"global_{size}"], dtype=np.float32).shape[0])
             for size in global_coarse_sizes
         )
+        hybrid_dtm_channels = _dtm_output_channel_count(args.dtm_output_mode) if args.include_dtm else 0
         encoder_cfg = HybridLocalGlobalEncoderConfig(
             local_in_channels=local_channels,
             global_in_channels=global_channels,
@@ -935,6 +982,14 @@ def main():
             conv_channels=model_cfg["conv_channels"],
             local_embed_dim=int(model_cfg["level_embed_dim"]),
             global_embed_dim=int(model_cfg["level_embed_dim"]),
+            global_encoder_mode=str(args.hybrid_global_encoder_mode),
+            sgcnn_target_hw=(
+                int(args.hybrid_sgcnn_target_size),
+                int(args.hybrid_sgcnn_target_size),
+            ),
+            dtm_channels=int(hybrid_dtm_channels),
+            dtm_embed_mode=str(args.hybrid_dtm_embed_mode),
+            dtm_embed_channels=int(args.hybrid_dtm_embed_channels),
             robot_state=RobotStateEncoderConfig(
                 input_dim=robot_state_dim,
                 hidden_dims=model_cfg["state_hidden_dims"],
@@ -1108,6 +1163,14 @@ def main():
             f" local_channels={local_channels}, local_crop={int(args.local_crop_size)}x{int(args.local_crop_size)},"
             f" global_view={global_view_mode}, global_scales=[{global_desc}]"
             + (f", global_windows={global_window_sizes}" if global_window_sizes else "")
+        )
+        print(
+            "Hybrid encoder:"
+            f" global_mode={args.hybrid_global_encoder_mode},"
+            f" sgcnn_target={int(args.hybrid_sgcnn_target_size)}x{int(args.hybrid_sgcnn_target_size)},"
+            f" dtm_embed={args.hybrid_dtm_embed_mode},"
+            f" dtm_channels={int(hybrid_dtm_channels)},"
+            f" dtm_embed_channels={int(args.hybrid_dtm_embed_channels)}"
         )
     else:
         print(f"Map observation channels by level: {level_channels}")

@@ -292,6 +292,35 @@ def _parse_args() -> argparse.Namespace:
         help="Centered hybrid global original-map window spans, e.g. 64,96,128.",
     )
     p.add_argument(
+        "--hybrid-global-encoder-mode",
+        type=str,
+        default="independent",
+        choices=["independent", "sgcnn"],
+        help=(
+            "Hybrid global encoder forwarded to run_ppo_sb3_paper.py. "
+            "independent uses one CNN per global scale; sgcnn uses grouped scale CNN."
+        ),
+    )
+    p.add_argument(
+        "--hybrid-sgcnn-target-size",
+        type=int,
+        default=16,
+        help="Target H/W for hybrid SGCNN global encoder.",
+    )
+    p.add_argument(
+        "--hybrid-dtm-embed-mode",
+        type=str,
+        default="concat",
+        choices=["concat", "conv1x1"],
+        help="DTM embedding mode forwarded to run_ppo_sb3_paper.py.",
+    )
+    p.add_argument(
+        "--hybrid-dtm-embed-channels",
+        type=int,
+        default=3,
+        help="Projected DTM channels for --hybrid-dtm-embed-mode=conv1x1.",
+    )
+    p.add_argument(
         "--model-size",
         type=str,
         default="xlarge",
@@ -912,6 +941,14 @@ def _build_run_cmd(
         str(args.global_view_mode),
         "--global-window-sizes",
         str(args.global_window_sizes),
+        "--hybrid-global-encoder-mode",
+        str(args.hybrid_global_encoder_mode),
+        "--hybrid-sgcnn-target-size",
+        str(int(args.hybrid_sgcnn_target_size)),
+        "--hybrid-dtm-embed-mode",
+        str(args.hybrid_dtm_embed_mode),
+        "--hybrid-dtm-embed-channels",
+        str(int(args.hybrid_dtm_embed_channels)),
         "--model-size",
         args.model_size,
         "--dtm-coarse-mode",
