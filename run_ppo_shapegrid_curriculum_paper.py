@@ -324,7 +324,7 @@ def _parse_args() -> argparse.Namespace:
         "--model-size",
         type=str,
         default="xlarge",
-        choices=["small", "large", "xlarge", "paper41", "paper41_xxl"],
+        choices=["small", "large", "xlarge", "paper41", "paper41_xxl", "paper41_max"],
         help="Forwarded to run_ppo_sb3_paper.py encoder size preset.",
     )
     p.add_argument(

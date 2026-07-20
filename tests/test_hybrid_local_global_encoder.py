@@ -15,6 +15,14 @@ def _inputs(global_channels: int):
     )
 
 
+def _inputs_for_sizes(global_channels: int, sizes: tuple[int, ...]):
+    return (
+        torch.randn(2, 5, 41, 41),
+        {size: torch.randn(2, global_channels, size, size) for size in sizes},
+        torch.randn(2, 50),
+    )
+
+
 def _config(**kwargs) -> HybridLocalGlobalEncoderConfig:
     base = dict(
         local_in_channels=5,
@@ -115,3 +123,34 @@ def test_hybrid_encoder_paper41_stride_local_branch_outputs_9x9_feature() -> Non
     assert encoder.local_encoder_mode == "paper41_stride"
     assert encoder.local_encoder.spatial_hw == (9, 9)
     assert encoder.local_encoder.proj.in_features == 8 * 9 * 9
+
+
+def test_hybrid_encoder_viewport_paper41_local_and_sgcnn_global_forward_shape() -> None:
+    sizes = (32, 16, 12, 8)
+    encoder = HybridLocalGlobalEncoder(
+        _config(
+            global_in_channels=(10, 10, 10, 10),
+            global_sizes=sizes,
+            global_encoder_mode="sgcnn",
+            sgcnn_target_hw=(16, 16),
+            local_encoder_mode="paper41_stride",
+            local_conv_channels=(4, 6, 8),
+            local_input_hw=(41, 41),
+            local_embed_dim=20,
+            global_embed_dim=12,
+            dtm_channels=6,
+            dtm_embed_mode="conv1x1",
+            dtm_embed_channels=3,
+        )
+    )
+    local_map, global_maps, robot_state = _inputs_for_sizes(global_channels=10, sizes=sizes)
+
+    out = encoder(local_map, global_maps, robot_state)
+
+    assert out.shape == (2, 32)
+    assert encoder.local_encoder_mode == "paper41_stride"
+    assert encoder.local_encoder.spatial_hw == (9, 9)
+    assert encoder.global_encoder_mode == "sgcnn"
+    assert encoder.global_encoder_in_channels == (7, 7, 7, 7)
+    assert encoder.global_sgcnn is not None
+    assert encoder.global_sgcnn.output_dim == 4 * 12

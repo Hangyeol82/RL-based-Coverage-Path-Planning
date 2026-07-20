@@ -368,7 +368,7 @@ def _parse_args() -> argparse.Namespace:
         "--model-size",
         type=str,
         default="xlarge",
-        choices=["small", "large", "xlarge", "paper41", "paper41_xxl"],
+        choices=["small", "large", "xlarge", "paper41", "paper41_xxl", "paper41_max"],
         help="Policy encoder size preset.",
     )
     mask_group = p.add_mutually_exclusive_group()
@@ -577,6 +577,20 @@ def _dtm_output_channel_count(mode: str) -> int:
 
 
 def _model_preset(model_size: str) -> Dict[str, object]:
+    if model_size == "paper41_max":
+        return dict(
+            conv_channels=(96, 192),
+            level_embed_dim=384,
+            local_conv_channels=(64, 128, 128),
+            global_conv_channels=(96, 192),
+            local_encoder_mode="paper41_stride",
+            local_pool_hw=(9, 9),
+            local_embed_dim=1024,
+            global_embed_dim=384,
+            state_hidden_dims=(384, 384),
+            fusion_hidden_dims=(3072, 1536, 1024),
+            policy_net_arch=(768, 512),
+        )
     if model_size == "paper41_xxl":
         return dict(
             conv_channels=(64, 128),
