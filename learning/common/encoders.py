@@ -50,6 +50,11 @@ class HybridLocalGlobalEncoderConfig:
     global_in_channels: Union[int, Tuple[int, ...]] = 3
     global_sizes: Tuple[int, ...] = (64, 32, 16)
     conv_channels: Tuple[int, ...] = (16, 32)
+    local_conv_channels: Optional[Tuple[int, ...]] = None
+    global_conv_channels: Optional[Tuple[int, ...]] = None
+    local_encoder_mode: str = "pool"
+    local_input_hw: Tuple[int, int] = (41, 41)
+    local_pool_hw: Tuple[int, int] = (1, 1)
     local_embed_dim: int = 64
     global_embed_dim: int = 64
     # "independent" keeps one CNN branch per global scale.
@@ -67,10 +72,18 @@ class HybridLocalGlobalEncoderConfig:
 
 
 class _LevelCNNBranch(nn.Module):
-    def __init__(self, in_channels: int, conv_channels: Sequence[int], out_dim: int):
+    def __init__(
+        self,
+        in_channels: int,
+        conv_channels: Sequence[int],
+        out_dim: int,
+        pool_hw: Tuple[int, int] = (1, 1),
+    ):
         super().__init__()
         if len(conv_channels) == 0:
             raise ValueError("conv_channels must contain at least one channel size")
+        if int(pool_hw[0]) <= 0 or int(pool_hw[1]) <= 0:
+            raise ValueError("pool_hw values must be positive")
 
         conv_layers = []
         ch_in = in_channels
@@ -80,14 +93,69 @@ class _LevelCNNBranch(nn.Module):
             ch_in = ch_out
 
         self.conv = nn.Sequential(*conv_layers)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.proj = nn.Linear(ch_in, out_dim)
+        self.pool_hw = (int(pool_hw[0]), int(pool_hw[1]))
+        self.pool = nn.AdaptiveAvgPool2d(self.pool_hw)
+        self.proj = nn.Linear(ch_in * self.pool_hw[0] * self.pool_hw[1], out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Level tensor must be 4D [B,C,H,W], got shape={tuple(x.shape)}")
         h = self.conv(x)
         h = self.pool(h).flatten(1)
+        return self.proj(h)
+
+
+def _conv2d_out_size(size: int, kernel_size: int, stride: int, padding: int, dilation: int = 1) -> int:
+    return ((int(size) + 2 * int(padding) - int(dilation) * (int(kernel_size) - 1) - 1) // int(stride)) + 1
+
+
+class _Paper41StrideCNNBranch(nn.Module):
+    """
+    Local 41x41 encoder inspired by CPP CNN baselines.
+
+    It intentionally keeps a 9x9 spatial feature grid before projection:
+    41x41 -> 41x41 -> 20x20 -> 9x9 for the default local crop.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        conv_channels: Sequence[int],
+        out_dim: int,
+        input_hw: Tuple[int, int] = (41, 41),
+    ):
+        super().__init__()
+        if len(conv_channels) != 3:
+            raise ValueError("paper41 stride branch requires exactly three conv channel sizes")
+        if int(input_hw[0]) <= 0 or int(input_hw[1]) <= 0:
+            raise ValueError("input_hw values must be positive")
+
+        c1, c2, c3 = (int(c) for c in conv_channels)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, c1, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1, c2, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c2, c3, kernel_size=5, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        h, w = (int(input_hw[0]), int(input_hw[1]))
+        h = _conv2d_out_size(h, kernel_size=3, stride=1, padding=1)
+        w = _conv2d_out_size(w, kernel_size=3, stride=1, padding=1)
+        h = _conv2d_out_size(h, kernel_size=4, stride=2, padding=1)
+        w = _conv2d_out_size(w, kernel_size=4, stride=2, padding=1)
+        h = _conv2d_out_size(h, kernel_size=5, stride=2, padding=1)
+        w = _conv2d_out_size(w, kernel_size=5, stride=2, padding=1)
+        if h <= 0 or w <= 0:
+            raise ValueError("paper41 stride branch produced non-positive feature size")
+        self.spatial_hw = (h, w)
+        self.proj = nn.Linear(c3 * h * w, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"local tensor must be 4D [B,C,H,W], got shape={tuple(x.shape)}")
+        h = self.conv(x).flatten(1)
         return self.proj(h)
 
 
@@ -379,13 +447,41 @@ class HybridLocalGlobalEncoder(nn.Module):
             raise ValueError("dtm_embed_channels must be positive")
         if self.config.sgcnn_target_hw[0] <= 0 or self.config.sgcnn_target_hw[1] <= 0:
             raise ValueError("sgcnn_target_hw values must be positive")
+        if self.config.local_pool_hw[0] <= 0 or self.config.local_pool_hw[1] <= 0:
+            raise ValueError("local_pool_hw values must be positive")
+        if self.config.local_input_hw[0] <= 0 or self.config.local_input_hw[1] <= 0:
+            raise ValueError("local_input_hw values must be positive")
+        self.local_encoder_mode = str(self.config.local_encoder_mode).lower().strip()
+        if self.local_encoder_mode not in {"pool", "paper41_stride"}:
+            raise ValueError("local_encoder_mode must be one of {'pool', 'paper41_stride'}")
 
         self.global_encoder_in_channels = self._effective_global_channels(self.global_in_channels)
-        self.local_encoder = _LevelCNNBranch(
-            in_channels=int(self.config.local_in_channels),
-            conv_channels=self.config.conv_channels,
-            out_dim=int(self.config.local_embed_dim),
+        self.local_conv_channels = tuple(
+            int(c) for c in (self.config.local_conv_channels or self.config.conv_channels)
         )
+        self.global_conv_channels = tuple(
+            int(c) for c in (self.config.global_conv_channels or self.config.conv_channels)
+        )
+        if self.local_encoder_mode == "paper41_stride":
+            self.local_encoder = _Paper41StrideCNNBranch(
+                in_channels=int(self.config.local_in_channels),
+                conv_channels=self.local_conv_channels,
+                out_dim=int(self.config.local_embed_dim),
+                input_hw=(
+                    int(self.config.local_input_hw[0]),
+                    int(self.config.local_input_hw[1]),
+                ),
+            )
+        else:
+            self.local_encoder = _LevelCNNBranch(
+                in_channels=int(self.config.local_in_channels),
+                conv_channels=self.local_conv_channels,
+                out_dim=int(self.config.local_embed_dim),
+                pool_hw=(
+                    int(self.config.local_pool_hw[0]),
+                    int(self.config.local_pool_hw[1]),
+                ),
+            )
         self.global_dtm_projectors = nn.ModuleDict()
         if self.dtm_embed_mode == "conv1x1" and self.dtm_channels > 0:
             for size, observed_channels in zip(self.global_sizes, self.global_in_channels):
@@ -404,7 +500,7 @@ class HybridLocalGlobalEncoder(nn.Module):
                 {
                     str(size): _LevelCNNBranch(
                         in_channels=int(channels),
-                        conv_channels=self.config.conv_channels,
+                        conv_channels=self.global_conv_channels,
                         out_dim=int(self.config.global_embed_dim),
                     )
                     for size, channels in zip(self.global_sizes, self.global_encoder_in_channels)
@@ -416,7 +512,7 @@ class HybridLocalGlobalEncoder(nn.Module):
             self.global_sgcnn = _SGCNNGroupedEncoder(
                 num_levels=len(self.global_sizes),
                 in_channels_per_level=self.global_encoder_in_channels,
-                conv_channels=self.config.conv_channels,
+                conv_channels=self.global_conv_channels,
                 level_embed_dim=int(self.config.global_embed_dim),
                 target_hw=(
                     int(self.config.sgcnn_target_hw[0]),

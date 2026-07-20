@@ -368,7 +368,7 @@ def _parse_args() -> argparse.Namespace:
         "--model-size",
         type=str,
         default="xlarge",
-        choices=["small", "large", "xlarge"],
+        choices=["small", "large", "xlarge", "paper41", "paper41_xxl"],
         help="Policy encoder size preset.",
     )
     mask_group = p.add_mutually_exclusive_group()
@@ -577,12 +577,41 @@ def _dtm_output_channel_count(mode: str) -> int:
 
 
 def _model_preset(model_size: str) -> Dict[str, object]:
+    if model_size == "paper41_xxl":
+        return dict(
+            conv_channels=(64, 128),
+            level_embed_dim=256,
+            local_conv_channels=(64, 128, 128),
+            global_conv_channels=(64, 128),
+            local_encoder_mode="paper41_stride",
+            local_pool_hw=(9, 9),
+            local_embed_dim=1024,
+            global_embed_dim=256,
+            state_hidden_dims=(256, 256),
+            fusion_hidden_dims=(2048, 1024),
+            policy_net_arch=(512, 512),
+        )
+    if model_size == "paper41":
+        return dict(
+            conv_channels=(64, 128),
+            level_embed_dim=256,
+            local_conv_channels=(32, 64, 64),
+            global_conv_channels=(64, 128),
+            local_encoder_mode="paper41_stride",
+            local_pool_hw=(9, 9),
+            local_embed_dim=512,
+            global_embed_dim=256,
+            state_hidden_dims=(256, 256),
+            fusion_hidden_dims=(1536, 1024),
+            policy_net_arch=(512, 512),
+        )
     if model_size == "xlarge":
         return dict(
             conv_channels=(64, 128),
             level_embed_dim=256,
             state_hidden_dims=(256, 256),
             fusion_hidden_dims=(1024, 1024),
+            policy_net_arch=(128, 128),
         )
     if model_size == "large":
         return dict(
@@ -590,6 +619,7 @@ def _model_preset(model_size: str) -> Dict[str, object]:
             level_embed_dim=128,
             state_hidden_dims=(128, 128),
             fusion_hidden_dims=(512, 512),
+            policy_net_arch=(128, 128),
         )
     # Legacy default.
     return dict(
@@ -597,6 +627,7 @@ def _model_preset(model_size: str) -> Dict[str, object]:
         level_embed_dim=64,
         state_hidden_dims=(64, 64),
         fusion_hidden_dims=(256, 256),
+        policy_net_arch=(128, 128),
     )
 
 
@@ -980,8 +1011,13 @@ def main():
             global_in_channels=global_channels,
             global_sizes=global_coarse_sizes,
             conv_channels=model_cfg["conv_channels"],
-            local_embed_dim=int(model_cfg["level_embed_dim"]),
-            global_embed_dim=int(model_cfg["level_embed_dim"]),
+            local_conv_channels=model_cfg.get("local_conv_channels"),
+            global_conv_channels=model_cfg.get("global_conv_channels"),
+            local_encoder_mode=str(model_cfg.get("local_encoder_mode", "pool")),
+            local_input_hw=(int(args.local_crop_size), int(args.local_crop_size)),
+            local_pool_hw=model_cfg.get("local_pool_hw", (1, 1)),
+            local_embed_dim=int(model_cfg.get("local_embed_dim", model_cfg["level_embed_dim"])),
+            global_embed_dim=int(model_cfg.get("global_embed_dim", model_cfg["level_embed_dim"])),
             global_encoder_mode=str(args.hybrid_global_encoder_mode),
             sgcnn_target_hw=(
                 int(args.hybrid_sgcnn_target_size),
@@ -1103,7 +1139,10 @@ def main():
     policy_kwargs = dict(
         features_extractor_class=features_extractor_class,
         features_extractor_kwargs=dict(encoder_config=encoder_cfg),
-        net_arch=dict(pi=[128, 128], vf=[128, 128]),
+        net_arch=dict(
+            pi=list(model_cfg.get("policy_net_arch", (128, 128))),
+            vf=list(model_cfg.get("policy_net_arch", (128, 128))),
+        ),
     )
 
     if args.load_model:
@@ -1168,6 +1207,12 @@ def main():
             "Hybrid encoder:"
             f" global_mode={args.hybrid_global_encoder_mode},"
             f" sgcnn_target={int(args.hybrid_sgcnn_target_size)}x{int(args.hybrid_sgcnn_target_size)},"
+            f" local_mode={str(model_cfg.get('local_encoder_mode', 'pool'))},"
+            f" local_conv={tuple(model_cfg.get('local_conv_channels', model_cfg['conv_channels']))},"
+            f" global_conv={tuple(model_cfg.get('global_conv_channels', model_cfg['conv_channels']))},"
+            f" local_reduce_hw={tuple(model_cfg.get('local_pool_hw', (1, 1)))},"
+            f" local_embed={int(model_cfg.get('local_embed_dim', model_cfg['level_embed_dim']))},"
+            f" global_embed={int(model_cfg.get('global_embed_dim', model_cfg['level_embed_dim']))},"
             f" dtm_embed={args.hybrid_dtm_embed_mode},"
             f" dtm_channels={int(hybrid_dtm_channels)},"
             f" dtm_embed_channels={int(args.hybrid_dtm_embed_channels)}"
@@ -1260,7 +1305,15 @@ def main():
     print(
         f"Model size: {args.model_size} | conv={model_cfg['conv_channels']} | "
         f"level_embed={model_cfg['level_embed_dim']} | "
-        f"state={model_cfg['state_hidden_dims']} | fusion={model_cfg['fusion_hidden_dims']}"
+        f"state={model_cfg['state_hidden_dims']} | fusion={model_cfg['fusion_hidden_dims']} | "
+        f"policy={tuple(model_cfg.get('policy_net_arch', (128, 128)))}"
+    )
+    total_params = sum(int(p.numel()) for p in model.policy.parameters())
+    trainable_params = sum(int(p.numel()) for p in model.policy.parameters() if p.requires_grad)
+    feature_dim = getattr(model.policy.features_extractor, "features_dim", "?")
+    print(
+        "Model params:"
+        f" total={total_params:,}, trainable={trainable_params:,}, features_dim={feature_dim}"
     )
     if args.load_model:
         print(f"Init mode: resume PPO from {args.load_model}")

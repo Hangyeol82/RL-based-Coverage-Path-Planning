@@ -78,3 +78,40 @@ def test_hybrid_encoder_sgcnn_without_dtm_keeps_baseline_channels() -> None:
     assert out.shape == (2, 32)
     assert encoder.global_encoder_in_channels == (4, 4, 4)
     assert len(encoder.global_dtm_projectors) == 0
+
+
+def test_hybrid_encoder_local_spatial_pool_preserves_larger_feature_before_projection() -> None:
+    encoder = HybridLocalGlobalEncoder(
+        _config(
+            local_conv_channels=(6, 8),
+            global_conv_channels=(4, 4),
+            local_pool_hw=(3, 3),
+            local_embed_dim=20,
+        )
+    )
+    local_map, global_maps, robot_state = _inputs(global_channels=10)
+
+    out = encoder(local_map, global_maps, robot_state)
+
+    assert out.shape == (2, 32)
+    assert encoder.local_encoder.pool_hw == (3, 3)
+    assert encoder.local_encoder.proj.in_features == 8 * 3 * 3
+
+
+def test_hybrid_encoder_paper41_stride_local_branch_outputs_9x9_feature() -> None:
+    encoder = HybridLocalGlobalEncoder(
+        _config(
+            local_encoder_mode="paper41_stride",
+            local_conv_channels=(4, 6, 8),
+            local_input_hw=(41, 41),
+            local_embed_dim=20,
+        )
+    )
+    local_map, global_maps, robot_state = _inputs(global_channels=10)
+
+    out = encoder(local_map, global_maps, robot_state)
+
+    assert out.shape == (2, 32)
+    assert encoder.local_encoder_mode == "paper41_stride"
+    assert encoder.local_encoder.spatial_hw == (9, 9)
+    assert encoder.local_encoder.proj.in_features == 8 * 9 * 9
