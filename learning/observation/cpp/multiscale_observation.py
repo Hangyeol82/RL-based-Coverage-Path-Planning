@@ -2427,13 +2427,15 @@ class HybridLocalGlobalCPPObservationBuilder:
         self._profile_totals[key] = float(self._profile_totals.get(key, 0.0)) + float(dt)
 
     def _pad_value_for(self, channel: str) -> float:
-        policy = str(self.config.unknown_policy)
+        # Out-of-map cells are fixed boundaries, not unknown map cells. Encode
+        # them as obstacles so edge/corner crops do not look like unexplored
+        # traversable space.
         if channel == "known_free":
-            return 1.0 if policy == "as_free" else 0.0
+            return 0.0
         if channel == "obstacle":
-            return 1.0 if policy == "as_obstacle" else 0.0
+            return 1.0
         if channel == "unknown":
-            return 0.0 if policy in {"as_free", "as_obstacle"} else 1.0
+            return 0.0
         return 0.0
 
     def _apply_unknown_policy(self, occupancy: np.ndarray) -> np.ndarray:
