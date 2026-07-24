@@ -29,6 +29,7 @@ class MultiLevelMAPSEncoderConfig:
     mode: str = "sgcnn"
     # Input levels may have different H/W; SGCNN resizes to this target.
     sgcnn_target_hw: Tuple[int, int] = (7, 7)
+    sgcnn_pool_hw: Tuple[int, int] = (1, 1)
 
 
 @dataclass(frozen=True)
@@ -62,11 +63,13 @@ class HybridLocalGlobalEncoderConfig:
     # grouped convolutions, preserving scale-specific channel groups.
     global_encoder_mode: str = "independent"
     sgcnn_target_hw: Tuple[int, int] = (16, 16)
+    sgcnn_pool_hw: Tuple[int, int] = (1, 1)
     # Optional DTM-only 1x1 projection before the global encoder. The first
     # non-DTM channels stay untouched; the final dtm_channels are projected.
     dtm_channels: int = 0
     dtm_embed_mode: str = "concat"
     dtm_embed_channels: int = 3
+    dtm_branch_embed_dim: int = 128
     robot_state: RobotStateEncoderConfig = field(default_factory=RobotStateEncoderConfig)
     fusion_hidden_dims: Tuple[int, ...] = (256, 256)
 
@@ -192,6 +195,7 @@ class _SGCNNGroupedEncoder(nn.Module):
         conv_channels: Sequence[int],
         level_embed_dim: int,
         target_hw: Tuple[int, int],
+        pool_hw: Tuple[int, int] = (1, 1),
         allow_implicit_channel_padding: bool = False,
     ):
         super().__init__()
@@ -201,6 +205,8 @@ class _SGCNNGroupedEncoder(nn.Module):
             raise ValueError("conv_channels must contain at least one channel size")
         if target_hw[0] <= 0 or target_hw[1] <= 0:
             raise ValueError("sgcnn_target_hw values must be positive")
+        if pool_hw[0] <= 0 or pool_hw[1] <= 0:
+            raise ValueError("sgcnn_pool_hw values must be positive")
 
         self.num_levels = int(num_levels)
         self.level_in_channels = _normalize_level_channels(in_channels_per_level, self.num_levels)
@@ -209,6 +215,7 @@ class _SGCNNGroupedEncoder(nn.Module):
         # fewer observation channels are zero-padded before stacking.
         self.in_channels_per_level = max(self.level_in_channels)
         self.target_hw = (int(target_hw[0]), int(target_hw[1]))
+        self.pool_hw = (int(pool_hw[0]), int(pool_hw[1]))
 
         layers = []
         ch_per_level_in = self.in_channels_per_level
@@ -230,9 +237,15 @@ class _SGCNNGroupedEncoder(nn.Module):
             layers.append(nn.ReLU(inplace=True))
             ch_per_level_in = int(ch_per_level_out)
         self.conv = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.pool = nn.AdaptiveAvgPool2d(self.pool_hw)
         self.proj = nn.ModuleList(
-            [nn.Linear(ch_per_level_in, level_embed_dim) for _ in range(self.num_levels)]
+            [
+                nn.Linear(
+                    ch_per_level_in * self.pool_hw[0] * self.pool_hw[1],
+                    level_embed_dim,
+                )
+                for _ in range(self.num_levels)
+            ]
         )
         self.output_dim = self.num_levels * level_embed_dim
 
@@ -272,8 +285,8 @@ class _SGCNNGroupedEncoder(nn.Module):
 
         stacked = torch.cat(xs, dim=1)  # [B, L*C, H, W]
         h = self.conv(stacked)
-        h = self.pool(h).flatten(1)  # [B, L*C_final]
-        h = h.view(h.shape[0], self.num_levels, -1)  # [B, L, C_final]
+        h = self.pool(h)
+        h = h.view(h.shape[0], self.num_levels, -1)  # [B, L, C_final*pool_h*pool_w]
         emb = [self.proj[i](h[:, i, :]) for i in range(self.num_levels)]
         return torch.cat(emb, dim=1)
 
@@ -323,6 +336,7 @@ class MultiLevelMAPSEncoder(nn.Module):
                 conv_channels=self.config.conv_channels,
                 level_embed_dim=self.config.level_embed_dim,
                 target_hw=self.config.sgcnn_target_hw,
+                pool_hw=self.config.sgcnn_pool_hw,
                 allow_implicit_channel_padding=input_channels_was_uniform,
             )
             self.output_dim = self.sgcnn.output_dim
@@ -440,13 +454,18 @@ class HybridLocalGlobalEncoder(nn.Module):
         if self.dtm_channels < 0:
             raise ValueError("dtm_channels must be non-negative")
         self.dtm_embed_mode = str(self.config.dtm_embed_mode).lower().strip()
-        if self.dtm_embed_mode not in {"concat", "conv1x1"}:
-            raise ValueError("dtm_embed_mode must be one of {'concat', 'conv1x1'}")
+        if self.dtm_embed_mode not in {"concat", "conv1x1", "branch"}:
+            raise ValueError("dtm_embed_mode must be one of {'concat', 'conv1x1', 'branch'}")
         self.dtm_embed_channels = int(self.config.dtm_embed_channels)
         if self.dtm_embed_channels <= 0:
             raise ValueError("dtm_embed_channels must be positive")
+        self.dtm_branch_embed_dim = int(self.config.dtm_branch_embed_dim)
+        if self.dtm_branch_embed_dim <= 0:
+            raise ValueError("dtm_branch_embed_dim must be positive")
         if self.config.sgcnn_target_hw[0] <= 0 or self.config.sgcnn_target_hw[1] <= 0:
             raise ValueError("sgcnn_target_hw values must be positive")
+        if self.config.sgcnn_pool_hw[0] <= 0 or self.config.sgcnn_pool_hw[1] <= 0:
+            raise ValueError("sgcnn_pool_hw values must be positive")
         if self.config.local_pool_hw[0] <= 0 or self.config.local_pool_hw[1] <= 0:
             raise ValueError("local_pool_hw values must be positive")
         if self.config.local_input_hw[0] <= 0 or self.config.local_input_hw[1] <= 0:
@@ -454,6 +473,14 @@ class HybridLocalGlobalEncoder(nn.Module):
         self.local_encoder_mode = str(self.config.local_encoder_mode).lower().strip()
         if self.local_encoder_mode not in {"pool", "paper41_stride"}:
             raise ValueError("local_encoder_mode must be one of {'pool', 'paper41_stride'}")
+        self.dtm_branch_enabled = self.dtm_embed_mode == "branch" and self.dtm_channels > 0
+        if self.dtm_branch_enabled:
+            for observed_channels in self.global_in_channels:
+                if int(observed_channels) <= self.dtm_channels:
+                    raise ValueError(
+                        "global_in_channels must be larger than dtm_channels when "
+                        "dtm_embed_mode='branch'"
+                    )
 
         self.global_encoder_in_channels = self._effective_global_channels(self.global_in_channels)
         self.local_conv_channels = tuple(
@@ -518,6 +545,27 @@ class HybridLocalGlobalEncoder(nn.Module):
                     int(self.config.sgcnn_target_hw[0]),
                     int(self.config.sgcnn_target_hw[1]),
                 ),
+                pool_hw=(
+                    int(self.config.sgcnn_pool_hw[0]),
+                    int(self.config.sgcnn_pool_hw[1]),
+                ),
+                allow_implicit_channel_padding=False,
+            )
+        self.global_dtm_sgcnn = None
+        if self.dtm_branch_enabled:
+            self.global_dtm_sgcnn = _SGCNNGroupedEncoder(
+                num_levels=len(self.global_sizes),
+                in_channels_per_level=(self.dtm_channels,) * len(self.global_sizes),
+                conv_channels=self.global_conv_channels,
+                level_embed_dim=self.dtm_branch_embed_dim,
+                target_hw=(
+                    int(self.config.sgcnn_target_hw[0]),
+                    int(self.config.sgcnn_target_hw[1]),
+                ),
+                pool_hw=(
+                    int(self.config.sgcnn_pool_hw[0]),
+                    int(self.config.sgcnn_pool_hw[1]),
+                ),
                 allow_implicit_channel_padding=False,
             )
         self.state_encoder = RobotStateEncoder(self.config.robot_state)
@@ -526,6 +574,7 @@ class HybridLocalGlobalEncoder(nn.Module):
         fusion_in = (
             int(self.config.local_embed_dim)
             + len(self.global_sizes) * int(self.config.global_embed_dim)
+            + (int(self.global_dtm_sgcnn.output_dim) if self.global_dtm_sgcnn is not None else 0)
             + int(self.state_encoder.output_dim)
         )
         fusion_dims = (fusion_in, *self.config.fusion_hidden_dims)
@@ -533,6 +582,8 @@ class HybridLocalGlobalEncoder(nn.Module):
         self.output_dim = self.config.fusion_hidden_dims[-1]
 
     def _effective_global_channels(self, observed_channels: Tuple[int, ...]) -> Tuple[int, ...]:
+        if self.dtm_embed_mode == "branch" and self.dtm_channels > 0:
+            return tuple(int(c) - self.dtm_channels for c in observed_channels)
         if self.dtm_embed_mode != "conv1x1" or self.dtm_channels == 0:
             return tuple(int(c) for c in observed_channels)
         return tuple(int(c) - self.dtm_channels + self.dtm_embed_channels for c in observed_channels)
@@ -560,6 +611,23 @@ class HybridLocalGlobalEncoder(nn.Module):
         dtm_feat = self.global_dtm_projectors[str(size)](dtm)
         return torch.cat([base, dtm_feat], dim=1)
 
+    def _split_dtm_branch_global_map(
+        self,
+        size: int,
+        global_map: torch.Tensor,
+        expected_channels: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if global_map.ndim != 4:
+            raise ValueError(
+                f"global_map_{size} must be 4D [B,C,H,W], got shape={tuple(global_map.shape)}"
+            )
+        if int(global_map.shape[1]) != int(expected_channels):
+            raise ValueError(
+                f"global_map_{size} expected C={int(expected_channels)}, got C={int(global_map.shape[1])}"
+            )
+        base_channels = int(expected_channels) - self.dtm_channels
+        return global_map[:, :base_channels, :, :], global_map[:, base_channels:, :, :]
+
     def forward(
         self,
         local_map: torch.Tensor,
@@ -570,14 +638,24 @@ class HybridLocalGlobalEncoder(nn.Module):
             raise ValueError(f"local_map must be 4D [B,C,H,W], got shape={tuple(local_map.shape)}")
         local_feat = self.local_encoder(local_map)
         prepared_globals = {}
+        prepared_dtms = {}
         for idx, (size, expected_c) in enumerate(zip(self.global_sizes, self.global_in_channels)):
             if size not in global_maps:
                 raise KeyError(f"Missing global map size {size}")
-            prepared_globals[idx] = self._prepare_global_map(
-                int(size),
-                global_maps[size],
-                int(expected_c),
-            )
+            if self.dtm_branch_enabled:
+                base_map, dtm_map = self._split_dtm_branch_global_map(
+                    int(size),
+                    global_maps[size],
+                    int(expected_c),
+                )
+                prepared_globals[idx] = base_map
+                prepared_dtms[idx] = dtm_map
+            else:
+                prepared_globals[idx] = self._prepare_global_map(
+                    int(size),
+                    global_maps[size],
+                    int(expected_c),
+                )
         if self.global_encoder_mode == "sgcnn":
             if self.global_sgcnn is None:
                 raise RuntimeError("Hybrid SGCNN encoder is not initialized")
@@ -590,6 +668,10 @@ class HybridLocalGlobalEncoder(nn.Module):
                 self.global_encoders[str(size)](prepared_globals[idx])
                 for idx, size in enumerate(self.global_sizes)
             ]
+        if self.global_dtm_sgcnn is not None:
+            global_feats.append(
+                self.global_dtm_sgcnn(prepared_dtms, tuple(range(len(self.global_sizes))))
+            )
         state_feat = self.state_encoder(robot_state)
         fused = torch.cat([local_feat, *global_feats, state_feat], dim=1)
         return self.fusion(fused)

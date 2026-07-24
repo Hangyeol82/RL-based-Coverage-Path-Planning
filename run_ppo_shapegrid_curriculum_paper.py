@@ -308,10 +308,19 @@ def _parse_args() -> argparse.Namespace:
         help="Target H/W for hybrid SGCNN global encoder.",
     )
     p.add_argument(
+        "--hybrid-sgcnn-pool-size",
+        type=int,
+        default=1,
+        help=(
+            "Final adaptive-pool H/W for hybrid SGCNN. Use the target size to "
+            "preserve spatial features."
+        ),
+    )
+    p.add_argument(
         "--hybrid-dtm-embed-mode",
         type=str,
         default="concat",
-        choices=["concat", "conv1x1"],
+        choices=["concat", "conv1x1", "branch"],
         help="DTM embedding mode forwarded to run_ppo_sb3_paper.py.",
     )
     p.add_argument(
@@ -321,10 +330,24 @@ def _parse_args() -> argparse.Namespace:
         help="Projected DTM channels for --hybrid-dtm-embed-mode=conv1x1.",
     )
     p.add_argument(
+        "--hybrid-dtm-branch-embed-dim",
+        type=int,
+        default=128,
+        help="Per-scale DTM branch embedding dimension for --hybrid-dtm-embed-mode=branch.",
+    )
+    p.add_argument(
         "--model-size",
         type=str,
         default="xlarge",
-        choices=["small", "large", "xlarge", "paper41", "paper41_xxl", "paper41_max"],
+        choices=[
+            "small",
+            "large",
+            "xlarge",
+            "paper41",
+            "paper41_mid",
+            "paper41_xxl",
+            "paper41_max",
+        ],
         help="Forwarded to run_ppo_sb3_paper.py encoder size preset.",
     )
     p.add_argument(
@@ -945,10 +968,14 @@ def _build_run_cmd(
         str(args.hybrid_global_encoder_mode),
         "--hybrid-sgcnn-target-size",
         str(int(args.hybrid_sgcnn_target_size)),
+        "--hybrid-sgcnn-pool-size",
+        str(int(args.hybrid_sgcnn_pool_size)),
         "--hybrid-dtm-embed-mode",
         str(args.hybrid_dtm_embed_mode),
         "--hybrid-dtm-embed-channels",
         str(int(args.hybrid_dtm_embed_channels)),
+        "--hybrid-dtm-branch-embed-dim",
+        str(int(args.hybrid_dtm_branch_embed_dim)),
         "--model-size",
         args.model_size,
         "--dtm-coarse-mode",

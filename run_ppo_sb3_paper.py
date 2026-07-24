@@ -349,13 +349,23 @@ def _parse_args() -> argparse.Namespace:
         help="Target H/W used when --hybrid-global-encoder-mode=sgcnn.",
     )
     p.add_argument(
+        "--hybrid-sgcnn-pool-size",
+        type=int,
+        default=1,
+        help=(
+            "Final adaptive-pool H/W used inside the hybrid SGCNN global encoder. "
+            "Use the target size to preserve spatial features."
+        ),
+    )
+    p.add_argument(
         "--hybrid-dtm-embed-mode",
         type=str,
         default="concat",
-        choices=["concat", "conv1x1"],
+        choices=["concat", "conv1x1", "branch"],
         help=(
             "How DTM channels are fed to the hybrid global encoder. concat uses raw "
-            "DTM channels; conv1x1 projects only DTM channels before concatenation."
+            "DTM channels; conv1x1 projects only DTM channels before concatenation; "
+            "branch sends DTM channels through a separate SGCNN branch."
         ),
     )
     p.add_argument(
@@ -365,10 +375,24 @@ def _parse_args() -> argparse.Namespace:
         help="Number of projected DTM channels for --hybrid-dtm-embed-mode=conv1x1.",
     )
     p.add_argument(
+        "--hybrid-dtm-branch-embed-dim",
+        type=int,
+        default=128,
+        help="Per-scale DTM branch embedding dimension for --hybrid-dtm-embed-mode=branch.",
+    )
+    p.add_argument(
         "--model-size",
         type=str,
         default="xlarge",
-        choices=["small", "large", "xlarge", "paper41", "paper41_xxl", "paper41_max"],
+        choices=[
+            "small",
+            "large",
+            "xlarge",
+            "paper41",
+            "paper41_mid",
+            "paper41_xxl",
+            "paper41_max",
+        ],
         help="Policy encoder size preset.",
     )
     mask_group = p.add_mutually_exclusive_group()
@@ -590,6 +614,20 @@ def _model_preset(model_size: str) -> Dict[str, object]:
             state_hidden_dims=(384, 384),
             fusion_hidden_dims=(3072, 1536, 1024),
             policy_net_arch=(768, 512),
+        )
+    if model_size == "paper41_mid":
+        return dict(
+            conv_channels=(64, 128),
+            level_embed_dim=256,
+            local_conv_channels=(48, 96, 96),
+            global_conv_channels=(64, 128),
+            local_encoder_mode="paper41_stride",
+            local_pool_hw=(9, 9),
+            local_embed_dim=768,
+            global_embed_dim=256,
+            state_hidden_dims=(256, 256),
+            fusion_hidden_dims=(1536, 1024, 512),
+            policy_net_arch=(512, 256),
         )
     if model_size == "paper41_xxl":
         return dict(
@@ -1037,9 +1075,14 @@ def main():
                 int(args.hybrid_sgcnn_target_size),
                 int(args.hybrid_sgcnn_target_size),
             ),
+            sgcnn_pool_hw=(
+                int(args.hybrid_sgcnn_pool_size),
+                int(args.hybrid_sgcnn_pool_size),
+            ),
             dtm_channels=int(hybrid_dtm_channels),
             dtm_embed_mode=str(args.hybrid_dtm_embed_mode),
             dtm_embed_channels=int(args.hybrid_dtm_embed_channels),
+            dtm_branch_embed_dim=int(args.hybrid_dtm_branch_embed_dim),
             robot_state=RobotStateEncoderConfig(
                 input_dim=robot_state_dim,
                 hidden_dims=model_cfg["state_hidden_dims"],
@@ -1221,6 +1264,7 @@ def main():
             "Hybrid encoder:"
             f" global_mode={args.hybrid_global_encoder_mode},"
             f" sgcnn_target={int(args.hybrid_sgcnn_target_size)}x{int(args.hybrid_sgcnn_target_size)},"
+            f" sgcnn_pool={int(args.hybrid_sgcnn_pool_size)}x{int(args.hybrid_sgcnn_pool_size)},"
             f" local_mode={str(model_cfg.get('local_encoder_mode', 'pool'))},"
             f" local_conv={tuple(model_cfg.get('local_conv_channels', model_cfg['conv_channels']))},"
             f" global_conv={tuple(model_cfg.get('global_conv_channels', model_cfg['conv_channels']))},"
@@ -1229,7 +1273,8 @@ def main():
             f" global_embed={int(model_cfg.get('global_embed_dim', model_cfg['level_embed_dim']))},"
             f" dtm_embed={args.hybrid_dtm_embed_mode},"
             f" dtm_channels={int(hybrid_dtm_channels)},"
-            f" dtm_embed_channels={int(args.hybrid_dtm_embed_channels)}"
+            f" dtm_embed_channels={int(args.hybrid_dtm_embed_channels)},"
+            f" dtm_branch_embed={int(args.hybrid_dtm_branch_embed_dim)}"
         )
     else:
         print(f"Map observation channels by level: {level_channels}")

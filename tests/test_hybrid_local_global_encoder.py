@@ -88,6 +88,49 @@ def test_hybrid_encoder_sgcnn_without_dtm_keeps_baseline_channels() -> None:
     assert len(encoder.global_dtm_projectors) == 0
 
 
+def test_hybrid_encoder_sgcnn_spatial_pool_size_preserves_feature_grid() -> None:
+    encoder = HybridLocalGlobalEncoder(
+        _config(
+            global_in_channels=(4, 4, 4),
+            global_encoder_mode="sgcnn",
+            sgcnn_target_hw=(8, 8),
+            sgcnn_pool_hw=(8, 8),
+            dtm_channels=0,
+        )
+    )
+    local_map, global_maps, robot_state = _inputs(global_channels=4)
+
+    out = encoder(local_map, global_maps, robot_state)
+
+    assert out.shape == (2, 32)
+    assert encoder.global_sgcnn is not None
+    assert encoder.global_sgcnn.pool_hw == (8, 8)
+    assert encoder.global_sgcnn.proj[0].in_features == 8 * 8 * 8
+
+
+def test_hybrid_encoder_sgcnn_dtm_branch_splits_base_and_dtm_channels() -> None:
+    encoder = HybridLocalGlobalEncoder(
+        _config(
+            global_encoder_mode="sgcnn",
+            sgcnn_target_hw=(8, 8),
+            sgcnn_pool_hw=(2, 2),
+            dtm_channels=6,
+            dtm_embed_mode="branch",
+            dtm_branch_embed_dim=5,
+        )
+    )
+    local_map, global_maps, robot_state = _inputs(global_channels=10)
+
+    out = encoder(local_map, global_maps, robot_state)
+
+    assert out.shape == (2, 32)
+    assert encoder.global_encoder_in_channels == (4, 4, 4)
+    assert len(encoder.global_dtm_projectors) == 0
+    assert encoder.global_dtm_sgcnn is not None
+    assert encoder.global_dtm_sgcnn.output_dim == 3 * 5
+    assert encoder.fusion[0].in_features == 12 + (3 * 12) + (3 * 5) + 16
+
+
 def test_hybrid_encoder_local_spatial_pool_preserves_larger_feature_before_projection() -> None:
     encoder = HybridLocalGlobalEncoder(
         _config(
