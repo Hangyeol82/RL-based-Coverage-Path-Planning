@@ -222,6 +222,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--milestone-threshold-99", type=float, default=0.99)
     p.add_argument("--milestone-lambda-90", type=float, default=0.2)
     p.add_argument("--milestone-lambda-99", type=float, default=4.0)
+    p.add_argument(
+        "--revisit-penalty",
+        type=float,
+        default=-0.2,
+        help="Penalty applied when stepping onto an already explored free cell.",
+    )
     overlap_group = p.add_mutually_exclusive_group()
     overlap_group.add_argument(
         "--overlap-streak-penalty",
@@ -957,6 +963,7 @@ def main():
         collision_reward=-10.0,
         constant_reward=-0.1,
         constant_reward_always=True,
+        revisit_penalty=float(args.revisit_penalty),
         overlap_streak_enabled=bool(args.overlap_streak_penalty),
         overlap_streak_grace=int(args.overlap_streak_grace),
         overlap_streak_increment=float(args.overlap_streak_increment),

@@ -259,6 +259,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--milestone-threshold-99", type=float, default=0.99)
     p.add_argument("--milestone-lambda-90", type=float, default=0.2)
     p.add_argument("--milestone-lambda-99", type=float, default=4.0)
+    p.add_argument("--revisit-penalty", type=float, default=-0.2)
     p.add_argument(
         "--maps-encoder-mode",
         type=str,
@@ -952,6 +953,8 @@ def _build_run_cmd(
         str(float(args.milestone_lambda_90)),
         "--milestone-lambda-99",
         str(float(args.milestone_lambda_99)),
+        "--revisit-penalty",
+        str(float(args.revisit_penalty)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
         "--local-crop-size",
