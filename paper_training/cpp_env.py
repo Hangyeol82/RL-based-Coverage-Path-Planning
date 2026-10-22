@@ -174,13 +174,60 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         self._paper_loop_or_stagnation_step_count = 0
         self._paper_recent_positions = []
         self._paper_threshold_steps = {0.90: None, 0.95: None, 0.99: None}
+        self._paper_threshold_metric_snapshots = {0.90: None, 0.95: None, 0.99: None}
         self._paper_last_coverage_cells = 0
         self._paper_coverage_auc_sum = 0.0
+        self._paper_reward_total_sum = 0.0
+        self._paper_reward_new_cell_sum = 0.0
+        self._paper_reward_tv_i_sum = 0.0
+        self._paper_reward_tv_g_sum = 0.0
+        self._paper_reward_const_sum = 0.0
+        self._paper_reward_turn_sum = 0.0
+        self._paper_reward_overlap_sum = 0.0
+        self._paper_reward_collision_sum = 0.0
+        self._paper_reward_milestone_sum = 0.0
+        self._paper_reward_hole_sum = 0.0
+        self._paper_reward_revisit_burden_shape_sum = 0.0
+
+    def _threshold_metric_snapshot(self, coverage_ratio: float) -> Dict[str, float]:
+        steps = max(1, int(self.steps))
+        noncollision_steps = max(1, int(self._paper_noncollision_steps))
+        return {
+            "coverage_ratio": float(coverage_ratio),
+            "turn_count": float(self._paper_turn_count),
+            "turn_ratio": float(self._paper_turn_count) / float(steps),
+            "revisit_count": float(self._paper_revisit_count),
+            "revisit_ratio": float(self._paper_revisit_count) / float(noncollision_steps),
+            "overlap_ratio": float(self._paper_revisit_count) / float(steps),
+            "stagnation_step_count": float(self._paper_stagnation_step_count),
+            "loop_step_count": float(self._paper_loop_step_count),
+            "loop_or_stagnation_step_count": float(self._paper_loop_or_stagnation_step_count),
+            "loop_or_stagnation_ratio": (
+                float(self._paper_loop_or_stagnation_step_count) / float(steps)
+            ),
+            "coverage_auc": float(self._paper_coverage_auc_sum) / float(steps),
+            "reward_total_sum": float(self._paper_reward_total_sum),
+            "reward_new_cell_sum": float(self._paper_reward_new_cell_sum),
+            "reward_tv_i_sum": float(self._paper_reward_tv_i_sum),
+            "reward_tv_g_sum": float(self._paper_reward_tv_g_sum),
+            "reward_const_sum": float(self._paper_reward_const_sum),
+            "reward_turn_sum": float(self._paper_reward_turn_sum),
+            "reward_overlap_sum": float(self._paper_reward_overlap_sum),
+            "reward_collision_sum": float(self._paper_reward_collision_sum),
+            "reward_milestone_sum": float(self._paper_reward_milestone_sum),
+            "reward_hole_sum": float(self._paper_reward_hole_sum),
+            "reward_revisit_burden_shape_sum": float(
+                self._paper_reward_revisit_burden_shape_sum
+            ),
+        }
 
     def _update_threshold_steps(self, coverage_ratio: float) -> None:
         for threshold in self._paper_threshold_steps:
             if self._paper_threshold_steps[threshold] is None and float(coverage_ratio) >= threshold:
                 self._paper_threshold_steps[threshold] = int(self.steps)
+                self._paper_threshold_metric_snapshots[threshold] = self._threshold_metric_snapshot(
+                    coverage_ratio
+                )
 
     def _refresh_paper_hole(self) -> np.ndarray:
         if self._paper_hole_calc is None:
@@ -301,6 +348,18 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
             self._paper_recent_positions = self._paper_recent_positions[-self.paper_metric_loop_window :]
         coverage_ratio_now = float(info.get("coverage_ratio", 0.0))
         self._paper_coverage_auc_sum += coverage_ratio_now
+
+        self._paper_reward_total_sum += float(reward)
+        self._paper_reward_new_cell_sum += float(info.get("reward_new_cell", info.get("reward_area", 0.0)))
+        self._paper_reward_tv_i_sum += float(info.get("reward_tv_i", 0.0))
+        self._paper_reward_tv_g_sum += float(info.get("reward_tv_g", 0.0))
+        self._paper_reward_const_sum += float(info.get("reward_const", 0.0))
+        self._paper_reward_turn_sum += float(info.get("reward_turn", 0.0))
+        self._paper_reward_overlap_sum += float(info.get("reward_overlap", 0.0))
+        self._paper_reward_collision_sum += float(info.get("reward_coll", 0.0))
+        self._paper_reward_milestone_sum += float(info.get("reward_milestone", 0.0))
+        self._paper_reward_hole_sum += float(reward_hole)
+        self._paper_reward_revisit_burden_shape_sum += float(reward_revisit_burden_shape)
         self._update_threshold_steps(coverage_ratio_now)
 
         info["hole_risk_up"] = float(pre_risk[0])
@@ -353,6 +412,8 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
         info["loop_detected"] = float(loop_event)
         info["loop_or_stagnation_detected"] = float(loop_event or stagnation_event)
         info["reward_total"] = float(reward)
+        info["reward_total_sum_so_far"] = float(self._paper_reward_total_sum)
+        info["reward_overlap_sum_so_far"] = float(self._paper_reward_overlap_sum)
         if (
             (not done)
             and self.paper_episode_success_threshold < 1.0
@@ -378,11 +439,28 @@ class PaperCPPDiscreteEnv(CPPDiscreteEnv):
                 float(self._paper_loop_or_stagnation_step_count) / float(final_steps)
             )
             info["episode_coverage_auc"] = float(self._paper_coverage_auc_sum) / float(final_steps)
+            info["episode_reward_total_sum"] = float(self._paper_reward_total_sum)
+            info["episode_reward_new_cell_sum"] = float(self._paper_reward_new_cell_sum)
+            info["episode_reward_tv_i_sum"] = float(self._paper_reward_tv_i_sum)
+            info["episode_reward_tv_g_sum"] = float(self._paper_reward_tv_g_sum)
+            info["episode_reward_const_sum"] = float(self._paper_reward_const_sum)
+            info["episode_reward_turn_sum"] = float(self._paper_reward_turn_sum)
+            info["episode_reward_overlap_sum"] = float(self._paper_reward_overlap_sum)
+            info["episode_reward_collision_sum"] = float(self._paper_reward_collision_sum)
+            info["episode_reward_milestone_sum"] = float(self._paper_reward_milestone_sum)
+            info["episode_reward_hole_sum"] = float(self._paper_reward_hole_sum)
+            info["episode_reward_revisit_burden_shape_sum"] = float(
+                self._paper_reward_revisit_burden_shape_sum
+            )
             for suffix, threshold in (("90", 0.90), ("95", 0.95), ("99", 0.99)):
                 step_hit = self._paper_threshold_steps[threshold]
                 success = step_hit is not None
                 info[f"episode_success_{suffix}"] = float(success)
                 info[f"episode_step_to_{suffix}"] = float(step_hit) if success else float("nan")
+                snapshot = self._paper_threshold_metric_snapshots[threshold]
+                if success and snapshot is not None:
+                    for metric_key, metric_value in snapshot.items():
+                        info[f"episode_{metric_key}_to_{suffix}"] = float(metric_value)
         return obs, float(reward), bool(done), info
 
 

@@ -32,6 +32,7 @@ class PaperMetricsCallback(BaseCallback):
         "reward_area",
         "reward_tv_i",
         "reward_tv_g",
+        "reward_sg_tv",
         "reward_coll",
         "reward_const",
         "reward_turn",
@@ -40,10 +41,21 @@ class PaperMetricsCallback(BaseCallback):
         "reward_hole",
         "reward_revisit_burden_shape",
         "reward_total",
+        "semi_global_tv_old",
+        "semi_global_tv_new",
+        "semi_global_tv_delta",
+        "semi_global_tv_normalized",
+        "semi_global_tv_clipped",
+        "semi_global_tv_recent_new_cells",
+        "semi_global_tv_gate_new_cells",
+        "semi_global_tv_active_cells",
         "offline_full_map",
         "offline_known_ratio",
         "coverage_ratio",
         "collision",
+        "invalid_action",
+        "invalid_action_penalized",
+        "invalid_action_penalty",
         "turn_event",
         "turn_ratio",
         "revisit_ratio",
@@ -62,6 +74,8 @@ class PaperMetricsCallback(BaseCallback):
         "heuristic_active",
         "heuristic_selected",
         "heuristic_overridden",
+        "heuristic_policy_handoff_reset",
+        "heuristic_sgtv_reset_after_rescue",
         "heuristic_path_found",
         "heuristic_no_progress_streak_before",
         "heuristic_no_progress_streak",
@@ -96,10 +110,47 @@ class PaperMetricsCallback(BaseCallback):
         "episode_revisit_ratio",
         "episode_overlap_ratio",
         "episode_coverage_auc",
+        "episode_reward_total_sum",
+        "episode_reward_new_cell_sum",
+        "episode_reward_tv_i_sum",
+        "episode_reward_tv_g_sum",
+        "episode_reward_sg_tv_sum",
+        "episode_reward_const_sum",
+        "episode_reward_turn_sum",
+        "episode_reward_overlap_sum",
+        "episode_reward_collision_sum",
+        "episode_reward_milestone_sum",
+        "episode_reward_hole_sum",
+        "episode_reward_revisit_burden_shape_sum",
         "episode_stagnation_step_count",
         "episode_loop_step_count",
         "episode_loop_or_stagnation_step_count",
         "episode_loop_or_stagnation_ratio",
+    )
+    THRESHOLD_EPISODE_KEYS: Sequence[str] = (
+        "coverage_ratio",
+        "turn_count",
+        "turn_ratio",
+        "revisit_count",
+        "revisit_ratio",
+        "overlap_ratio",
+        "stagnation_step_count",
+        "loop_step_count",
+        "loop_or_stagnation_step_count",
+        "loop_or_stagnation_ratio",
+        "coverage_auc",
+        "reward_total_sum",
+        "reward_new_cell_sum",
+        "reward_tv_i_sum",
+        "reward_tv_g_sum",
+        "reward_sg_tv_sum",
+        "reward_const_sum",
+        "reward_turn_sum",
+        "reward_overlap_sum",
+        "reward_collision_sum",
+        "reward_milestone_sum",
+        "reward_hole_sum",
+        "reward_revisit_burden_shape_sum",
     )
     TREND_KEYS: Sequence[str] = (
         "episode_final_coverage_ratio",
@@ -111,6 +162,12 @@ class PaperMetricsCallback(BaseCallback):
         "step_to_99",
         "episode_turn_ratio",
         "episode_overlap_ratio",
+        "overlap_ratio_to_95",
+        "overlap_ratio_to_99",
+        "turn_ratio_to_95",
+        "turn_ratio_to_99",
+        "revisit_ratio_to_95",
+        "revisit_ratio_to_99",
         "episode_coverage_auc",
         "episode_loop_or_stagnation_ratio",
     )
@@ -199,6 +256,14 @@ class PaperMetricsCallback(BaseCallback):
                         if np.isfinite(val):
                             episode_vals[f"step_to_{suffix}"] = val
                             self._episode[step_key].append(val)
+                    for metric_key in self.THRESHOLD_EPISODE_KEYS:
+                        info_key = f"episode_{metric_key}_to_{suffix}"
+                        if info_key in info:
+                            val = float(info[info_key])
+                            if np.isfinite(val):
+                                out_key = f"{metric_key}_to_{suffix}"
+                                episode_vals[out_key] = val
+                                self._episode[info_key].append(val)
                 group_items = (
                     ("family", info.get("map_family", "unknown")),
                     ("generator", info.get("map_generator", "unknown")),
@@ -270,6 +335,13 @@ class PaperMetricsCallback(BaseCallback):
                     rec[f"step_to_{suffix}_count"] = float(len(step_vals))
                     self.logger.record(f"paper_metrics/success_{suffix}", rec[f"success_{suffix}"])
                     self.logger.record(f"paper_metrics/step_to_{suffix}", rec[f"step_to_{suffix}"])
+                for metric_key in self.THRESHOLD_EPISODE_KEYS:
+                    episode_key = f"episode_{metric_key}_to_{suffix}"
+                    out_key = f"{metric_key}_to_{suffix}"
+                    vals = self._episode.get(episode_key, [])
+                    if vals:
+                        rec[out_key] = self._mean(vals)
+                        self.logger.record(f"paper_metrics/{out_key}", rec[out_key])
 
             for kind, groups in self._episode_group.items():
                 for token, metrics in sorted(groups.items()):
@@ -311,6 +383,7 @@ class PaperMetricsCallback(BaseCallback):
             "rollouts": self.history,
             "step_mean_keys": list(self.STEP_MEAN_KEYS),
             "episode_mean_keys": list(self.EPISODE_MEAN_KEYS),
+            "threshold_episode_keys": list(self.THRESHOLD_EPISODE_KEYS),
             "thresholds": [0.90, 0.95, 0.99],
         }
         with p.open("w", encoding="utf-8") as f:
@@ -319,6 +392,11 @@ class PaperMetricsCallback(BaseCallback):
     def save_csv(self, path: str):
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
+        threshold_keys = []
+        for suffix in ("90", "95", "99"):
+            threshold_keys.extend(
+                f"{metric_key}_to_{suffix}" for metric_key in self.THRESHOLD_EPISODE_KEYS
+            )
         base_keys = [
             "rollout",
             "timesteps",
@@ -335,6 +413,7 @@ class PaperMetricsCallback(BaseCallback):
             "success_99",
             "step_to_99",
             "step_to_99_count",
+            *threshold_keys,
         ]
         extra = sorted({k for row in self.history for k in row.keys() if k not in base_keys})
         keys = base_keys + extra

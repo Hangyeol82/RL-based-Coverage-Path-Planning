@@ -20,10 +20,22 @@ class CPPRewardConfig:
     local_tv_reward_scale: float = 1.0
     local_tv_reward_max: float = 5.0
     local_tv_normalizer: float = 2.5
+    local_tv_new_cell_only: bool = True
 
     global_tv_reward_scale: float = 0.0
     global_tv_reward_max: float = 5.0
     global_tv_normalizer: float = 4.0
+    # Short-horizon, POMDP-aware coverage-shape regularizer. The env computes
+    # the TV change over the union of recent local observation windows and adds
+    # it separately as reward_sg_tv.
+    semi_global_tv_reward_scale: float = 0.0
+    semi_global_tv_horizon: int = 32
+    # If positive, use this shorter horizon only for the min-new-cells gate.
+    # 0 preserves the legacy behavior: gate over semi_global_tv_horizon.
+    semi_global_tv_gate_horizon: int = 0
+    semi_global_tv_clip: float = 2.0
+    semi_global_tv_window_size: int = 41
+    semi_global_tv_min_new_cells: int = 1
     # Legacy switch: apply attenuation on TV gradients across edges touching obstacles.
     tv_exclude_obstacle_edges: bool = True
     # Attenuation factor for obstacle-touching edges in TV.
@@ -72,6 +84,7 @@ class CPPRewardInput:
     global_tv: float
     coverage_pixels: float
     collided: bool = False
+    collision_reward_override: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -124,11 +137,12 @@ def compute_cpp_reward(inp: CPPRewardInput, cfg: CPPRewardConfig) -> CPPRewardBr
     if not collided:
         reward_cell = float(cfg.new_cell_reward) if newly_visited > 0.0 else 0.0
 
-        tv_diff = float(inp.local_tv_new) - float(inp.local_tv_old)
-        reward_tv_i = -tv_diff
-        reward_tv_i /= max(1e-8, float(cfg.local_tv_normalizer))
-        reward_tv_i *= float(cfg.local_tv_reward_scale)
-        reward_tv_i = _signed_clip(reward_tv_i, cfg.local_tv_reward_max)
+        if newly_visited > 0.0:
+            tv_diff = float(inp.local_tv_new) - float(inp.local_tv_old)
+            reward_tv_i = -tv_diff
+            reward_tv_i /= max(1e-8, float(cfg.local_tv_normalizer))
+            reward_tv_i *= float(cfg.local_tv_reward_scale)
+            reward_tv_i = _signed_clip(reward_tv_i, cfg.local_tv_reward_max)
 
         coverage_pixels = max(1.0, float(inp.coverage_pixels))
         reward_tv_g = -float(inp.global_tv)
@@ -137,7 +151,14 @@ def compute_cpp_reward(inp: CPPRewardInput, cfg: CPPRewardConfig) -> CPPRewardBr
         reward_tv_g *= float(cfg.global_tv_reward_scale)
         reward_tv_g = _signed_clip(reward_tv_g, cfg.global_tv_reward_max)
 
-    reward_coll = float(cfg.collision_reward) if collided else 0.0
+    if collided:
+        reward_coll = (
+            float(inp.collision_reward_override)
+            if inp.collision_reward_override is not None
+            else float(cfg.collision_reward)
+        )
+    else:
+        reward_coll = 0.0
     reward_const = (
         float(cfg.constant_reward)
         if cfg.constant_reward_always or newly_visited <= 0.0

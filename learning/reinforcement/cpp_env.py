@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 from collections import deque
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -15,6 +16,7 @@ from learning.observation import (
     RobotStateObservationBuilder,
     RobotStateObservationConfig,
 )
+from learning.observation.cpp.grid_features import center_crop_with_pad
 from .reward import (
     CPPRewardBreakdown,
     CPPRewardConfig,
@@ -44,11 +46,17 @@ class CPPDiscreteEnvConfig:
     stop_on_full_coverage: bool = True
     include_dtm: bool = False
     tv_mode: str = "sym-iso"
+    local_tv_mode: str = "patch"
     local_tv_patch_radius: int = 3
     # Known-map safety mask (online-safe):
     # - invalid: out-of-bounds or known obstacle (1)
     # - valid: known free (0) or unknown (-1)
     use_action_mask: bool = False
+    # shield: replace invalid known-map actions with a valid fallback.
+    # penalty: keep the requested invalid action, leave the robot in place, and
+    # apply invalid_action_penalty through the collision reward term.
+    action_mask_mode: str = "shield"
+    invalid_action_penalty: float = -1.0
     # Optional robot-state augmentation from multi-scale DTM at robot's current cell.
     # Per level: [can_exit_up, can_exit_right, can_exit_down, can_exit_left]
     # Optional validity flag can be appended per level.
@@ -72,6 +80,21 @@ class CPPDiscreteEnvConfig:
     heuristic_no_progress_threshold: int = 50
     heuristic_min_coverage: float = 0.0
     heuristic_max_astar_expansions: int = 0
+    heuristic_turn_cost: float = 0.0
+    heuristic_revisit_cost: float = 0.0
+    # v2 matches the local-trap rescue trigger used by offline evaluation.
+    # It combines hard no-new-cell timeout, period-2 oscillation, and local
+    # known-uncovered exhaustion. "simple" preserves the legacy behavior.
+    heuristic_trigger_mode: str = "simple"
+    heuristic_period2_enabled: bool = True
+    heuristic_period2_recent_new_window: int = 4
+    heuristic_period2_streak: int = 2
+    heuristic_same_cell_enabled: bool = True
+    heuristic_same_cell_stall: int = 12
+    heuristic_late_local_radius: int = 0
+    heuristic_late_local_max_uncovered: int = 0
+    heuristic_reset_sgtv_after_rescue: bool = False
+    heuristic_reset_policy_state_after_rescue: bool = False
 
     maps_observation_mode: str = "multiscale"
     observation: MultiScaleCPPObservationConfig = field(
@@ -114,6 +137,10 @@ class CPPDiscreteEnv:
         mode = str(cfg.maps_observation_mode).strip().lower()
         if mode not in {"multiscale", "hybrid_local_global"}:
             raise ValueError("maps_observation_mode must be one of {'multiscale', 'hybrid_local_global'}")
+        action_mask_mode = str(cfg.action_mask_mode).strip().lower()
+        if action_mask_mode not in {"shield", "penalty"}:
+            raise ValueError("action_mask_mode must be one of {'shield', 'penalty'}")
+        self._action_mask_mode = action_mask_mode
 
         self.true_map = grid
         self.rows, self.cols = grid.shape
@@ -155,6 +182,11 @@ class CPPDiscreteEnv:
         self._default_start = self._resolve_start(start_pos)
         self.known_map = np.full_like(self.true_map, fill_value=-1, dtype=np.int32)
         self.explored = np.zeros_like(self.true_map, dtype=bool)
+        self.coverage_time_map = np.full_like(self.true_map, fill_value=-1, dtype=np.int32)
+        self._sgtv_window_counts = np.zeros_like(self.true_map, dtype=np.int16)
+        self._sgtv_window_deque: Deque[Tuple[int, int, int, int]] = deque(
+            maxlen=max(1, int(self.config.reward.semi_global_tv_horizon)),
+        )
         self.current_pos: GridPos = self._default_start
         self.prev_pos: Optional[GridPos] = None
         self.prev_action: Optional[int] = None
@@ -182,6 +214,11 @@ class CPPDiscreteEnv:
         self._heuristic_no_progress_streak = 0
         self._heuristic_cached_actions: Deque[int] = deque()
         self._heuristic_cached_target: Optional[GridPos] = None
+        self._heuristic_v2_new_events: Deque[int] = deque(maxlen=32)
+        self._heuristic_period2_streak = 0
+        self._heuristic_same_cell_stall = 0
+        self._heuristic_trigger_reason = "none"
+        self._heuristic_rescue_selected_previous_step = False
 
         self.reset()
 
@@ -213,13 +250,14 @@ class CPPDiscreteEnv:
         c1 = min(self.cols - 1, cc + rng)
         self.known_map[r0 : r1 + 1, c0 : c1 + 1] = self.true_map[r0 : r1 + 1, c0 : c1 + 1]
 
-    def _mark_explored(self, pos: GridPos) -> float:
+    def _mark_explored(self, pos: GridPos, *, step_index: Optional[int] = None) -> float:
         rr, cc = pos
         if self.true_map[rr, cc] != 0:
             return 0.0
         if self.explored[rr, cc]:
             return 0.0
         self.explored[rr, cc] = True
+        self.coverage_time_map[rr, cc] = int(self.steps if step_index is None else step_index)
         return 1.0
 
     def _coverage_ratio(self) -> float:
@@ -277,19 +315,24 @@ class CPPDiscreteEnv:
         return (self.known_map == 1).astype(np.float32)
 
     def _local_patch(self, arr: np.ndarray, center: GridPos, radius: int) -> np.ndarray:
-        rr, cc = center
-        r0 = max(0, rr - radius)
-        r1 = min(self.rows, rr + radius + 1)
-        c0 = max(0, cc - radius)
-        c1 = min(self.cols, cc + radius + 1)
-        return arr[r0:r1, c0:c1]
+        size = max(1, int(radius) * 2 + 1)
+        return center_crop_with_pad(arr, center, size, size, pad_value=0.0)
 
     def _compute_local_tv(self, center: GridPos) -> float:
-        radius = max(0, int(self.config.local_tv_patch_radius))
         cov = self._coverage_map_float()
         obs = self._known_obstacle_map_float()
-        cov_local = self._local_patch(cov, center, radius)
-        obs_local = self._local_patch(obs, center, radius)
+        return self._compute_local_tv_from_maps(cov, obs, center)
+
+    def _compute_local_tv_from_maps(
+        self,
+        coverage_map: np.ndarray,
+        obstacle_map: np.ndarray,
+        center: GridPos,
+    ) -> float:
+        radius = max(0, int(self.config.local_tv_patch_radius))
+        cov_local = self._local_patch(coverage_map, center, radius)
+        size = max(1, radius * 2 + 1)
+        obs_local = center_crop_with_pad(obstacle_map, center, size, size, pad_value=1.0)
         return float(
             total_variation(
                 cov_local,
@@ -300,6 +343,38 @@ class CPPDiscreteEnv:
                 obstacle_edge_weight=float(self.config.reward.tv_obstacle_edge_weight),
             )
         )
+
+    def _compute_incremental_edge_tv_delta(
+        self,
+        coverage_before: np.ndarray,
+        coverage_after: np.ndarray,
+        obstacle_map: np.ndarray,
+        center: GridPos,
+    ) -> float:
+        rr, cc = center
+        if not (0 <= rr < self.rows and 0 <= cc < self.cols):
+            return 0.0
+        if obstacle_map[rr, cc] > 0.5:
+            return 0.0
+
+        before_center = bool(coverage_before[rr, cc] > 0.5)
+        after_center = bool(coverage_after[rr, cc] > 0.5)
+        if before_center == after_center:
+            return 0.0
+
+        before_edges = 0.0
+        after_edges = 0.0
+        for dr, dc in ACTION_TO_DELTA.values():
+            nr, nc = rr + dr, cc + dc
+            if not (0 <= nr < self.rows and 0 <= nc < self.cols):
+                continue
+            if obstacle_map[nr, nc] > 0.5:
+                continue
+            before_neighbor = bool(coverage_before[nr, nc] > 0.5)
+            after_neighbor = bool(coverage_after[nr, nc] > 0.5)
+            before_edges += float(before_center != before_neighbor)
+            after_edges += float(after_center != after_neighbor)
+        return float(after_edges - before_edges)
 
     def _compute_global_tv(self) -> float:
         cov = self._coverage_map_float()
@@ -314,6 +389,171 @@ class CPPDiscreteEnv:
                 obstacle_edge_weight=float(self.config.reward.tv_obstacle_edge_weight),
             )
         )
+
+    def _sgtv_window_bounds(self, center: GridPos) -> Tuple[int, int, int, int]:
+        size = max(1, int(self.config.reward.semi_global_tv_window_size))
+        radius = max(0, size // 2)
+        rr, cc = center
+        r0 = max(0, int(rr) - radius)
+        r1 = min(self.rows, int(rr) + radius + 1)
+        c0 = max(0, int(cc) - radius)
+        c1 = min(self.cols, int(cc) + radius + 1)
+        return r0, r1, c0, c1
+
+    def _reset_semi_global_tv_state(self) -> None:
+        if self.coverage_time_map.shape != self.true_map.shape:
+            self.coverage_time_map = np.full_like(self.true_map, fill_value=-1, dtype=np.int32)
+        else:
+            self.coverage_time_map.fill(-1)
+        if self._sgtv_window_counts.shape != self.true_map.shape:
+            self._sgtv_window_counts = np.zeros_like(self.true_map, dtype=np.int16)
+        else:
+            self._sgtv_window_counts.fill(0)
+        self._sgtv_window_deque = deque(
+            maxlen=max(1, int(self.config.reward.semi_global_tv_horizon)),
+        )
+
+    def _reset_policy_handoff_state_after_rescue(self) -> None:
+        """Expose a fresh policy state after a completed heuristic route."""
+        self.prev_pos = None
+        self.prev_action = None
+        self.recent_actions.clear()
+
+    def _push_semi_global_tv_window(self, center: GridPos) -> None:
+        bounds = self._sgtv_window_bounds(center)
+        if self._sgtv_window_deque.maxlen is not None and len(self._sgtv_window_deque) >= self._sgtv_window_deque.maxlen:
+            old_r0, old_r1, old_c0, old_c1 = self._sgtv_window_deque[0]
+            self._sgtv_window_counts[old_r0:old_r1, old_c0:old_c1] -= 1
+        self._sgtv_window_deque.append(bounds)
+        r0, r1, c0, c1 = bounds
+        self._sgtv_window_counts[r0:r1, c0:c1] += 1
+
+    def _semi_global_tv_union_bounds(self) -> Optional[Tuple[int, int, int, int]]:
+        if not self._sgtv_window_deque:
+            return None
+        r0 = min(b[0] for b in self._sgtv_window_deque)
+        r1 = max(b[1] for b in self._sgtv_window_deque)
+        c0 = min(b[2] for b in self._sgtv_window_deque)
+        c1 = max(b[3] for b in self._sgtv_window_deque)
+        if r0 >= r1 or c0 >= c1:
+            return None
+        return int(r0), int(r1), int(c0), int(c1)
+
+    def _masked_tv_non_iso(
+        self,
+        coverage: np.ndarray,
+        active_mask: np.ndarray,
+        obstacle_mask: np.ndarray,
+    ) -> float:
+        x = np.asarray(coverage, dtype=np.float32)
+        active = np.asarray(active_mask, dtype=bool)
+        obs = np.asarray(obstacle_mask, dtype=bool)
+        if x.shape != active.shape or x.shape != obs.shape:
+            raise ValueError("coverage, active_mask, and obstacle_mask must have the same shape")
+        if x.size == 0:
+            return 0.0
+
+        diff_v = np.abs(x[1:, :] - x[:-1, :])
+        diff_h = np.abs(x[:, 1:] - x[:, :-1])
+        valid_v = active[1:, :] & active[:-1, :]
+        valid_h = active[:, 1:] & active[:, :-1]
+        touches_obs_v = obs[1:, :] | obs[:-1, :]
+        touches_obs_h = obs[:, 1:] | obs[:, :-1]
+        w = float(np.clip(float(self.config.reward.tv_obstacle_edge_weight), 0.0, 1.0))
+        weight_v = np.where(touches_obs_v, w, 1.0)
+        weight_h = np.where(touches_obs_h, w, 1.0)
+        return float(np.sum(diff_v * valid_v * weight_v) + np.sum(diff_h * valid_h * weight_h))
+
+    def _compute_semi_global_tv_reward(
+        self,
+        *,
+        curr_step_index: int,
+        collided: bool,
+    ) -> Dict[str, float]:
+        cfg = self.config.reward
+        scale = float(cfg.semi_global_tv_reward_scale)
+        horizon = max(1, int(cfg.semi_global_tv_horizon))
+        gate_horizon_raw = int(getattr(cfg, "semi_global_tv_gate_horizon", 0))
+        gate_horizon = horizon if gate_horizon_raw <= 0 else max(1, gate_horizon_raw)
+        clip_abs = max(0.0, float(cfg.semi_global_tv_clip))
+
+        def zero_info(
+            *,
+            recent_new: float = 0.0,
+            gate_new: float = 0.0,
+            active_cells: float = 0.0,
+        ) -> Dict[str, float]:
+            return {
+                "reward_sg_tv": 0.0,
+                "semi_global_tv_old": 0.0,
+                "semi_global_tv_new": 0.0,
+                "semi_global_tv_delta": 0.0,
+                "semi_global_tv_normalized": 0.0,
+                "semi_global_tv_clipped": 0.0,
+                "semi_global_tv_recent_new_cells": float(recent_new),
+                "semi_global_tv_gate_new_cells": float(gate_new),
+                "semi_global_tv_active_cells": float(active_cells),
+            }
+
+        if scale == 0.0 or clip_abs == 0.0 or bool(collided):
+            return zero_info()
+
+        bounds = self._semi_global_tv_union_bounds()
+        if bounds is None:
+            return zero_info()
+
+        r0, r1, c0, c1 = bounds
+        active = self._sgtv_window_counts[r0:r1, c0:c1] > 0
+        active_cells = int(np.count_nonzero(active))
+        if active_cells <= 0:
+            return zero_info()
+
+        time_slice = self.coverage_time_map[r0:r1, c0:c1]
+        old_step = int(curr_step_index) - int(horizon)
+        gate_old_step = int(curr_step_index) - int(gate_horizon)
+        old_cov = ((time_slice >= 0) & (time_slice <= old_step) & active).astype(np.float32)
+        new_cov = ((time_slice >= 0) & (time_slice <= int(curr_step_index)) & active).astype(np.float32)
+        recent_new = int(
+            np.count_nonzero(
+                (time_slice >= 0)
+                & (time_slice > old_step)
+                & (time_slice <= int(curr_step_index))
+                & active
+            )
+        )
+        gate_new = int(
+            np.count_nonzero(
+                (time_slice >= 0)
+                & (time_slice > gate_old_step)
+                & (time_slice <= int(curr_step_index))
+                & active
+            )
+        )
+        if gate_new < max(1, int(cfg.semi_global_tv_min_new_cells)):
+            return zero_info(
+                recent_new=float(recent_new),
+                gate_new=float(gate_new),
+                active_cells=float(active_cells),
+            )
+
+        obs = self._known_obstacle_map_float()[r0:r1, c0:c1] > 0.5
+        tv_old = self._masked_tv_non_iso(old_cov, active, obs)
+        tv_new = self._masked_tv_non_iso(new_cov, active, obs)
+        delta = float(tv_new - tv_old)
+        normalized = delta / float(max(1, recent_new))
+        clipped = float(np.clip(normalized, -clip_abs, clip_abs))
+        reward = -scale * clipped
+        return {
+            "reward_sg_tv": float(reward),
+            "semi_global_tv_old": float(tv_old),
+            "semi_global_tv_new": float(tv_new),
+            "semi_global_tv_delta": float(delta),
+            "semi_global_tv_normalized": float(normalized),
+            "semi_global_tv_clipped": float(clipped),
+            "semi_global_tv_recent_new_cells": float(recent_new),
+            "semi_global_tv_gate_new_cells": float(gate_new),
+            "semi_global_tv_active_cells": float(active_cells),
+        }
 
     def _build_observation(self) -> Dict[str, object]:
         t_total = perf_counter() if self._profile_observation else 0.0
@@ -399,6 +639,11 @@ class CPPDiscreteEnv:
             robot_pos=self.current_pos,
             prev_pos=self.prev_pos,
             recent_actions=list(self.recent_actions),
+            action_mask=(
+                self.get_action_mask().astype(np.float32)
+                if bool(getattr(self.config.robot_state, "include_action_mask", False))
+                else None
+            ),
             recent_new_coverage=list(self.recent_new_coverage),
             extra_features=robot_extra_features,
         )
@@ -656,6 +901,41 @@ class CPPDiscreteEnv:
     def _heuristic_should_activate(self) -> bool:
         if not bool(self.config.heuristic_assist_enabled):
             return False
+        self._heuristic_trigger_reason = "none"
+        if str(self.config.heuristic_trigger_mode).strip().lower() == "v2":
+            window = max(1, int(self.config.heuristic_period2_recent_new_window))
+            recent_new = int(sum(list(self._heuristic_v2_new_events)[-window:]))
+            reasons: List[str] = []
+            if int(self._heuristic_no_progress_streak) >= int(self.config.heuristic_no_progress_threshold):
+                reasons.append("no_new_timeout")
+            if (
+                bool(self.config.heuristic_period2_enabled)
+                and
+                len(self._heuristic_v2_new_events) >= window
+                and recent_new == 0
+                and int(self._heuristic_period2_streak) >= int(self.config.heuristic_period2_streak)
+            ):
+                reasons.append("period2")
+            if (
+                bool(self.config.heuristic_same_cell_enabled)
+                and
+                len(self._heuristic_v2_new_events) >= 32
+                and int(sum(list(self._heuristic_v2_new_events)[-32:])) == 0
+                and int(self._heuristic_same_cell_stall) >= int(self.config.heuristic_same_cell_stall)
+            ):
+                reasons.append("same_cell")
+            radius = int(self.config.heuristic_late_local_radius)
+            if radius > 0 and self._coverage_ratio() >= float(self.config.heuristic_min_coverage):
+                rr, cc = self.current_pos
+                r0, r1 = max(0, rr - radius), min(self.rows, rr + radius + 1)
+                c0, c1 = max(0, cc - radius), min(self.cols, cc + radius + 1)
+                local_uncovered = int(np.count_nonzero(
+                    (self.known_map[r0:r1, c0:c1] == 0) & (~self.explored[r0:r1, c0:c1])
+                ))
+                if local_uncovered <= int(self.config.heuristic_late_local_max_uncovered):
+                    reasons.append("late_local_exhausted")
+            self._heuristic_trigger_reason = "+".join(reasons) if reasons else "none"
+            return bool(reasons)
         threshold = int(self.config.heuristic_no_progress_threshold)
         if threshold <= 0:
             return False
@@ -753,41 +1033,32 @@ class CPPDiscreteEnv:
         if max_expansions <= 0:
             max_expansions = int(self.rows * self.cols)
 
-        seen = np.zeros((self.rows, self.cols), dtype=bool)
-        seen[sr, sc] = True
-        parent: Dict[GridPos, GridPos] = {}
-        queue: Deque[GridPos] = deque([(int(sr), int(sc))])
-
-        found: Optional[GridPos] = None
-        expansions = 0
-        while queue and expansions < max_expansions:
-            r, c = queue.popleft()
-            expansions += 1
-            if (r, c) != (sr, sc) and bool(target_mask[r, c]):
-                found = (int(r), int(c))
-                break
-
-            for _, (dr, dc) in ACTION_TO_DELTA.items():
-                nr, nc = r + dr, c + dc
-                if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
-                    continue
-                if bool(seen[nr, nc]) or (not bool(passable[nr, nc])):
-                    continue
-                seen[nr, nc] = True
-                parent[(int(nr), int(nc))] = (int(r), int(c))
-                queue.append((int(nr), int(nc)))
+        turn_cost = max(0.0, float(self.config.heuristic_turn_cost))
+        revisit_cost = max(0.0, float(self.config.heuristic_revisit_cost))
+        if turn_cost > 0.0 or revisit_cost > 0.0:
+            path, expansions = self._turn_aware_path_to_target(
+                target_mask,
+                passable=passable,
+                max_expansions=max_expansions,
+                turn_cost=turn_cost,
+                revisit_cost=revisit_cost,
+            )
+            stats["search_method"] = "turn_aware_astar"
+        else:
+            path, expansions = self._shortest_low_turn_path_to_target(
+                target_mask,
+                passable=passable,
+                max_expansions=max_expansions,
+            )
+            stats["search_method"] = "bfs_shortest_low_turn"
 
         stats["astar_expansions"] = float(expansions)
-        if found is None:
+        if len(path) <= 1:
             return None, stats
 
-        path: List[GridPos] = [found]
-        cur = found
-        while cur != start:
-            cur = parent.get(cur, start)
-            path.append(cur)
-            if cur == start:
-                break
+        found = path[0]
+
+        path = list(path)
         path.reverse()
         if len(path) <= 1:
             return None, stats
@@ -815,6 +1086,205 @@ class CPPDiscreteEnv:
         stats["target_row"] = float(found[0])
         stats["target_col"] = float(found[1])
         return int(action), stats
+
+    def _bfs_path_to_target(
+        self,
+        target_mask: np.ndarray,
+        *,
+        passable: np.ndarray,
+        max_expansions: int,
+    ) -> Tuple[List[GridPos], int]:
+        start = self.current_pos
+        sr, sc = start
+        seen = np.zeros((self.rows, self.cols), dtype=bool)
+        seen[sr, sc] = True
+        parent: Dict[GridPos, GridPos] = {}
+        queue: Deque[GridPos] = deque([(int(sr), int(sc))])
+
+        found: Optional[GridPos] = None
+        expansions = 0
+        while queue and expansions < int(max_expansions):
+            r, c = queue.popleft()
+            expansions += 1
+            if (r, c) != (sr, sc) and bool(target_mask[r, c]):
+                found = (int(r), int(c))
+                break
+
+            for _, (dr, dc) in ACTION_TO_DELTA.items():
+                nr, nc = r + dr, c + dc
+                if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                    continue
+                if bool(seen[nr, nc]) or (not bool(passable[nr, nc])):
+                    continue
+                seen[nr, nc] = True
+                parent[(int(nr), int(nc))] = (int(r), int(c))
+                queue.append((int(nr), int(nc)))
+
+        if found is None:
+            return [], expansions
+
+        path: List[GridPos] = [found]
+        cur = found
+        while cur != start:
+            cur = parent.get(cur, start)
+            path.append(cur)
+            if cur == start:
+                break
+        return path, expansions
+
+    def _shortest_low_turn_path_to_target(
+        self,
+        target_mask: np.ndarray,
+        *,
+        passable: np.ndarray,
+        max_expansions: int,
+    ) -> Tuple[List[GridPos], int]:
+        """Find a shortest path, breaking equal-length ties by turn count.
+
+        The previous plain BFS kept only one state per cell, so the first
+        path discovered was selected even when another path of the same
+        length had fewer direction changes.  The previous weighted search
+        could instead choose a longer path to avoid turns.  This search uses
+        the lexicographic objective (steps, turns), preserving shortest-path
+        behavior while making tie-breaking turn-aware.
+        """
+        start = self.current_pos
+        sr, sc = start
+        start_prev = -1 if self.prev_action is None else int(self.prev_action)
+        start_state = (int(sr), int(sc), int(start_prev))
+
+        # A cell can need a separate state for each incoming action.  The
+        # expansion budget therefore scales with the number of action states.
+        expansion_limit = max(int(max_expansions), int(self.rows * self.cols * 4))
+        best_key: Dict[Tuple[int, int, int], Tuple[int, int]] = {
+            start_state: (0, 0)
+        }
+        parent: Dict[
+            Tuple[int, int, int], Tuple[int, int, int]
+        ] = {}
+        heap: List[Tuple[int, int, int, int, int, int]] = [
+            (0, 0, 0, int(sr), int(sc), int(start_prev))
+        ]
+        expansions = 0
+        counter = 0
+        found_state: Optional[Tuple[int, int, int]] = None
+
+        while heap and expansions < expansion_limit:
+            steps, turns, _, r, c, prev_action = heapq.heappop(heap)
+            state = (int(r), int(c), int(prev_action))
+            if (int(steps), int(turns)) != best_key.get(state):
+                continue
+            expansions += 1
+
+            if (r, c) != (sr, sc) and bool(target_mask[r, c]):
+                # Heap ordering guarantees the first target is optimal under
+                # (steps, turns), including ties across different headings.
+                found_state = state
+                break
+
+            for action, (dr, dc) in ACTION_TO_DELTA.items():
+                nr, nc = int(r + dr), int(c + dc)
+                if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                    continue
+                if not bool(passable[nr, nc]):
+                    continue
+
+                next_state = (nr, nc, int(action))
+                next_key = (
+                    int(steps) + 1,
+                    int(turns)
+                    + int(int(prev_action) >= 0 and int(action) != int(prev_action)),
+                )
+                if next_key >= best_key.get(next_state, (float("inf"), float("inf"))):
+                    continue
+                best_key[next_state] = next_key
+                parent[next_state] = state
+                counter += 1
+                heapq.heappush(
+                    heap,
+                    (
+                        next_key[0],
+                        next_key[1],
+                        counter,
+                        nr,
+                        nc,
+                        int(action),
+                    ),
+                )
+
+        if found_state is None:
+            return [], expansions
+
+        rev_path: List[GridPos] = [(found_state[0], found_state[1])]
+        cur = found_state
+        while cur != start_state:
+            cur = parent.get(cur, start_state)
+            rev_path.append((int(cur[0]), int(cur[1])))
+            if cur == start_state:
+                break
+        return rev_path, expansions
+
+    def _turn_aware_path_to_target(
+        self,
+        target_mask: np.ndarray,
+        *,
+        passable: np.ndarray,
+        max_expansions: int,
+        turn_cost: float,
+        revisit_cost: float,
+    ) -> Tuple[List[GridPos], int]:
+        start = self.current_pos
+        sr, sc = start
+        start_prev = -1 if self.prev_action is None else int(self.prev_action)
+        start_state = (int(sr), int(sc), int(start_prev))
+        best_cost = {start_state: 0.0}
+        parent: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+        heap: List[Tuple[float, int, int, int, int]] = [(0.0, 0, int(sr), int(sc), int(start_prev))]
+        expansions = 0
+        counter = 0
+        found_state: Optional[Tuple[int, int, int]] = None
+
+        while heap and expansions < int(max_expansions):
+            cost, _, r, c, prev_action = heapq.heappop(heap)
+            state = (int(r), int(c), int(prev_action))
+            if cost > best_cost.get(state, float("inf")):
+                continue
+            expansions += 1
+            if (r, c) != (sr, sc) and bool(target_mask[r, c]):
+                found_state = state
+                break
+
+            for action, (dr, dc) in ACTION_TO_DELTA.items():
+                nr, nc = int(r + dr), int(c + dc)
+                if nr < 0 or nr >= self.rows or nc < 0 or nc >= self.cols:
+                    continue
+                if not bool(passable[nr, nc]):
+                    continue
+                extra = 1.0
+                if int(prev_action) >= 0 and int(action) != int(prev_action):
+                    extra += float(turn_cost)
+                if bool(self.explored[nr, nc]) and not bool(target_mask[nr, nc]):
+                    extra += float(revisit_cost)
+                next_state = (nr, nc, int(action))
+                next_cost = float(cost) + float(extra)
+                if next_cost >= best_cost.get(next_state, float("inf")):
+                    continue
+                best_cost[next_state] = next_cost
+                parent[next_state] = state
+                counter += 1
+                heapq.heappush(heap, (next_cost, counter, nr, nc, int(action)))
+
+        if found_state is None:
+            return [], expansions
+
+        rev_path: List[GridPos] = [(found_state[0], found_state[1])]
+        cur = found_state
+        while cur != start_state:
+            cur = parent.get(cur, start_state)
+            rev_path.append((int(cur[0]), int(cur[1])))
+            if cur == start_state:
+                break
+        return rev_path, expansions
 
     def _nearest_known_uncovered_astar_action(self) -> Tuple[Optional[int], Dict[str, object]]:
         while self._heuristic_cached_actions:
@@ -866,9 +1336,15 @@ class CPPDiscreteEnv:
         self._heuristic_no_progress_streak = 0
         self._heuristic_cached_actions.clear()
         self._heuristic_cached_target = None
+        self._heuristic_v2_new_events.clear()
+        self._heuristic_period2_streak = 0
+        self._heuristic_same_cell_stall = 0
+        self._heuristic_trigger_reason = "none"
+        self._heuristic_rescue_selected_previous_step = False
 
         self.known_map.fill(-1)
         self.explored.fill(False)
+        self._reset_semi_global_tv_state()
         preserve_static_map_cache = bool(self.config.preserve_static_map_observation_cache_on_reset)
         self.maps_builder.reset_incremental_state(preserve_static_map=preserve_static_map_cache)
         if self.hybrid_maps_builder is not None:
@@ -880,7 +1356,8 @@ class CPPDiscreteEnv:
                 preserve_static_map=preserve_static_map_cache,
             )
         self._sense_at(self.current_pos)
-        self._mark_explored(self.current_pos)
+        self._mark_explored(self.current_pos, step_index=0)
+        self._push_semi_global_tv_window(self.current_pos)
 
         self.last_reward = CPPRewardBreakdown(
             area=0.0,
@@ -902,11 +1379,17 @@ class CPPDiscreteEnv:
         action_mask = self.get_action_mask()
         executed_action = requested_action
         action_overridden = False
-        if self.config.use_action_mask and (not bool(action_mask[requested_action])):
+        masked_invalid_action = bool(
+            self.config.use_action_mask and (not bool(action_mask[requested_action]))
+        )
+        invalid_action_penalized = False
+        if masked_invalid_action and self._action_mask_mode == "shield":
             fallback = self._fallback_action_from_mask(action_mask)
             if fallback is not None:
                 executed_action = int(fallback)
                 action_overridden = True
+        elif masked_invalid_action and self._action_mask_mode == "penalty":
+            invalid_action_penalized = True
 
         heuristic_streak_before = int(self._heuristic_no_progress_streak)
         heuristic_active = self._heuristic_should_activate()
@@ -929,6 +1412,8 @@ class CPPDiscreteEnv:
                 heuristic_selected = True
                 heuristic_overridden = int(executed_action) != previous_executed_action
                 action_overridden = bool(action_overridden or heuristic_overridden)
+                if heuristic_overridden:
+                    invalid_action_penalized = False
 
         cr, cc = self.current_pos
         prev_action = self.prev_action
@@ -959,10 +1444,44 @@ class CPPDiscreteEnv:
 
         was_explored = bool(self.explored[self.current_pos]) if not collided else False
         prev_coverage_cells = int(np.count_nonzero(self.explored & self.free_mask))
-        local_tv_old = self._compute_local_tv(self.current_pos)
-        newly_visited = self._mark_explored(self.current_pos)
-        local_tv_new = self._compute_local_tv(self.current_pos)
+        # TV_i compares the same local window before/after this transition.
+        # The window is centered at the post-action robot position, matching
+        # the local observation used to choose the next action.
+        tv_center = self.current_pos
+        coverage_before = self._coverage_map_float()
+        obstacle_snapshot = self._known_obstacle_map_float()
+        curr_step_index = int(self.steps) + 1
+        newly_visited = self._mark_explored(self.current_pos, step_index=curr_step_index)
+        coverage_after = self._coverage_map_float()
+        local_tv_mode = str(self.config.local_tv_mode).strip().lower()
+        if local_tv_mode in {"edge", "incremental_edge", "cell_edge"}:
+            local_tv_old = 0.0
+            local_tv_new = self._compute_incremental_edge_tv_delta(
+                coverage_before,
+                coverage_after,
+                obstacle_snapshot,
+                tv_center,
+            )
+        elif local_tv_mode == "patch":
+            local_tv_old = self._compute_local_tv_from_maps(
+                coverage_before,
+                obstacle_snapshot,
+                tv_center,
+            )
+            local_tv_new = self._compute_local_tv_from_maps(
+                coverage_after,
+                obstacle_snapshot,
+                tv_center,
+            )
+        else:
+            raise ValueError("local_tv_mode must be one of {'patch', 'edge'}")
         global_tv = self._compute_global_tv()
+        self._push_semi_global_tv_window(self.current_pos)
+        semi_global_tv_info = self._compute_semi_global_tv_reward(
+            curr_step_index=curr_step_index,
+            collided=collided,
+        )
+        reward_sg_tv = float(semi_global_tv_info.get("reward_sg_tv", 0.0))
         coverage_cells = int(np.count_nonzero(self.explored & self.free_mask))
         prev_coverage_ratio = float(prev_coverage_cells) / float(max(1, self.free_total))
         curr_coverage_ratio = float(coverage_cells) / float(max(1, self.free_total))
@@ -974,10 +1493,15 @@ class CPPDiscreteEnv:
             global_tv=global_tv,
             coverage_pixels=float(coverage_cells),
             collided=collided,
+            collision_reward_override=(
+                float(self.config.invalid_action_penalty)
+                if collided and invalid_action_penalized
+                else None
+            ),
         )
         base_reward = compute_cpp_reward(rew_in, self.config.reward)
         reward_turn = 0.0
-        if prev_action is not None and executed_action != int(prev_action):
+        if (not collided) and prev_action is not None and executed_action != int(prev_action):
             reward_turn = float(self.config.reward.turn_change_penalty)
 
         overlap_event = (not collided) and was_explored
@@ -1007,7 +1531,13 @@ class CPPDiscreteEnv:
             collided=collided,
         )
 
-        total_reward = float(base_reward.total + reward_turn + reward_overlap + reward_milestone)
+        total_reward = float(
+            base_reward.total
+            + reward_turn
+            + reward_overlap
+            + reward_milestone
+            + reward_sg_tv
+        )
         self.last_reward = CPPRewardBreakdown(
             area=float(base_reward.area),
             tv_local=float(base_reward.tv_local),
@@ -1026,8 +1556,36 @@ class CPPDiscreteEnv:
 
         self.steps += 1
         self.path.append(self.current_pos)
-        self.prev_action = int(executed_action)
-        self.recent_actions.append(int(executed_action))
+        self._heuristic_v2_new_events.append(int((not collided) and float(newly_visited) > 0.0))
+        self._heuristic_rescue_selected_previous_step = bool(heuristic_selected)
+        if len(self.path) >= 3 and self.path[-1] == self.path[-3] and self.path[-1] != self.path[-2]:
+            self._heuristic_period2_streak += 1
+        else:
+            self._heuristic_period2_streak = 0
+        if len(self.path) >= 2 and self.path[-1] == self.path[-2]:
+            self._heuristic_same_cell_stall += 1
+        else:
+            self._heuristic_same_cell_stall = 0
+        recorded_action = -1 if collided else int(executed_action)
+        if not collided:
+            self.prev_action = int(executed_action)
+        self.recent_actions.append(int(recorded_action))
+
+        # A cached route ends once the target is reached (new coverage clears
+        # the remaining cache). Reset before constructing the observation that
+        # is returned to the policy, not after it has already chosen an action.
+        policy_handoff_reset = bool(
+            heuristic_selected
+            and not self._heuristic_cached_actions
+            and bool(self.config.heuristic_reset_policy_state_after_rescue)
+        )
+        sgtv_reset_after_rescue = False
+        if policy_handoff_reset:
+            self._reset_policy_handoff_state_after_rescue()
+            if bool(self.config.heuristic_reset_sgtv_after_rescue):
+                self._reset_semi_global_tv_state()
+                self._push_semi_global_tv_window(self.current_pos)
+                sgtv_reset_after_rescue = True
 
         done_reason = ""
         truncated = False
@@ -1056,10 +1614,21 @@ class CPPDiscreteEnv:
             "action_requested": int(requested_action),
             "action_executed": int(executed_action),
             "action_overridden": bool(action_overridden),
+            "invalid_action": bool(masked_invalid_action),
+            "invalid_action_penalized": bool(collided and invalid_action_penalized),
+            "invalid_action_penalty": (
+                float(self.config.invalid_action_penalty)
+                if collided and invalid_action_penalized
+                else 0.0
+            ),
             "heuristic_assist_enabled": bool(self.config.heuristic_assist_enabled),
+            "heuristic_trigger_mode": str(self.config.heuristic_trigger_mode),
+            "heuristic_trigger_reason": str(self._heuristic_trigger_reason),
             "heuristic_active": bool(heuristic_active),
             "heuristic_selected": bool(heuristic_selected),
             "heuristic_overridden": bool(heuristic_overridden),
+            "heuristic_policy_handoff_reset": bool(policy_handoff_reset),
+            "heuristic_sgtv_reset_after_rescue": bool(sgtv_reset_after_rescue),
             "heuristic_path_found": bool(float(heuristic_stats.get("path_found", 0.0)) > 0.5),
             "heuristic_no_progress_streak_before": int(heuristic_streak_before),
             "heuristic_no_progress_streak": int(self._heuristic_no_progress_streak),
@@ -1077,11 +1646,13 @@ class CPPDiscreteEnv:
             "forced_turn": bool(forced_turn),
             "action_mask_valid_count": int(np.count_nonzero(action_mask)),
             "action_mask": [int(v) for v in action_mask.astype(np.int8)],
+            "recorded_action": int(recorded_action),
             "revisited_cell": bool((not collided) and was_explored),
             "overlap_streak": int(self.overlap_streak),
             "reward_turn": float(reward_turn),
             "reward_overlap": float(reward_overlap),
             "reward_milestone": float(reward_milestone),
+            **semi_global_tv_info,
             "milestone_hit_90_now": bool(milestone_hit_90_now),
             "milestone_hit_99_now": bool(milestone_hit_99_now),
             "milestone_hit_90": bool(self._milestone_hit_90),

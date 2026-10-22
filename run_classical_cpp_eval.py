@@ -62,10 +62,17 @@ def _parse_args() -> argparse.Namespace:
             "nearest_unvisited",
             "frontier_greedy",
             "wall_follow",
+            "ba_star",
             "spiral_stc",
         ],
     )
     p.add_argument("--map-files", type=str, default="", help="Comma-separated txt map files.")
+    p.add_argument(
+        "--map-dir",
+        type=str,
+        default="",
+        help="Directory of txt maps. Used when --map-files is not provided.",
+    )
     p.add_argument("--seeds", type=str, default="1001,1002,1003,1004,1005")
     p.add_argument("--map-size", type=int, default=128)
     p.add_argument("--shapegrid-level", type=int, default=4)
@@ -77,6 +84,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-paths", action="store_true")
     p.add_argument("--save-plots", action="store_true")
     p.add_argument("--lap-width", type=int, default=2, help="C* lap width.")
+    p.add_argument(
+        "--epsilon-global-escape",
+        action="store_true",
+        help="For Epsilon*, keep searching globally instead of stopping when local hierarchical escape fails.",
+    )
     return p.parse_args()
 
 
@@ -149,7 +161,10 @@ def _run_algorithm(args: argparse.Namespace, grid: np.ndarray, start: GridPos) -
             start_node=start,
             sensor_range=int(args.sensor_range),
         )
-        path = planner.run(max_steps=int(args.max_steps))
+        path = planner.run(
+            max_steps=int(args.max_steps),
+            global_escape=bool(args.epsilon_global_escape),
+        )
         return [(int(r), int(c)) for r, c in path], {}
 
     if args.algorithm == "cstar":
@@ -169,7 +184,7 @@ def _run_algorithm(args: argparse.Namespace, grid: np.ndarray, start: GridPos) -
         path = planner.run(max_steps=int(args.max_steps))
         return [(int(r), int(c)) for r, c in path], planner.rcg_stats()
 
-    if args.algorithm in {"nearest_unvisited", "frontier_greedy", "wall_follow", "spiral_stc"}:
+    if args.algorithm in {"nearest_unvisited", "frontier_greedy", "wall_follow", "ba_star", "spiral_stc"}:
         result = run_online_heuristic(
             str(args.algorithm),
             grid,
@@ -202,9 +217,20 @@ def _write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
         "revisit_ratio",
         "overlap_count",
         "overlap_ratio",
+        "turn_count",
+        "turn_ratio",
         "step_to_90",
         "step_to_95",
         "step_to_99",
+        "overlap_ratio_to_90",
+        "overlap_ratio_to_95",
+        "overlap_ratio_to_99",
+        "turn_ratio_to_90",
+        "turn_ratio_to_95",
+        "turn_ratio_to_99",
+        "revisit_ratio_to_90",
+        "revisit_ratio_to_95",
+        "revisit_ratio_to_99",
         "success_90",
         "success_95",
         "success_99",
@@ -247,6 +273,11 @@ def _save_plot(grid: np.ndarray, path: Sequence[GridPos], out_png: Path, title: 
 
 def _maps_from_args(args: argparse.Namespace) -> List[Tuple[str, Optional[int], np.ndarray, str]]:
     map_files = _parse_map_files(str(args.map_files))
+    if not map_files and str(args.map_dir).strip():
+        map_dir = Path(str(args.map_dir)).expanduser().resolve()
+        map_files = sorted(map_dir.glob("*.txt"))
+        if not map_files:
+            raise ValueError(f"No .txt maps found in {map_dir}")
     if map_files:
         out = []
         for path in map_files:

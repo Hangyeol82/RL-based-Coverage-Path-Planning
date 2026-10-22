@@ -29,6 +29,7 @@ class RewardBreakdownCallback(BaseCallback):
         "reward_area",
         "reward_tv_i",
         "reward_tv_g",
+        "reward_sg_tv",
         "reward_coll",
         "reward_const",
         "reward_turn",
@@ -37,6 +38,9 @@ class RewardBreakdownCallback(BaseCallback):
         "reward_total",
         "coverage_ratio",
         "collision",
+        "invalid_action",
+        "invalid_action_penalized",
+        "invalid_action_penalty",
     )
 
     def __init__(self, verbose: int = 0):

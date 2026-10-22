@@ -15,6 +15,7 @@ class RobotStateObservationConfig:
     action_history_len: int = 5
     include_position: bool = True
     include_action_history: bool = True
+    include_action_mask: bool = False
     # Kept for backward-compatible CLI/config construction; ignored in build().
     include_progress: bool = False
     include_stagnation: bool = False
@@ -57,6 +58,15 @@ class RobotStateObservationBuilder:
                         f"{suffix}_left",
                     ]
                 )
+        if self.config.include_action_mask:
+            names.extend(
+                [
+                    "action_mask_up",
+                    "action_mask_right",
+                    "action_mask_down",
+                    "action_mask_left",
+                ]
+            )
         return tuple(names)
 
     def _normalize_position(self, robot_pos: GridPos, shape: Tuple[int, int]) -> np.ndarray:
@@ -127,6 +137,7 @@ class RobotStateObservationBuilder:
         robot_pos: GridPos,
         prev_pos: Optional[GridPos] = None,
         recent_actions: Optional[Sequence[int]] = None,
+        action_mask: Optional[Sequence[float]] = None,
         recent_new_coverage: Optional[Sequence[float]] = None,
         extra_features: Optional[Sequence[float]] = None,
     ) -> np.ndarray:
@@ -155,6 +166,13 @@ class RobotStateObservationBuilder:
                     robot_pos=robot_pos,
                 )
             )
+        if self.config.include_action_mask:
+            if action_mask is None:
+                raise ValueError("action_mask must be provided when include_action_mask=True")
+            mask = np.asarray(list(action_mask), dtype=np.float32).reshape(-1)
+            if mask.shape != (4,):
+                raise ValueError(f"action_mask must have shape (4,), got {mask.shape}")
+            parts.append(mask)
         if parts:
             base = np.concatenate(parts, axis=0).astype(np.float32)
         else:

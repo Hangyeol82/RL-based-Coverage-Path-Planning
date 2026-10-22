@@ -1,8 +1,6 @@
 import heapq
+from collections import deque
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
-from MapGenerator import MapGenerator
 
 
 class EpsilonStarCPP:
@@ -56,44 +54,39 @@ class EpsilonStarCPP:
         t = 1.0 - (col / (width - 1))
         return self.zigzag_min + (self.zigzag_max - self.zigzag_min) * t
 
+    def _zigzag_weights(self, width):
+        if width <= 1:
+            return np.full((1,), float(self.zigzag_max), dtype=float)
+        cols = np.arange(width, dtype=float)
+        t = 1.0 - (cols / float(width - 1))
+        return self.zigzag_min + (self.zigzag_max - self.zigzag_min) * t
+
     def _compute_level0_potential(self, traversable, unexplored):
+        weights = self._zigzag_weights(self.cols)
         pot = np.zeros((self.rows, self.cols), dtype=float)
-        for r in range(self.rows):
-            for c in range(self.cols):
-                if not traversable[r, c]:
-                    pot[r, c] = -1.0
-                elif not unexplored[r, c]:
-                    pot[r, c] = 0.0
-                else:
-                    pot[r, c] = self._zigzag_weight(c, self.cols)
+        pot[unexplored] = np.broadcast_to(weights, pot.shape)[unexplored]
+        pot[~traversable] = -1.0
         return pot
 
     def _compute_level_potential(self, trav_count, unexp_count):
         rows, cols = trav_count.shape
         pot = np.zeros((rows, cols), dtype=float)
-        for r in range(rows):
-            for c in range(cols):
-                if trav_count[r, c] == 0:
-                    pot[r, c] = -1.0
-                else:
-                    ratio = unexp_count[r, c] / trav_count[r, c]
-                    pot[r, c] = ratio * self._zigzag_weight(c, cols)
+        valid = trav_count > 0
+        ratio = np.zeros((rows, cols), dtype=float)
+        np.divide(unexp_count, trav_count, out=ratio, where=valid)
+        pot[valid] = ratio[valid] * np.broadcast_to(self._zigzag_weights(cols), pot.shape)[valid]
+        pot[~valid] = -1.0
         return pot
 
     def _coarsen_sum(self, arr):
         rows, cols = arr.shape
-        # odd size is merged with a single leftover cell (ceil(n/2))
         new_rows = (rows + 1) // 2
         new_cols = (cols + 1) // 2
-        out = np.zeros((new_rows, new_cols), dtype=int)
-        for r in range(new_rows):
-            for c in range(new_cols):
-                r0 = r * 2
-                r1 = min(r0 + 2, rows)
-                c0 = c * 2
-                c1 = min(c0 + 2, cols)
-                out[r, c] = np.sum(arr[r0:r1, c0:c1])
-        return out
+        pad_rows = new_rows * 2 - rows
+        pad_cols = new_cols * 2 - cols
+        if pad_rows or pad_cols:
+            arr = np.pad(arr, ((0, pad_rows), (0, pad_cols)), mode="constant", constant_values=0)
+        return arr.reshape(new_rows, 2, new_cols, 2).sum(axis=(1, 3)).astype(int, copy=False)
 
     def _build_maps(self):
         traversable = self.known_grid != 1
@@ -249,6 +242,122 @@ class EpsilonStarCPP:
         return False
 
     def _coarse_neighbors(self, cell, shape):
+        """Return the 3x3 MAPS neighborhood used by the ETM at level l."""
+        r, c = cell
+        rows, cols = shape
+        result = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    result.append((nr, nc))
+        return result
+
+    def _coarse_cell_candidates(self, coarse_cell, level):
+        """Return positive-potential epsilon cells inside one coarse MAPS cell.
+
+        The paper's I(.) operator selects an unexplored epsilon cell from the
+        selected coarse cell.  We use deterministic potential/distance tie
+        breaking so evaluations are reproducible, while retaining every valid
+        candidate for a reachability check before committing to one.
+        """
+        scale = 2 ** level
+        r0 = coarse_cell[0] * scale
+        r1 = min((coarse_cell[0] + 1) * scale, self.rows)
+        c0 = coarse_cell[1] * scale
+        c1 = min((coarse_cell[1] + 1) * scale, self.cols)
+
+        candidates = []
+        for r in range(r0, r1):
+            for c in range(c0, c1):
+                if self.known_grid[r, c] == 1:
+                    continue
+                potential = float(self.level_maps[0][r, c])
+                if potential > 0.0:
+                    distance = abs(r - self.current_node[0]) + abs(c - self.current_node[1])
+                    candidates.append((potential, -distance, (r, c)))
+        candidates.sort(reverse=True)
+        return [cell for _, _, cell in candidates]
+
+    def _find_escape_plan(self):
+        """Find the lowest-level reachable positive MAPS waypoint and route.
+
+        An ETM transitions through CP1..CPL until it finds a positive coarse
+        cell.  A coarse cell can contain an unreachable pocket after obstacles
+        are observed, so a failed route must advance to the next candidate,
+        rather than terminate coverage.
+        """
+        reachable = self._reachable_tree()
+        max_level = len(self.level_maps) - 1
+        for level in range(1, max_level + 1):
+            coarse = self.level_maps[level]
+            cur_cell = (self.current_node[0] // (2 ** level), self.current_node[1] // (2 ** level))
+            coarse_candidates = [
+                cell for cell in self._coarse_neighbors(cur_cell, coarse.shape)
+                if coarse[cell[0], cell[1]] > 0
+            ]
+            coarse_candidates.sort(
+                key=lambda cell: float(coarse[cell[0], cell[1]]), reverse=True
+            )
+            for coarse_cell in coarse_candidates:
+                for target in self._coarse_cell_candidates(coarse_cell, level):
+                    path = self._path_from_reachable_tree(reachable, target)
+                    if path:
+                        return target, level, path
+        return None
+
+    def _find_global_escape_plan(self):
+        """Final CP_L fallback over all positive cells, with reachability."""
+        reachable = self._reachable_tree()
+        candidates = []
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.known_grid[r, c] == 1:
+                    continue
+                potential = float(self.level_maps[0][r, c])
+                if potential <= 0.0:
+                    continue
+                distance = abs(r - self.current_node[0]) + abs(c - self.current_node[1])
+                candidates.append((potential, -distance, (r, c)))
+        candidates.sort(reverse=True)
+        for _, _, target in candidates:
+            path = self._path_from_reachable_tree(reachable, target)
+            if path:
+                return target, len(self.level_maps) - 1, path
+        return None
+
+    def _reachable_tree(self):
+        """Compute all cells reachable through the currently known free space.
+
+        Unknown cells are treated as traversable, as required by the online
+        MAPS model.  Newly observed obstacles invalidate an in-flight route on
+        the next control cycle.  A single BFS replaces thousands of equivalent
+        A* calls when an ETM searches a high-level coarse cell.
+        """
+        parent = {self.current_node: None}
+        queue = deque([self.current_node])
+        while queue:
+            current = queue.popleft()
+            for neighbor in self._neighbors(current):
+                if neighbor in parent:
+                    continue
+                parent[neighbor] = current
+                queue.append(neighbor)
+        return parent
+
+    def _path_from_reachable_tree(self, parent, target):
+        if target not in parent:
+            return []
+        path = []
+        current = target
+        while current is not None:
+            path.append(current)
+            current = parent[current]
+        path.reverse()
+        return path
+
+    def _legacy_coarse_neighbors(self, cell, shape):
+        """Retained only for compatibility with older external callers."""
         r, c = cell
         rows, cols = shape
         result = []
@@ -302,6 +411,23 @@ class EpsilonStarCPP:
                 return target, level
         return None, None
 
+    def _find_global_escape_target(self):
+        best = None
+        best_key = None
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.known_grid[r, c] == 1 or self.explored[r, c]:
+                    continue
+                val = self.level_maps[0][r, c]
+                if val <= 0:
+                    continue
+                dist = abs(r - self.current_node[0]) + abs(c - self.current_node[1])
+                key = (float(val), -int(dist))
+                if best_key is None or key > best_key:
+                    best = (r, c)
+                    best_key = key
+        return best
+
     def _a_star(self, start, goal):
         if self.known_grid[goal[0], goal[1]] == 1:
             return []
@@ -339,7 +465,7 @@ class EpsilonStarCPP:
         self.current_node = node
         self.path.append(node)
 
-    def run(self, max_steps=None):
+    def run(self, max_steps=None, global_escape=False):
         if max_steps is None:
             max_steps = self.rows * self.cols * 10
 
@@ -375,14 +501,17 @@ class EpsilonStarCPP:
                     continue
 
             if self.etm_state == "CPH":
-                target, level = self._find_escape_target()
-                if target is None:
+                plan = self._find_escape_plan()
+                if plan is None and bool(global_escape):
+                    plan = self._find_global_escape_plan()
+                if plan is None:
+                    # No positive cell is reachable from the known component.
+                    # This is the ETM final state, not a failed single target.
                     break
+                target, level, path = plan
                 self.waypoint = target
                 self.current_level = level
-                self.escape_path = self._a_star(self.current_node, self.waypoint)
-                if not self.escape_path:
-                    break
+                self.escape_path = path
                 self.etm_state = "WT"
 
             if self.etm_state == "WT":
@@ -409,6 +538,9 @@ class EpsilonStarCPP:
 
 
 def visualize_path(grid, path, title="Coverage Path"):
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
     plt.figure(figsize=(11, 10))
     plt.imshow(grid, cmap="binary", origin="upper")
 
@@ -486,6 +618,8 @@ def visualize_path(grid, path, title="Coverage Path"):
 
 
 if __name__ == "__main__":
+    from MapGenerator import MapGenerator
+
     height, width = 20, 20
     seed = 123
 

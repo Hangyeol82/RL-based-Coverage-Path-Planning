@@ -70,6 +70,8 @@ class HybridLocalGlobalEncoderConfig:
     dtm_embed_mode: str = "concat"
     dtm_embed_channels: int = 3
     dtm_branch_embed_dim: int = 128
+    dtm_bypass_lstm: bool = False
+    global_bypass_lstm: bool = False
     robot_state: RobotStateEncoderConfig = field(default_factory=RobotStateEncoderConfig)
     fusion_hidden_dims: Tuple[int, ...] = (256, 256)
 
@@ -462,6 +464,10 @@ class HybridLocalGlobalEncoder(nn.Module):
         self.dtm_branch_embed_dim = int(self.config.dtm_branch_embed_dim)
         if self.dtm_branch_embed_dim <= 0:
             raise ValueError("dtm_branch_embed_dim must be positive")
+        self.dtm_bypass_lstm = bool(self.config.dtm_bypass_lstm)
+        if self.dtm_bypass_lstm and self.dtm_embed_mode != "branch":
+            raise ValueError("dtm_bypass_lstm requires dtm_embed_mode='branch'")
+        self.global_bypass_lstm = bool(self.config.global_bypass_lstm)
         if self.config.sgcnn_target_hw[0] <= 0 or self.config.sgcnn_target_hw[1] <= 0:
             raise ValueError("sgcnn_target_hw values must be positive")
         if self.config.sgcnn_pool_hw[0] <= 0 or self.config.sgcnn_pool_hw[1] <= 0:
@@ -552,6 +558,7 @@ class HybridLocalGlobalEncoder(nn.Module):
                 allow_implicit_channel_padding=False,
             )
         self.global_dtm_sgcnn = None
+        dtm_branch_output_dim = 0
         if self.dtm_branch_enabled:
             self.global_dtm_sgcnn = _SGCNNGroupedEncoder(
                 num_levels=len(self.global_sizes),
@@ -568,18 +575,34 @@ class HybridLocalGlobalEncoder(nn.Module):
                 ),
                 allow_implicit_channel_padding=False,
             )
+            dtm_branch_output_dim = int(self.global_dtm_sgcnn.output_dim)
         self.state_encoder = RobotStateEncoder(self.config.robot_state)
         if len(self.config.fusion_hidden_dims) == 0:
             raise ValueError("fusion_hidden_dims must not be empty")
+        global_output_dim = len(self.global_sizes) * int(self.config.global_embed_dim)
+        recurrent_global_dim = 0 if self.global_bypass_lstm else global_output_dim
+        recurrent_dtm_dim = (
+            0
+            if (self.dtm_bypass_lstm or self.global_bypass_lstm)
+            else dtm_branch_output_dim
+        )
         fusion_in = (
             int(self.config.local_embed_dim)
-            + len(self.global_sizes) * int(self.config.global_embed_dim)
-            + (int(self.global_dtm_sgcnn.output_dim) if self.global_dtm_sgcnn is not None else 0)
+            + recurrent_global_dim
+            + recurrent_dtm_dim
             + int(self.state_encoder.output_dim)
         )
         fusion_dims = (fusion_in, *self.config.fusion_hidden_dims)
         self.fusion = _make_mlp(fusion_dims, last_activation=True)
-        self.output_dim = self.config.fusion_hidden_dims[-1]
+        self.recurrent_output_dim = int(self.config.fusion_hidden_dims[-1])
+        self.global_bypass_dim = global_output_dim if self.global_bypass_lstm else 0
+        self.dtm_bypass_dim = (
+            dtm_branch_output_dim
+            if (self.dtm_bypass_lstm or (self.global_bypass_lstm and self.dtm_branch_enabled))
+            else 0
+        )
+        self.bypass_dim = self.global_bypass_dim + self.dtm_bypass_dim
+        self.output_dim = self.recurrent_output_dim + self.bypass_dim
 
     def _effective_global_channels(self, observed_channels: Tuple[int, ...]) -> Tuple[int, ...]:
         if self.dtm_embed_mode == "branch" and self.dtm_channels > 0:
@@ -668,10 +691,23 @@ class HybridLocalGlobalEncoder(nn.Module):
                 self.global_encoders[str(size)](prepared_globals[idx])
                 for idx, size in enumerate(self.global_sizes)
             ]
+        dtm_feat = None
         if self.global_dtm_sgcnn is not None:
-            global_feats.append(
-                self.global_dtm_sgcnn(prepared_dtms, tuple(range(len(self.global_sizes))))
-            )
+            dtm_feat = self.global_dtm_sgcnn(prepared_dtms, tuple(range(len(self.global_sizes))))
         state_feat = self.state_encoder(robot_state)
+        if self.global_bypass_lstm:
+            recurrent_fused = torch.cat([local_feat, state_feat], dim=1)
+            base_feat = self.fusion(recurrent_fused)
+            bypass_feats = list(global_feats)
+            if dtm_feat is not None:
+                bypass_feats.append(dtm_feat)
+            return torch.cat([base_feat, *bypass_feats], dim=1)
+        if dtm_feat is not None and not self.dtm_bypass_lstm:
+            global_feats.append(dtm_feat)
         fused = torch.cat([local_feat, *global_feats, state_feat], dim=1)
-        return self.fusion(fused)
+        base_feat = self.fusion(fused)
+        if self.dtm_bypass_lstm:
+            if dtm_feat is None:
+                raise RuntimeError("DTM bypass requested but DTM branch features are unavailable")
+            return torch.cat([base_feat, dtm_feat], dim=1)
+        return base_feat

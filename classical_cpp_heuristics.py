@@ -334,6 +334,63 @@ class OnlineGridCPPHeuristics:
 
         return self._result("spiral_stc")
 
+    def run_ba_star(self, max_steps: int) -> HeuristicResult:
+        self.reset()
+        sweep_dir = 1
+
+        for _ in range(int(max_steps)):
+            if self._done():
+                break
+
+            cr, cc = self.current
+            preferred: List[GridPos] = []
+            forward = (cr, cc + sweep_dir)
+            if self._known_free(forward) and forward not in self.explored:
+                preferred.append(forward)
+
+            # At a sweep boundary, move to an adjacent unvisited row, then reverse direction.
+            for dr in (1, -1):
+                vertical = (cr + dr, cc)
+                if self._known_free(vertical) and vertical not in self.explored:
+                    preferred.append(vertical)
+
+            reverse = (cr, cc - sweep_dir)
+            if self._known_free(reverse) and reverse not in self.explored:
+                preferred.append(reverse)
+
+            if preferred:
+                nxt = preferred[0]
+                if nxt[1] == cc:
+                    sweep_dir *= -1
+                self._move_to(nxt)
+                continue
+
+            local = [n for n in self._known_free_neighbors(self.current) if n not in self.explored]
+            if local:
+                local.sort(
+                    key=lambda p: (
+                        int(p[1] == cc + sweep_dir),
+                        self._unknown_gain(p),
+                        -_turn_cost(self.current, p, self.heading),
+                    ),
+                    reverse=True,
+                )
+                self._move_to(local[0])
+                continue
+
+            targets = set(self._known_unvisited_cells())
+            route = self._bfs_to_targets(targets) if targets else []
+            if len(route) <= 1:
+                frontiers = set(self._frontier_cells())
+                route = self._bfs_to_targets(frontiers) if frontiers else []
+                if len(route) <= 1:
+                    break
+                self.frontier_handoff_count += 1
+            self.replan_count += 1
+            self._move_to(route[1])
+
+        return self._result("ba_star")
+
 
 def _turn_cost(current: GridPos, nxt: GridPos, heading: int) -> int:
     cr, cc = current
@@ -364,4 +421,6 @@ def run_online_heuristic(
         return planner.run_wall_follow(max_steps)
     if algorithm == "spiral_stc":
         return planner.run_spiral_stc(max_steps)
+    if algorithm == "ba_star":
+        return planner.run_ba_star(max_steps)
     raise ValueError(f"Unknown online heuristic: {algorithm}")

@@ -45,6 +45,10 @@ from learning.reinforcement.sb3_policy import (
     HybridLocalGlobalFeaturesExtractor,
     MAPSStateFeaturesExtractor,
 )
+try:
+    from learning.reinforcement.sb3_policy import DtmBypassRecurrentMultiInputPolicy
+except ImportError:
+    DtmBypassRecurrentMultiInputPolicy = None
 from paper_training.callbacks import PaperMetricsCallback
 from paper_training.cpp_env import PaperCPPDiscreteEnv, PaperCPPDiscreteGymEnv
 from paper_training.offline_cpp_env import OfflinePaperCPPDiscreteEnv, OfflinePaperCPPDiscreteGymEnv
@@ -99,6 +103,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument(
+        "--recurrent-policy",
+        action="store_true",
+        help=(
+            "Use sb3-contrib RecurrentPPO with MultiInputLstmPolicy. "
+            "Action-mask flags still enable env-side shielding, but action "
+            "probabilities are not masked because RecurrentPPO is not MaskablePPO."
+        ),
+    )
+    p.add_argument("--lstm-hidden-size", type=int, default=256)
+    p.add_argument("--n-lstm-layers", type=int, default=1)
+    shared_lstm_group = p.add_mutually_exclusive_group()
+    shared_lstm_group.add_argument("--shared-lstm", dest="shared_lstm", action="store_true")
+    shared_lstm_group.add_argument("--no-shared-lstm", dest="shared_lstm", action="store_false")
+    critic_lstm_group = p.add_mutually_exclusive_group()
+    critic_lstm_group.add_argument("--critic-lstm", dest="critic_lstm", action="store_true")
+    critic_lstm_group.add_argument("--no-critic-lstm", dest="critic_lstm", action="store_false")
+    p.add_argument(
         "--verbose",
         type=int,
         default=1,
@@ -128,6 +149,9 @@ def _parse_args() -> argparse.Namespace:
     rs_action_group = p.add_mutually_exclusive_group()
     rs_action_group.add_argument("--robot-state-action-history", dest="robot_state_action_history", action="store_true")
     rs_action_group.add_argument("--no-robot-state-action-history", dest="robot_state_action_history", action="store_false")
+    rs_mask_group = p.add_mutually_exclusive_group()
+    rs_mask_group.add_argument("--robot-state-action-mask", dest="robot_state_action_mask", action="store_true")
+    rs_mask_group.add_argument("--no-robot-state-action-mask", dest="robot_state_action_mask", action="store_false")
     rs_progress_group = p.add_mutually_exclusive_group()
     rs_progress_group.add_argument("--robot-state-progress", dest="robot_state_progress", action="store_true")
     rs_progress_group.add_argument("--no-robot-state-progress", dest="robot_state_progress", action="store_false")
@@ -228,6 +252,24 @@ def _parse_args() -> argparse.Namespace:
         default=-0.2,
         help="Penalty applied when stepping onto an already explored free cell.",
     )
+    p.add_argument(
+        "--turn-change-penalty",
+        type=float,
+        default=-0.05,
+        help="Penalty applied when the executed move changes direction.",
+    )
+    p.add_argument(
+        "--new-cell-reward",
+        type=float,
+        default=0.7,
+        help="Reward applied when stepping onto a newly explored free cell.",
+    )
+    p.add_argument(
+        "--step-penalty",
+        type=float,
+        default=-0.1,
+        help="Constant per-step reward. Use 0.0 to remove time-pressure shaping.",
+    )
     overlap_group = p.add_mutually_exclusive_group()
     overlap_group.add_argument(
         "--overlap-streak-penalty",
@@ -248,6 +290,84 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.4,
         help="Maximum absolute overlap penalty after streak acceleration.",
+    )
+    p.add_argument(
+        "--local-tv-reward-scale",
+        type=float,
+        default=0.0,
+        help="Scale for local TV_i shaping. Default 0 keeps it disabled.",
+    )
+    p.add_argument(
+        "--local-tv-normalizer",
+        type=float,
+        default=2.5,
+        help="Normalizer for local TV_i shaping. Use 1.0 for edge TV_i.",
+    )
+    p.add_argument(
+        "--local-tv-mode",
+        type=str,
+        default="patch",
+        choices=["patch", "edge"],
+        help="patch: TV over a local crop; edge: incremental 4-neighbor TV at the changed cell.",
+    )
+    p.add_argument(
+        "--global-tv-reward-scale",
+        type=float,
+        default=0.0,
+        help="Scale for global TV_g shaping. Default 0 keeps it disabled.",
+    )
+    p.add_argument(
+        "--semi-global-tv-reward-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Scale for recent-window semi-global TV shaping. Default 0 disables it."
+        ),
+    )
+    p.add_argument(
+        "--semi-global-tv-horizon",
+        type=int,
+        default=32,
+        help="Number of recent local windows used for semi-global TV.",
+    )
+    p.add_argument(
+        "--semi-global-tv-gate-horizon",
+        type=int,
+        default=0,
+        help=(
+            "Recent-step horizon used only for the semi-global TV min-new-cells gate. "
+            "Use 0 to reuse --semi-global-tv-horizon."
+        ),
+    )
+    p.add_argument(
+        "--semi-global-tv-clip",
+        type=float,
+        default=2.0,
+        help="Symmetric clip applied to normalized semi-global TV delta.",
+    )
+    p.add_argument(
+        "--semi-global-tv-window-size",
+        type=int,
+        default=41,
+        help="Local observation window size used to build the semi-global TV union.",
+    )
+    p.add_argument(
+        "--semi-global-tv-min-new-cells",
+        type=int,
+        default=1,
+        help="Minimum recent new cells required before semi-global TV is applied.",
+    )
+    p.add_argument(
+        "--local-tv-patch-radius",
+        type=int,
+        default=3,
+        help="Radius for local TV_i patch. Use 20 to match a 41x41 local crop.",
+    )
+    p.add_argument(
+        "--tv-obstacle-edge-weight",
+        type=float,
+        default=0.35,
+        help="Weight for TV edges touching obstacles. Use 0 to ignore obstacle-contact edges.",
     )
     p.add_argument("--include-dtm", action="store_true")
     p.add_argument(
@@ -387,6 +507,22 @@ def _parse_args() -> argparse.Namespace:
         help="Per-scale DTM branch embedding dimension for --hybrid-dtm-embed-mode=branch.",
     )
     p.add_argument(
+        "--hybrid-dtm-bypass-lstm",
+        action="store_true",
+        help=(
+            "For recurrent hybrid DTM branch models, feed non-DTM fused features to "
+            "the LSTM and concatenate DTM branch features after the LSTM."
+        ),
+    )
+    p.add_argument(
+        "--hybrid-global-bypass-lstm",
+        action="store_true",
+        help=(
+            "For recurrent hybrid models, feed only local-map and robot-state fusion "
+            "to the LSTM and concatenate global-map features after the LSTM."
+        ),
+    )
+    p.add_argument(
         "--model-size",
         type=str,
         default="xlarge",
@@ -416,6 +552,45 @@ def _parse_args() -> argparse.Namespace:
         dest="action_mask",
         action="store_false",
         help="Disable action masking.",
+    )
+    p.add_argument(
+        "--action-mask-mode",
+        type=str,
+        default="shield",
+        choices=["shield", "penalty"],
+        help=(
+            "How env-side action masking handles invalid known-map actions. "
+            "shield keeps the legacy valid-action fallback; penalty leaves the "
+            "robot in place and applies --invalid-action-penalty."
+        ),
+    )
+    p.add_argument(
+        "--invalid-action-penalty",
+        type=float,
+        default=-1.0,
+        help=(
+            "Collision reward used only when --action-mask-mode=penalty and "
+            "the requested action is invalid under the known-map action mask."
+        ),
+    )
+    maskable_group = p.add_mutually_exclusive_group()
+    maskable_group.add_argument(
+        "--maskable-policy",
+        dest="maskable_policy",
+        action="store_true",
+        help=(
+            "When --action-mask is enabled and --recurrent-policy is disabled, "
+            "use sb3-contrib MaskablePPO to mask invalid action probabilities."
+        ),
+    )
+    maskable_group.add_argument(
+        "--no-maskable-policy",
+        dest="maskable_policy",
+        action="store_false",
+        help=(
+            "Keep env-side action shielding from --action-mask, but train with "
+            "plain PPO. Use this for fair feed-forward vs RecurrentPPO ablations."
+        ),
     )
     heuristic_group = p.add_mutually_exclusive_group()
     heuristic_group.add_argument(
@@ -450,6 +625,28 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Maximum A* node expansions per assist call. 0 uses the full map size.",
+    )
+    p.add_argument("--heuristic-trigger-mode", choices=["simple", "v2"], default="simple")
+    period2_group = p.add_mutually_exclusive_group()
+    period2_group.add_argument("--heuristic-period2", dest="heuristic_period2", action="store_true")
+    period2_group.add_argument("--no-heuristic-period2", dest="heuristic_period2", action="store_false")
+    p.set_defaults(heuristic_period2=True)
+    p.add_argument("--heuristic-period2-recent-new-window", type=int, default=4)
+    p.add_argument("--heuristic-period2-streak", type=int, default=2)
+    same_cell_group = p.add_mutually_exclusive_group()
+    same_cell_group.add_argument("--heuristic-same-cell", dest="heuristic_same_cell", action="store_true")
+    same_cell_group.add_argument("--no-heuristic-same-cell", dest="heuristic_same_cell", action="store_false")
+    p.set_defaults(heuristic_same_cell=True)
+    p.add_argument("--heuristic-same-cell-stall", type=int, default=12)
+    p.add_argument("--heuristic-late-local-radius", type=int, default=0)
+    p.add_argument("--heuristic-late-local-max-uncovered", type=int, default=0)
+    p.add_argument(
+        "--heuristic-exclude-from-ppo",
+        action="store_true",
+        help=(
+            "Exclude A* rescue transitions from recurrent PPO credit, reset the LSTM "
+            "segment after rescue, and reset the SGTV learning window on policy return."
+        ),
     )
 
     p.add_argument("--map-source", type=str, default="random", choices=["random", "custom", "file"])
@@ -509,12 +706,16 @@ def _parse_args() -> argparse.Namespace:
         boundary_exit_features=False,
         robot_state_position=True,
         robot_state_action_history=True,
+        robot_state_action_mask=False,
         robot_state_progress=False,
         robot_state_stagnation=False,
         cell_phase_channels=True,
         hole_signals=False,
         revisit_burden_shaping=False,
         heuristic_assist=False,
+        shared_lstm=False,
+        critic_lstm=True,
+        maskable_policy=True,
     )
     args = p.parse_args()
     args.robot_state_progress = False
@@ -907,6 +1108,13 @@ def main():
     args = _parse_args()
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
+    if args.recurrent_policy:
+        if int(args.lstm_hidden_size) <= 0:
+            raise ValueError("--lstm-hidden-size must be positive")
+        if int(args.n_lstm_layers) <= 0:
+            raise ValueError("--n-lstm-layers must be positive")
+        if bool(args.shared_lstm) and bool(args.critic_lstm):
+            raise ValueError("--shared-lstm requires --no-critic-lstm")
     if args.load_model and args.init_from_bc:
         raise ValueError("--load-model and --init-from-bc are mutually exclusive")
     _set_seed(args.seed)
@@ -924,7 +1132,37 @@ def main():
 
     AlgoClass = SB3PPO
     algo_name = "PPO"
-    if args.action_mask:
+    policy_name = "MultiInputPolicy"
+    if args.recurrent_policy:
+        try:
+            from sb3_contrib import RecurrentPPO  # type: ignore
+            from learning.reinforcement.intervention_aware_ppo import InterventionAwareRecurrentPPO
+        except Exception as e:
+            raise RuntimeError(
+                "sb3_contrib with RecurrentPPO is required for --recurrent-policy"
+            ) from e
+        AlgoClass = InterventionAwareRecurrentPPO if bool(args.heuristic_exclude_from_ppo) else RecurrentPPO
+        algo_name = "RecurrentPPO"
+        policy_name = "MultiInputLstmPolicy"
+        if bool(args.hybrid_dtm_bypass_lstm) or bool(args.hybrid_global_bypass_lstm):
+            if DtmBypassRecurrentMultiInputPolicy is None:
+                raise RuntimeError(
+                    "The installed sb3_policy module does not provide the requested "
+                    "DTM/global LSTM bypass policy."
+                )
+            policy_name = DtmBypassRecurrentMultiInputPolicy
+        if args.action_mask:
+            mode_desc = (
+                "invalid actions receive stay-in-place penalties"
+                if str(args.action_mask_mode).strip().lower() == "penalty"
+                else "keeping env-side action shield enabled"
+            )
+            print(
+                "[INFO] RecurrentPPO does not support MaskablePPO action-probability "
+                f"masking; {mode_desc}.",
+                flush=True,
+            )
+    elif args.action_mask and bool(args.maskable_policy):
         try:
             from sb3_contrib import MaskablePPO  # type: ignore
         except Exception:
@@ -935,6 +1173,17 @@ def main():
         else:
             AlgoClass = MaskablePPO
             algo_name = "MaskablePPO"
+    elif args.action_mask:
+        mode_desc = (
+            "invalid actions receive stay-in-place penalties"
+            if str(args.action_mask_mode).strip().lower() == "penalty"
+            else "using env-side action shield only"
+        )
+        print(
+            "[INFO] --action-mask is enabled with --no-maskable-policy; "
+            f"using plain PPO; {mode_desc}.",
+            flush=True,
+        )
 
     grid = _build_map(args)
     grid_pool, grid_meta_pool = _load_map_pool(args, grid)
@@ -953,16 +1202,25 @@ def main():
         raise ValueError("--global-window-sizes is required when --global-view-mode is centered/viewport")
 
     reward_cfg = CPPRewardConfig(
-        new_cell_reward=0.7,
-        local_tv_reward_scale=0.0,
+        new_cell_reward=float(args.new_cell_reward),
+        local_tv_reward_scale=float(args.local_tv_reward_scale),
         local_tv_reward_max=5.0,
-        local_tv_normalizer=2.5,
-        global_tv_reward_scale=0.0,
+        local_tv_normalizer=float(args.local_tv_normalizer),
+        global_tv_reward_scale=float(args.global_tv_reward_scale),
         global_tv_reward_max=5.0,
         global_tv_normalizer=4.0,
+        semi_global_tv_reward_scale=float(args.semi_global_tv_reward_scale),
+        semi_global_tv_horizon=int(args.semi_global_tv_horizon),
+        semi_global_tv_gate_horizon=int(args.semi_global_tv_gate_horizon),
+        semi_global_tv_clip=float(args.semi_global_tv_clip),
+        semi_global_tv_window_size=int(args.semi_global_tv_window_size),
+        semi_global_tv_min_new_cells=int(args.semi_global_tv_min_new_cells),
+        local_tv_new_cell_only=True,
+        tv_obstacle_edge_weight=float(args.tv_obstacle_edge_weight),
         collision_reward=-10.0,
-        constant_reward=-0.1,
+        constant_reward=float(args.step_penalty),
         constant_reward_always=True,
+        turn_change_penalty=float(args.turn_change_penalty),
         revisit_penalty=float(args.revisit_penalty),
         overlap_streak_enabled=bool(args.overlap_streak_penalty),
         overlap_streak_grace=int(args.overlap_streak_grace),
@@ -980,6 +1238,8 @@ def main():
         collision_ends_episode=False,
         stop_on_full_coverage=True,
         include_dtm=args.include_dtm,
+        local_tv_mode=str(args.local_tv_mode),
+        local_tv_patch_radius=int(args.local_tv_patch_radius),
         maps_observation_mode=(
             "hybrid_local_global"
             if str(args.maps_encoder_mode).strip().lower() == "hybrid_local_global"
@@ -1015,15 +1275,28 @@ def main():
             action_history_len=int(args.robot_state_action_history_len),
             include_position=bool(args.robot_state_position),
             include_action_history=bool(args.robot_state_action_history),
+            include_action_mask=bool(args.robot_state_action_mask),
             include_progress=bool(args.robot_state_progress),
             include_stagnation=bool(args.robot_state_stagnation),
         ),
         use_cell_phase_features=bool(args.cell_phase_channels),
         use_action_mask=bool(args.action_mask),
+        action_mask_mode=str(args.action_mask_mode),
+        invalid_action_penalty=float(args.invalid_action_penalty),
         heuristic_assist_enabled=bool(args.heuristic_assist),
         heuristic_no_progress_threshold=int(args.heuristic_no_progress_threshold),
         heuristic_min_coverage=float(args.heuristic_min_coverage),
         heuristic_max_astar_expansions=int(args.heuristic_max_astar_expansions),
+        heuristic_trigger_mode=str(args.heuristic_trigger_mode),
+        heuristic_period2_enabled=bool(args.heuristic_period2),
+        heuristic_period2_recent_new_window=int(args.heuristic_period2_recent_new_window),
+        heuristic_period2_streak=int(args.heuristic_period2_streak),
+        heuristic_same_cell_enabled=bool(args.heuristic_same_cell),
+        heuristic_same_cell_stall=int(args.heuristic_same_cell_stall),
+        heuristic_late_local_radius=int(args.heuristic_late_local_radius),
+        heuristic_late_local_max_uncovered=int(args.heuristic_late_local_max_uncovered),
+        heuristic_reset_sgtv_after_rescue=bool(args.heuristic_exclude_from_ppo),
+        heuristic_reset_policy_state_after_rescue=bool(args.heuristic_exclude_from_ppo),
         reward=reward_cfg,
     )
 
@@ -1054,6 +1327,11 @@ def main():
     robot_state_dim = int(np.asarray(probe_obs["robot_state"], dtype=np.float32).shape[0])
     model_cfg = _model_preset(str(args.model_size))
     use_hybrid_maps = "hybrid_maps" in probe_obs
+    if (bool(args.hybrid_dtm_bypass_lstm) or bool(args.hybrid_global_bypass_lstm)) and not use_hybrid_maps:
+        raise ValueError(
+            "--hybrid-dtm-bypass-lstm/--hybrid-global-bypass-lstm require "
+            "--maps-encoder-mode hybrid_local_global"
+        )
     level_channels: Tuple[int, ...] = ()
     local_channels = 0
     global_channels: Tuple[int, ...] = ()
@@ -1065,6 +1343,15 @@ def main():
             for size in global_coarse_sizes
         )
         hybrid_dtm_channels = _dtm_output_channel_count(args.dtm_output_mode) if args.include_dtm else 0
+        if bool(args.hybrid_dtm_bypass_lstm):
+            if not args.recurrent_policy:
+                raise ValueError("--hybrid-dtm-bypass-lstm requires --recurrent-policy")
+            if int(hybrid_dtm_channels) <= 0:
+                raise ValueError("--hybrid-dtm-bypass-lstm requires --include-dtm")
+            if str(args.hybrid_dtm_embed_mode).lower().strip() != "branch":
+                raise ValueError("--hybrid-dtm-bypass-lstm requires --hybrid-dtm-embed-mode branch")
+        if bool(args.hybrid_global_bypass_lstm) and not args.recurrent_policy:
+            raise ValueError("--hybrid-global-bypass-lstm requires --recurrent-policy")
         encoder_cfg = HybridLocalGlobalEncoderConfig(
             local_in_channels=local_channels,
             global_in_channels=global_channels,
@@ -1090,6 +1377,8 @@ def main():
             dtm_embed_mode=str(args.hybrid_dtm_embed_mode),
             dtm_embed_channels=int(args.hybrid_dtm_embed_channels),
             dtm_branch_embed_dim=int(args.hybrid_dtm_branch_embed_dim),
+            dtm_bypass_lstm=bool(args.hybrid_dtm_bypass_lstm),
+            global_bypass_lstm=bool(args.hybrid_global_bypass_lstm),
             robot_state=RobotStateEncoderConfig(
                 input_dim=robot_state_dim,
                 hidden_dims=model_cfg["state_hidden_dims"],
@@ -1208,6 +1497,13 @@ def main():
             vf=list(model_cfg.get("policy_net_arch", (128, 128))),
         ),
     )
+    if bool(args.recurrent_policy):
+        policy_kwargs.update(
+            lstm_hidden_size=int(args.lstm_hidden_size),
+            n_lstm_layers=int(args.n_lstm_layers),
+            shared_lstm=bool(args.shared_lstm),
+            enable_critic_lstm=bool(args.critic_lstm),
+        )
 
     if args.load_model:
         try:
@@ -1225,9 +1521,14 @@ def main():
             else:
                 raise
         model.set_random_seed(args.seed)
+        if int(args.verbose) == 0:
+            # SB3 restores the checkpoint logger, including its previous verbose mode.
+            from stable_baselines3.common.logger import configure
+
+            model.set_logger(configure(folder=None, format_strings=[]))
     else:
         model = AlgoClass(
-            policy="MultiInputPolicy",
+            policy=policy_name,
             env=vec_env,
             learning_rate=args.lr,
             n_steps=args.n_steps,
@@ -1281,7 +1582,9 @@ def main():
             f" dtm_embed={args.hybrid_dtm_embed_mode},"
             f" dtm_channels={int(hybrid_dtm_channels)},"
             f" dtm_embed_channels={int(args.hybrid_dtm_embed_channels)},"
-            f" dtm_branch_embed={int(args.hybrid_dtm_branch_embed_dim)}"
+            f" dtm_branch_embed={int(args.hybrid_dtm_branch_embed_dim)},"
+            f" dtm_bypass_lstm={bool(args.hybrid_dtm_bypass_lstm)},"
+            f" global_bypass_lstm={bool(args.hybrid_global_bypass_lstm)}"
         )
     else:
         print(f"Map observation channels by level: {level_channels}")
@@ -1302,8 +1605,18 @@ def main():
     print(f"Start: {start}")
     print(
         f"Action mask: {bool(args.action_mask)} | algo={algo_name} | "
-        f"env_shield={bool(env_cfg.use_action_mask)}"
+        f"env_shield={bool(env_cfg.use_action_mask)} | "
+        f"mask_mode={str(env_cfg.action_mask_mode)} | "
+        f"invalid_penalty={float(env_cfg.invalid_action_penalty):.3f}"
     )
+    if bool(args.recurrent_policy):
+        print(
+            "Recurrent policy:"
+            f" lstm_hidden={int(args.lstm_hidden_size)},"
+            f" layers={int(args.n_lstm_layers)},"
+            f" shared_lstm={bool(args.shared_lstm)},"
+            f" critic_lstm={bool(args.critic_lstm)}"
+        )
     print(
         "PPO cfg:"
         f" total_timesteps={args.total_timesteps}, num_envs={args.num_envs},"
@@ -1311,11 +1624,25 @@ def main():
         f" rollout_batch={args.n_steps * args.num_envs},"
         f" batch_size={args.batch_size}, n_epochs={args.n_epochs}"
     )
+    semi_global_tv_gate_horizon = (
+        int(reward_cfg.semi_global_tv_gate_horizon)
+        if int(reward_cfg.semi_global_tv_gate_horizon) > 0
+        else int(reward_cfg.semi_global_tv_horizon)
+    )
     print(
         "Reward shaping:"
         f" new_cell={float(reward_cfg.new_cell_reward):.3f},"
         f" local_tv_scale={float(reward_cfg.local_tv_reward_scale):.3f},"
+        f" local_tv_mode={str(env_cfg.local_tv_mode)},"
+        f" local_tv_normalizer={float(reward_cfg.local_tv_normalizer):.3f},"
+        f" local_tv_new_cell_only=True,"
         f" global_tv_scale={float(reward_cfg.global_tv_reward_scale):.3f},"
+        f" semi_global_tv_scale={float(reward_cfg.semi_global_tv_reward_scale):.3f},"
+        f" semi_global_tv_horizon={int(reward_cfg.semi_global_tv_horizon)},"
+        f" semi_global_tv_gate_horizon={semi_global_tv_gate_horizon},"
+        f" semi_global_tv_clip={float(reward_cfg.semi_global_tv_clip):.3f},"
+        f" local_tv_radius={int(env_cfg.local_tv_patch_radius)},"
+        f" tv_obstacle_edge_weight={float(reward_cfg.tv_obstacle_edge_weight):.3f},"
         f" collision={float(reward_cfg.collision_reward):.3f},"
         f" step={float(reward_cfg.constant_reward):.3f},"
         f" turn={float(reward_cfg.turn_change_penalty):.3f},"
@@ -1339,6 +1666,7 @@ def main():
         "Robot-state features:"
         f" position={bool(args.robot_state_position)},"
         f" action_history={bool(args.robot_state_action_history)},"
+        f" action_mask={bool(args.robot_state_action_mask)},"
         f" progress={bool(args.robot_state_progress)},"
         f" stagnation={bool(args.robot_state_stagnation)},"
         f" action_history_len={int(args.robot_state_action_history_len)}"
@@ -1361,7 +1689,10 @@ def main():
         f" enabled={bool(args.heuristic_assist)},"
         f" threshold={int(args.heuristic_no_progress_threshold)},"
         f" min_coverage={float(args.heuristic_min_coverage):.3f},"
-        f" max_astar_expansions={int(args.heuristic_max_astar_expansions)}"
+        f" max_astar_expansions={int(args.heuristic_max_astar_expansions)},"
+        f" period2={bool(args.heuristic_period2)},"
+        f" same_cell={bool(args.heuristic_same_cell)},"
+        f" exclude_from_ppo={bool(args.heuristic_exclude_from_ppo)}"
     )
     print(
         "Paper metrics:"
@@ -1394,7 +1725,25 @@ def main():
         print(f"BC checkpoint: {args.init_from_bc}")
     else:
         print("Init mode: random init")
+    diagnostics_root = os.environ.get("RLCPP_PPO_DIAGNOSTICS_DIR", "").strip()
+    if diagnostics_root:
+        from stable_baselines3.common.logger import configure
+
+        chunk_name = Path(args.save_model).stem if args.save_model else "unsaved"
+        diagnostics_dir = Path(diagnostics_root) / chunk_name
+        model.set_logger(configure(str(diagnostics_dir), ["csv", "json"]))
+        print(f"PPO diagnostics: {diagnostics_dir}", flush=True)
+    min_free_gib = float(os.environ.get("RLCPP_MIN_FREE_GIB", "0"))
+    if min_free_gib > 0:
+        import shutil
+
+        disk_path = Path(args.save_model).parent if args.save_model else REPO_ROOT
+        free_gib = shutil.disk_usage(disk_path).free / (1024 ** 3)
+        if free_gib < min_free_gib:
+            raise RuntimeError(f"Insufficient disk space: {free_gib:.2f} GiB < {min_free_gib:.2f} GiB")
     model.learn(total_timesteps=args.total_timesteps, callback=callback)
+    if diagnostics_root:
+        model.logger.dump(step=model.num_timesteps)
 
     if args.save_model:
         out = Path(args.save_model)

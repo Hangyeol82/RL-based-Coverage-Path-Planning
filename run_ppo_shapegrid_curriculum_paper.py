@@ -107,6 +107,27 @@ def _parse_args() -> argparse.Namespace:
         default="shape_grid:1,macro_detail:1",
         help="Generator weights used inside the object-placement family.",
     )
+    p.add_argument(
+        "--mixed-paper-level-shift",
+        type=int,
+        default=0,
+        help=(
+            "Shift sampled mixed-paper map levels before generation. "
+            "Use -1 to make an existing L3/L4 curriculum generate L2/L3 maps."
+        ),
+    )
+    p.add_argument(
+        "--mixed-paper-min-level",
+        type=int,
+        default=min(PRESETS),
+        help="Minimum generated mixed-paper map level after applying level shift.",
+    )
+    p.add_argument(
+        "--mixed-paper-max-level",
+        type=int,
+        default=max(PRESETS),
+        help="Maximum generated mixed-paper map level after applying level shift.",
+    )
     p.add_argument("--mixed-map-max-retries", type=int, default=64)
     p.add_argument("--mixed-min-start-component-ratio", type=float, default=0.995)
     p.add_argument("--mixed-min-free-ratio", type=float, default=0.05)
@@ -221,6 +242,9 @@ def _parse_args() -> argparse.Namespace:
     rs_action_group = p.add_mutually_exclusive_group()
     rs_action_group.add_argument("--robot-state-action-history", dest="robot_state_action_history", action="store_true")
     rs_action_group.add_argument("--no-robot-state-action-history", dest="robot_state_action_history", action="store_false")
+    rs_mask_group = p.add_mutually_exclusive_group()
+    rs_mask_group.add_argument("--robot-state-action-mask", dest="robot_state_action_mask", action="store_true")
+    rs_mask_group.add_argument("--no-robot-state-action-mask", dest="robot_state_action_mask", action="store_false")
     rs_progress_group = p.add_mutually_exclusive_group()
     rs_progress_group.add_argument("--robot-state-progress", dest="robot_state_progress", action="store_true")
     rs_progress_group.add_argument("--no-robot-state-progress", dest="robot_state_progress", action="store_false")
@@ -260,6 +284,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--milestone-lambda-90", type=float, default=0.2)
     p.add_argument("--milestone-lambda-99", type=float, default=4.0)
     p.add_argument("--revisit-penalty", type=float, default=-0.2)
+    p.add_argument("--turn-change-penalty", type=float, default=-0.05)
+    p.add_argument("--new-cell-reward", type=float, default=0.7)
+    p.add_argument("--step-penalty", type=float, default=-0.1)
+    p.add_argument("--local-tv-reward-scale", type=float, default=0.0)
+    p.add_argument("--local-tv-normalizer", type=float, default=2.5)
+    p.add_argument("--local-tv-mode", type=str, default="patch", choices=["patch", "edge"])
+    p.add_argument("--global-tv-reward-scale", type=float, default=0.0)
+    p.add_argument("--semi-global-tv-reward-scale", type=float, default=0.0)
+    p.add_argument("--semi-global-tv-horizon", type=int, default=32)
+    p.add_argument("--semi-global-tv-gate-horizon", type=int, default=0)
+    p.add_argument("--semi-global-tv-clip", type=float, default=2.0)
+    p.add_argument("--semi-global-tv-window-size", type=int, default=41)
+    p.add_argument("--semi-global-tv-min-new-cells", type=int, default=1)
+    p.add_argument("--local-tv-patch-radius", type=int, default=3)
+    p.add_argument("--tv-obstacle-edge-weight", type=float, default=0.35)
     p.add_argument(
         "--maps-encoder-mode",
         type=str,
@@ -337,6 +376,16 @@ def _parse_args() -> argparse.Namespace:
         help="Per-scale DTM branch embedding dimension for --hybrid-dtm-embed-mode=branch.",
     )
     p.add_argument(
+        "--hybrid-dtm-bypass-lstm",
+        action="store_true",
+        help="Forward DTM branch features around the LSTM in recurrent hybrid models.",
+    )
+    p.add_argument(
+        "--hybrid-global-bypass-lstm",
+        action="store_true",
+        help="Forward hybrid global-map features around the LSTM in recurrent hybrid models.",
+    )
+    p.add_argument(
         "--model-size",
         type=str,
         default="xlarge",
@@ -407,6 +456,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument(
+        "--recurrent-policy",
+        action="store_true",
+        help=(
+            "Forward --recurrent-policy to each PPO chunk so the chunk runner "
+            "uses RecurrentPPO/MultiInputLstmPolicy."
+        ),
+    )
+    p.add_argument("--lstm-hidden-size", type=int, default=256)
+    p.add_argument("--n-lstm-layers", type=int, default=1)
+    shared_lstm_group = p.add_mutually_exclusive_group()
+    shared_lstm_group.add_argument("--shared-lstm", dest="shared_lstm", action="store_true")
+    shared_lstm_group.add_argument("--no-shared-lstm", dest="shared_lstm", action="store_false")
+    critic_lstm_group = p.add_mutually_exclusive_group()
+    critic_lstm_group.add_argument("--critic-lstm", dest="critic_lstm", action="store_true")
+    critic_lstm_group.add_argument("--no-critic-lstm", dest="critic_lstm", action="store_false")
+    p.add_argument(
         "--verbose",
         type=int,
         default=0,
@@ -417,24 +482,78 @@ def _parse_args() -> argparse.Namespace:
     mask_group = p.add_mutually_exclusive_group()
     mask_group.add_argument("--action-mask", dest="action_mask", action="store_true")
     mask_group.add_argument("--no-action-mask", dest="action_mask", action="store_false")
+    p.add_argument(
+        "--action-mask-mode",
+        type=str,
+        default="shield",
+        choices=["shield", "penalty"],
+        help=(
+            "Forwarded to run_ppo_sb3_paper.py. shield uses the legacy fallback; "
+            "penalty keeps invalid actions as stay-in-place collisions."
+        ),
+    )
+    p.add_argument(
+        "--invalid-action-penalty",
+        type=float,
+        default=-1.0,
+        help="Penalty for known-map invalid actions when --action-mask-mode=penalty.",
+    )
+    maskable_group = p.add_mutually_exclusive_group()
+    maskable_group.add_argument(
+        "--maskable-policy",
+        dest="maskable_policy",
+        action="store_true",
+        help=(
+            "Forward MaskablePPO probability masking for feed-forward chunks. "
+            "Ignored by recurrent chunks."
+        ),
+    )
+    maskable_group.add_argument(
+        "--no-maskable-policy",
+        dest="maskable_policy",
+        action="store_false",
+        help=(
+            "Keep env-side action shielding from --action-mask, but train "
+            "feed-forward chunks with plain PPO."
+        ),
+    )
     heuristic_group = p.add_mutually_exclusive_group()
     heuristic_group.add_argument("--heuristic-assist", dest="heuristic_assist", action="store_true")
     heuristic_group.add_argument("--no-heuristic-assist", dest="heuristic_assist", action="store_false")
     p.add_argument("--heuristic-no-progress-threshold", type=int, default=50)
     p.add_argument("--heuristic-min-coverage", type=float, default=0.0)
     p.add_argument("--heuristic-max-astar-expansions", type=int, default=0)
+    p.add_argument("--heuristic-trigger-mode", choices=["simple", "v2"], default="simple")
+    period2_group = p.add_mutually_exclusive_group()
+    period2_group.add_argument("--heuristic-period2", dest="heuristic_period2", action="store_true")
+    period2_group.add_argument("--no-heuristic-period2", dest="heuristic_period2", action="store_false")
+    p.set_defaults(heuristic_period2=True)
+    p.add_argument("--heuristic-period2-recent-new-window", type=int, default=4)
+    p.add_argument("--heuristic-period2-streak", type=int, default=2)
+    same_cell_group = p.add_mutually_exclusive_group()
+    same_cell_group.add_argument("--heuristic-same-cell", dest="heuristic_same_cell", action="store_true")
+    same_cell_group.add_argument("--no-heuristic-same-cell", dest="heuristic_same_cell", action="store_false")
+    p.set_defaults(heuristic_same_cell=True)
+    p.add_argument("--heuristic-same-cell-stall", type=int, default=12)
+    p.add_argument("--heuristic-late-local-radius", type=int, default=0)
+    p.add_argument("--heuristic-late-local-max-uncovered", type=int, default=0)
+    p.add_argument("--heuristic-exclude-from-ppo", action="store_true")
     p.set_defaults(
         action_mask=True,
         milestone_reward=False,
         boundary_exit_features=False,
         robot_state_position=True,
         robot_state_action_history=True,
+        robot_state_action_mask=False,
         robot_state_progress=False,
         robot_state_stagnation=False,
         cell_phase_channels=True,
         hole_signals=False,
         revisit_burden_shaping=False,
         heuristic_assist=False,
+        shared_lstm=False,
+        critic_lstm=True,
+        maskable_policy=True,
     )
 
     p.add_argument(
@@ -449,6 +568,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=str, default="")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--continue-on-error", action="store_true")
+    p.add_argument(
+        "--model-retain-every",
+        type=int,
+        default=1,
+        help=(
+            "Keep every Nth model checkpoint plus chunk 1 and the latest checkpoint. "
+            "The default (1) keeps every checkpoint. Training logs are never pruned."
+        ),
+    )
     p.add_argument(
         "--resume-from-model",
         type=str,
@@ -625,6 +753,36 @@ def _phase_for_mixed_chunk(
 def _normalised_prob_dict(pairs: Sequence[Tuple[object, float]]) -> Dict[str, float]:
     total = float(sum(float(w) for _k, w in pairs))
     return {str(k): float(w) / total for k, w in pairs}
+
+
+def _effective_mixed_paper_level(
+    level: int,
+    *,
+    level_shift: int,
+    min_level: int,
+    max_level: int,
+) -> int:
+    shifted = int(level) + int(level_shift)
+    return int(min(max(shifted, int(min_level)), int(max_level)))
+
+
+def _effective_mixed_paper_level_probs(
+    pairs: Sequence[Tuple[int, float]],
+    *,
+    level_shift: int,
+    min_level: int,
+    max_level: int,
+) -> List[Tuple[int, float]]:
+    merged: Dict[int, float] = {}
+    for level, weight in pairs:
+        effective_level = _effective_mixed_paper_level(
+            int(level),
+            level_shift=int(level_shift),
+            min_level=int(min_level),
+            max_level=int(max_level),
+        )
+        merged[effective_level] = merged.get(effective_level, 0.0) + float(weight)
+    return sorted(merged.items())
 
 
 def _jsonable(obj):
@@ -919,6 +1077,10 @@ def _build_run_cmd(
         str(float(args.lr)),
         "--verbose",
         str(int(args.verbose)),
+        "--lstm-hidden-size",
+        str(int(args.lstm_hidden_size)),
+        "--n-lstm-layers",
+        str(int(args.n_lstm_layers)),
         "--sensor-range",
         str(int(args.sensor_range)),
         "--max-episode-steps",
@@ -943,6 +1105,20 @@ def _build_run_cmd(
         str(float(args.heuristic_min_coverage)),
         "--heuristic-max-astar-expansions",
         str(int(args.heuristic_max_astar_expansions)),
+        "--heuristic-trigger-mode",
+        str(args.heuristic_trigger_mode),
+        "--heuristic-period2" if bool(args.heuristic_period2) else "--no-heuristic-period2",
+        "--heuristic-period2-recent-new-window",
+        str(int(args.heuristic_period2_recent_new_window)),
+        "--heuristic-period2-streak",
+        str(int(args.heuristic_period2_streak)),
+        "--heuristic-same-cell" if bool(args.heuristic_same_cell) else "--no-heuristic-same-cell",
+        "--heuristic-same-cell-stall",
+        str(int(args.heuristic_same_cell_stall)),
+        "--heuristic-late-local-radius",
+        str(int(args.heuristic_late_local_radius)),
+        "--heuristic-late-local-max-uncovered",
+        str(int(args.heuristic_late_local_max_uncovered)),
         "--boundary-exit-threshold",
         str(float(args.boundary_exit_threshold)),
         "--milestone-threshold-90",
@@ -955,6 +1131,40 @@ def _build_run_cmd(
         str(float(args.milestone_lambda_99)),
         "--revisit-penalty",
         str(float(args.revisit_penalty)),
+        "--turn-change-penalty",
+        str(float(args.turn_change_penalty)),
+        "--new-cell-reward",
+        str(float(args.new_cell_reward)),
+        "--step-penalty",
+        str(float(args.step_penalty)),
+        "--local-tv-reward-scale",
+        str(float(args.local_tv_reward_scale)),
+        "--local-tv-normalizer",
+        str(float(args.local_tv_normalizer)),
+        "--local-tv-mode",
+        str(args.local_tv_mode),
+        "--global-tv-reward-scale",
+        str(float(args.global_tv_reward_scale)),
+        "--semi-global-tv-reward-scale",
+        str(float(args.semi_global_tv_reward_scale)),
+        "--semi-global-tv-horizon",
+        str(int(args.semi_global_tv_horizon)),
+        "--semi-global-tv-gate-horizon",
+        str(int(args.semi_global_tv_gate_horizon)),
+        "--semi-global-tv-clip",
+        str(float(args.semi_global_tv_clip)),
+        "--semi-global-tv-window-size",
+        str(int(args.semi_global_tv_window_size)),
+        "--semi-global-tv-min-new-cells",
+        str(int(args.semi_global_tv_min_new_cells)),
+        "--local-tv-patch-radius",
+        str(int(args.local_tv_patch_radius)),
+        "--tv-obstacle-edge-weight",
+        str(float(args.tv_obstacle_edge_weight)),
+        "--action-mask-mode",
+        str(args.action_mask_mode),
+        "--invalid-action-penalty",
+        str(float(args.invalid_action_penalty)),
         "--maps-encoder-mode",
         args.maps_encoder_mode,
         "--local-crop-size",
@@ -1006,8 +1216,22 @@ def _build_run_cmd(
         "--save-breakdown-csv",
         str(save_csv),
     ]
+    if bool(args.hybrid_dtm_bypass_lstm):
+        cmd.append("--hybrid-dtm-bypass-lstm")
+    if bool(args.hybrid_global_bypass_lstm):
+        cmd.append("--hybrid-global-bypass-lstm")
     if args.full_map_observation:
         cmd.append("--full-map-observation")
+    if args.recurrent_policy:
+        cmd.append("--recurrent-policy")
+    if args.shared_lstm:
+        cmd.append("--shared-lstm")
+    else:
+        cmd.append("--no-shared-lstm")
+    if args.critic_lstm:
+        cmd.append("--critic-lstm")
+    else:
+        cmd.append("--no-critic-lstm")
     if args.include_dtm:
         cmd.append("--include-dtm")
     if int(args.maps_per_chunk) > 1:
@@ -1023,10 +1247,16 @@ def _build_run_cmd(
         cmd.append("--action-mask")
     else:
         cmd.append("--no-action-mask")
+    if args.maskable_policy:
+        cmd.append("--maskable-policy")
+    else:
+        cmd.append("--no-maskable-policy")
     if args.heuristic_assist:
         cmd.append("--heuristic-assist")
     else:
         cmd.append("--no-heuristic-assist")
+    if args.heuristic_exclude_from_ppo:
+        cmd.append("--heuristic-exclude-from-ppo")
     if args.robot_state_position:
         cmd.append("--robot-state-position")
     else:
@@ -1035,6 +1265,10 @@ def _build_run_cmd(
         cmd.append("--robot-state-action-history")
     else:
         cmd.append("--no-robot-state-action-history")
+    if args.robot_state_action_mask:
+        cmd.append("--robot-state-action-mask")
+    else:
+        cmd.append("--no-robot-state-action-mask")
     if args.robot_state_progress:
         cmd.append("--robot-state-progress")
     else:
@@ -1092,12 +1326,25 @@ def main():
         raise ValueError("--maps-per-chunk must be positive")
     if args.mixed_map_max_retries <= 0:
         raise ValueError("--mixed-map-max-retries must be positive")
+    if int(args.mixed_paper_min_level) not in PRESETS:
+        raise ValueError(f"--mixed-paper-min-level must be one of {sorted(PRESETS)}")
+    if int(args.mixed_paper_max_level) not in PRESETS:
+        raise ValueError(f"--mixed-paper-max-level must be one of {sorted(PRESETS)}")
+    if int(args.mixed_paper_min_level) > int(args.mixed_paper_max_level):
+        raise ValueError("--mixed-paper-min-level must be <= --mixed-paper-max-level")
     if args.dry_run_chunks <= 0:
         raise ValueError("--dry-run-chunks must be positive")
     if not (0.0 < float(args.episode_success_threshold) <= 1.0):
         raise ValueError("--episode-success-threshold must be in (0, 1]")
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive")
+    if args.recurrent_policy:
+        if int(args.lstm_hidden_size) <= 0:
+            raise ValueError("--lstm-hidden-size must be positive")
+        if int(args.n_lstm_layers) <= 0:
+            raise ValueError("--n-lstm-layers must be positive")
+        if bool(args.shared_lstm) and bool(args.critic_lstm):
+            raise ValueError("--shared-lstm requires --no-critic-lstm")
     if args.start_chunk_index < 0:
         raise ValueError("--start-chunk-index must be non-negative")
     if args.start_timesteps < 0:
@@ -1200,10 +1447,24 @@ def main():
     , flush=True)
     print(f"[INFO] out_dir={out_dir}", flush=True)
     if args.generator_curriculum == "mixed_paper":
+        effective_phase_level_probs = [
+            _normalised_prob_dict(
+                _effective_mixed_paper_level_probs(
+                    pairs,
+                    level_shift=int(args.mixed_paper_level_shift),
+                    min_level=int(args.mixed_paper_min_level),
+                    max_level=int(args.mixed_paper_max_level),
+                )
+            )
+            for pairs in phase_level_probs
+        ]
         print(
             "[INFO] mixed-paper schedule:"
             f" phase_timesteps={phase_timesteps},"
             f" phase_level_probs={[ _normalised_prob_dict(pairs) for pairs in phase_level_probs ]},"
+            f" effective_phase_level_probs={effective_phase_level_probs},"
+            f" level_shift={int(args.mixed_paper_level_shift)},"
+            f" level_bounds=({int(args.mixed_paper_min_level)}, {int(args.mixed_paper_max_level)}),"
             f" family_probs={_normalised_prob_dict(family_weights)},"
             f" object_generator_probs={_normalised_prob_dict(object_generator_weights)}",
             flush=True,
@@ -1253,6 +1514,7 @@ def main():
         start_component_ratios: List[float] = []
         map_records: List[Dict] = []
         level_prob_dict: Dict[str, float] = {}
+        sampled_level_prob_dict: Dict[str, float] = {}
 
         if args.generator_curriculum == "shapegrid":
             if args.curriculum_mode == "fixed":
@@ -1268,6 +1530,7 @@ def main():
             curriculum_name = preset.name
             curriculum_level = int(preset.level)
             level_prob_dict = {str(preset.level): 1.0}
+            sampled_level_prob_dict = dict(level_prob_dict)
 
             for j in range(maps_per_chunk):
                 this_seed = int(map_seed if args.map_seed_mode == "fixed" else (map_seed + j))
@@ -1316,8 +1579,21 @@ def main():
                 phase_level_probs,
                 chunk_start,
             )
-            level_prob_dict = _normalised_prob_dict(level_probs)
+            sampled_level_prob_dict = _normalised_prob_dict(level_probs)
+            effective_level_probs = _effective_mixed_paper_level_probs(
+                level_probs,
+                level_shift=int(args.mixed_paper_level_shift),
+                min_level=int(args.mixed_paper_min_level),
+                max_level=int(args.mixed_paper_max_level),
+            )
+            level_prob_dict = _normalised_prob_dict(effective_level_probs)
             curriculum_desc = f"mixed_paper_phase{stage_idx + 1}_levels={level_prob_dict}"
+            if sampled_level_prob_dict != level_prob_dict or int(args.mixed_paper_level_shift) != 0:
+                curriculum_desc += (
+                    f"_sampled={sampled_level_prob_dict}"
+                    f"_shift={int(args.mixed_paper_level_shift)}"
+                    f"_bounds={int(args.mixed_paper_min_level)}-{int(args.mixed_paper_max_level)}"
+                )
             curriculum_name = "mixed_paper"
             curriculum_level = -1
             spec_plan = _build_balanced_mixed_spec_plan(
@@ -1330,7 +1606,13 @@ def main():
 
             for j in range(maps_per_chunk):
                 this_seed = int(map_seed if args.map_seed_mode == "fixed" else (map_seed + j))
-                family, generator, level = spec_plan[j]
+                family, generator, sampled_level = spec_plan[j]
+                level = _effective_mixed_paper_level(
+                    int(sampled_level),
+                    level_shift=int(args.mixed_paper_level_shift),
+                    min_level=int(args.mixed_paper_min_level),
+                    max_level=int(args.mixed_paper_max_level),
+                )
                 generator_seed = int(this_seed + 7919)
                 grid, stats, used_seed, attempt, meta = _build_validated_curriculum_map(
                     generator=generator,
@@ -1343,7 +1625,12 @@ def main():
                     min_free_ratio=float(args.mixed_min_free_ratio),
                     max_obstacle_ratio=float(args.mixed_max_obstacle_ratio),
                 )
-                stem = f"map{j+1:03d}_P{stage_idx+1}_L{level}_{generator}_seed{this_seed}"
+                level_stem = (
+                    f"L{level}"
+                    if int(sampled_level) == int(level)
+                    else f"rawL{sampled_level}_L{level}"
+                )
+                stem = f"map{j+1:03d}_P{stage_idx+1}_{level_stem}_{generator}_seed{this_seed}"
                 map_txt = maps_dir / f"chunk{display_chunk:02d}_{stem}.txt" if maps_per_chunk == 1 else map_pool_dir / f"{stem}.txt"
                 _write_map_txt(map_txt, grid)
                 map_files.append(map_txt)
@@ -1358,8 +1645,15 @@ def main():
                         "family": str(family),
                         "generator": str(generator),
                         "level": int(level),
+                        "sampled_level": int(sampled_level),
+                        "effective_level": int(level),
                         "phase_index": int(stage_idx),
                         "phase_level_probs": level_prob_dict,
+                        "phase_sampled_level_probs": sampled_level_prob_dict,
+                        "phase_effective_level_probs": level_prob_dict,
+                        "mixed_paper_level_shift": int(args.mixed_paper_level_shift),
+                        "mixed_paper_min_level": int(args.mixed_paper_min_level),
+                        "mixed_paper_max_level": int(args.mixed_paper_max_level),
                         "seed_requested": int(this_seed),
                         "seed_generator": int(generator_seed),
                         "seed_used": int(used_seed),
@@ -1382,6 +1676,11 @@ def main():
         family_counts = _count_by(map_records, "family")
         generator_counts = _count_by(map_records, "generator")
         level_counts = _count_by(map_records, "level")
+        sampled_level_counts = (
+            _count_by(map_records, "sampled_level")
+            if any("sampled_level" in row for row in map_records)
+            else dict(level_counts)
+        )
         with manifest_jsonl.open("a", encoding="utf-8") as f:
             for row in map_records:
                 f.write(json.dumps(_jsonable(row), ensure_ascii=False) + "\n")
@@ -1410,6 +1709,11 @@ def main():
             init_from_bc=init_bc,
             load_model=load_model,
         )
+        sampled_level_counts_desc = (
+            f" sampled_level_counts={sampled_level_counts}"
+            if sampled_level_counts != level_counts
+            else ""
+        )
 
         print(
             f"\n[CHUNK {display_chunk} local={i+1}/{num_chunks}] steps={chunk_t} "
@@ -1417,6 +1721,7 @@ def main():
             f"maps={maps_per_chunk} obs_ratio_mean={obs_ratio:.3f} "
             f"family_counts={family_counts} generator_counts={generator_counts} "
             f"level_counts={level_counts}"
+            f"{sampled_level_counts_desc}"
         , flush=True)
         print(f"[RUN] {' '.join(cmd)}", flush=True)
 
@@ -1434,6 +1739,7 @@ def main():
                 "curriculum_level": int(curriculum_level),
                 "curriculum_name": curriculum_name,
                 "curriculum_level_probs": level_prob_dict,
+                "curriculum_sampled_level_probs": sampled_level_prob_dict,
                 "map_seed": int(map_seed),
                 "used_map_seeds": used_map_seeds,
                 "maps_per_chunk": int(maps_per_chunk),
@@ -1448,6 +1754,7 @@ def main():
                 "map_family_counts": family_counts,
                 "map_generator_counts": generator_counts,
                 "map_level_counts": level_counts,
+                "map_sampled_level_counts": sampled_level_counts,
             }
             progress_rows.append(rec)
             with progress_jsonl.open("a", encoding="utf-8") as f:
@@ -1505,6 +1812,7 @@ def main():
             "curriculum_level": int(curriculum_level),
             "curriculum_name": curriculum_name,
             "curriculum_level_probs": level_prob_dict,
+            "curriculum_sampled_level_probs": sampled_level_prob_dict,
             "map_seed": int(map_seed),
             "used_map_seeds": used_map_seeds,
             "maps_per_chunk": int(maps_per_chunk),
@@ -1522,6 +1830,7 @@ def main():
             "map_family_counts": family_counts,
             "map_generator_counts": generator_counts,
             "map_level_counts": level_counts,
+            "map_sampled_level_counts": sampled_level_counts,
             "chunk_last_reward_total": float(last.get("reward_total", float("nan"))),
             "chunk_last_coverage_ratio": float(last.get("coverage_ratio", float("nan"))),
             "chunk_last_collision": float(last.get("collision", float("nan"))),
@@ -1679,6 +1988,29 @@ def main():
 
         with progress_jsonl.open("a", encoding="utf-8") as f:
             f.write(json.dumps(_jsonable(rec), ensure_ascii=False) + "\n")
+
+        retain_every = max(1, int(args.model_retain_every))
+        if retain_every > 1:
+            for checkpoint in models_dir.glob("chunk*.zip"):
+                suffix = checkpoint.stem.removeprefix("chunk")
+                if not suffix.isdigit():
+                    continue
+                checkpoint_chunk = int(suffix)
+                should_keep = (
+                    checkpoint == save_model_zip
+                    or checkpoint_chunk == 1
+                    or checkpoint_chunk % retain_every == 0
+                )
+                if should_keep:
+                    continue
+                try:
+                    checkpoint.unlink()
+                    print(f"[PRUNE] removed model checkpoint: {checkpoint}", flush=True)
+                except OSError as exc:
+                    print(
+                        f"[WARN] failed to prune model checkpoint {checkpoint}: {exc}",
+                        flush=True,
+                    )
 
     summary = {
         "config": _jsonable(vars(args)),
